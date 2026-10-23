@@ -1,0 +1,293 @@
+{
+  "schema": "gufo-ornith-routed-kquant-operators/1",
+  "date": "2026-10-23",
+  "base_revision": "dd579916f269e99fb47282070f4e9a35e56f6243",
+  "scope": "Synthetic routed-expert operators only; no full-model Ornith AR/MTP or performance qualification.",
+  "vendor_revision": "5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a",
+  "toolchain": {
+    "nixpkgs": "2fcb964de67fcf60b43471c55d5d99e61a9ccb5a",
+    "flake_lock_sha256": "faabad820ec09caab7351bf48910cec895a38cf1766e098e3065aea86f405ed6",
+    "cmake": "4.3.4",
+    "hip_clang": "22.0.0",
+    "host_cxx": "GNU 15.3.0",
+    "hipconfig": "7.2.53211-9999",
+    "target": "gfx1151",
+    "build_type": "RelWithDebInfo, assertions enabled",
+    "gpu_configuration": "nix develop -c python3 ../scripts/configure_gpu_test.py"
+  },
+  "candidate_source_sha256": {
+    "src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp": "6aa1873eed529103c303f5d5d31a59eeff756debe309a1439b54317ec6521909",
+    "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp": "3f99f910c3ee9997f4d42fcd086718680c25ac72a5647d2543932e5e89e6d189",
+    "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h": "03c021b592e927307e938f5f578e07ade438fdd7868a2a72babfd24f50c0ec63",
+    "tests/models/qwen38_flash_next/CMakeLists.txt": "88c221a52d56fd5b12e7c2c60813fed651970d733d5a4999a7b3e22c0f99b4b3",
+    "tests/models/qwen38_flash_next/routed_kquant_ops_test.cpp": "9cf05ea95db97f3c789cd0004f9b20e104ba036ee151aed63710d44698cef5b1"
+  },
+  "fixture": {
+    "experts": 256,
+    "experts_per_token": 8,
+    "weight_seed": 17,
+    "paired_weight_seed": 79,
+    "input_seed": 37,
+    "routing": "Four shared boundary/interior experts plus four dispersed experts; eight distinct IDs per token.",
+    "down_view": "tokens * 8 independent slot inputs, one expert per input",
+    "reference": "Independent GGUF layout unpacking and F64 accumulation over dequantized weights and original FP32 activations.",
+    "tolerance": "Strict maximum absolute error < 0.01 * maximum absolute F64 reference, from routed_wmma_ops_test.cpp::Ok; unchanged.",
+    "extra_checks": [
+      "finite outputs",
+      "leading/trailing output guards",
+      "exact paired vs separate MMVQ projections",
+      "exact scalar vs grouped gate/up at 1,2,3,8 tokens",
+      "reject K=640 partial weight blocks",
+      "reject gated experts_used=33 and tokens=9"
+    ],
+    "repeat": "All 40 printed metrics identical in direct binary and full ctest runs in separate processes."
+  },
+  "checks": {
+    "gpu_build": "passed: qwen38_flash_next_tests --parallel 28",
+    "gpu_ctest": {
+      "passed": 21,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 97.26
+    },
+    "format": "passed: 641 C++ files",
+    "pr": {
+      "passed": 66,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 35.92
+    },
+    "environment_note": "Initial sandbox PR run denied local socket access; all 66 passed when rerun on the host."
+  },
+  "raw_evidence_sha256": {
+    "configure-gpu.log": "974c0743811dd526d6c5cbd0fc7ccb1d7561e4d62211c53e2a261e891f15b2bb",
+    "build-gpu.log": "0c09df40225d379e44247a152a43ac5ea233abe60071aa8539188f35bc939dd1",
+    "ctest-gpu.log": "96f456a0ab7597a887f28cdac5ac465d571f52a2757b1d70478b8300bc8562ae",
+    "ctest-gpu-details.log": "8acf9a860da282dac52400f70846271fe87205d3b53eb86bc6bc1f6e3aa61458",
+    "kquant-focused.log": "184a203b13a8aa7abcc3eda2f5387cdd2d5ff2b30e4506887e8640327d3dd67c",
+    "pr-host.log": "1dca154160d52df292beaecd22e98821c19c4eefefc38e1f95f561b4c2592b66",
+    "format-final.log": "46d8419a4182d42b15febc68e54aa043f06c1c9cb876cd73b689c3df86537a88"
+  },
+  "results": [
+    {
+      "format": "Q6_K",
+      "tokens": 1,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3765523767,
+      "mmq_max_error": 0.3810937738,
+      "tolerance": 1.137230824,
+      "reference_max_abs": 113.7230824
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 2,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3765523767,
+      "mmq_max_error": 0.3810937738,
+      "tolerance": 1.137230824,
+      "reference_max_abs": 113.7230824
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 3,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3765523767,
+      "mmq_max_error": 0.3810937738,
+      "tolerance": 1.137230824,
+      "reference_max_abs": 113.7230824
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 8,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3824627271,
+      "mmq_max_error": 0.3876812329,
+      "tolerance": 1.137230824,
+      "reference_max_abs": 113.7230824
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 64,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.4537156032,
+      "mmq_max_error": 0.4451899933,
+      "tolerance": 1.306396334,
+      "reference_max_abs": 130.6396334
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 1,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2446403718,
+      "mmq_max_error": 0.2498893952,
+      "tolerance": 0.5857549347,
+      "reference_max_abs": 58.57549347
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 2,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2446403718,
+      "mmq_max_error": 0.2498893952,
+      "tolerance": 0.6697593959,
+      "reference_max_abs": 66.97593959
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 3,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2658805268,
+      "mmq_max_error": 0.2715510743,
+      "tolerance": 0.6697593959,
+      "reference_max_abs": 66.97593959
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 8,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2720182787,
+      "mmq_max_error": 0.2724760423,
+      "tolerance": 0.7210741938,
+      "reference_max_abs": 72.10741938
+    },
+    {
+      "format": "Q6_K",
+      "tokens": 64,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2873786516,
+      "mmq_max_error": 0.2923185682,
+      "tolerance": 0.7468632812,
+      "reference_max_abs": 74.68632812
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 1,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3467093778,
+      "mmq_max_error": 0.3425608945,
+      "tolerance": 0.9621309446,
+      "reference_max_abs": 96.21309446
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 2,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3467093778,
+      "mmq_max_error": 0.3425608945,
+      "tolerance": 0.9621309446,
+      "reference_max_abs": 96.21309446
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 3,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3531894951,
+      "mmq_max_error": 0.3598079949,
+      "tolerance": 0.9621309446,
+      "reference_max_abs": 96.21309446
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 8,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.3846353908,
+      "mmq_max_error": 0.3851851195,
+      "tolerance": 0.9621309446,
+      "reference_max_abs": 96.21309446
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 64,
+      "projection": "gate_up",
+      "m": 512,
+      "k": 2048,
+      "mmvq_max_error": 0.4497298011,
+      "mmq_max_error": 0.4437428722,
+      "tolerance": 1.162361794,
+      "reference_max_abs": 116.2361794
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 1,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2323708185,
+      "mmq_max_error": 0.2327961573,
+      "tolerance": 0.5950427018,
+      "reference_max_abs": 59.50427018
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 2,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2323708185,
+      "mmq_max_error": 0.2327961573,
+      "tolerance": 0.5950427018,
+      "reference_max_abs": 59.50427018
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 3,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2323708185,
+      "mmq_max_error": 0.2327961573,
+      "tolerance": 0.7049902504,
+      "reference_max_abs": 70.49902504
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 8,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2338914755,
+      "mmq_max_error": 0.2327961573,
+      "tolerance": 0.7049902504,
+      "reference_max_abs": 70.49902504
+    },
+    {
+      "format": "IQ4_XS",
+      "tokens": 64,
+      "projection": "down",
+      "m": 2048,
+      "k": 512,
+      "mmvq_max_error": 0.2727613254,
+      "mmq_max_error": 0.2760267062,
+      "tolerance": 0.7561623823,
+      "reference_max_abs": 75.61623823
+    }
+  ]
+}
