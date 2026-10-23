@@ -1,6 +1,7 @@
-# Ornith-1.5-35B-A3B (qwen35moe) model package. Configuration and weight
-# binding only; execution routes are added once each is qualified.
+# Ornith-1.5-35B-A3B (qwen35moe) model package: configuration, weight
+# binding and chat policy. Execution routes are added once each is qualified.
 add_library(gufo_ornith15 STATIC
+  chat_template.cpp
   config.cpp
   weights.cpp)
 

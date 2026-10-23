@@ -143,7 +143,7 @@ std::string PythonJsonSpacing(std::string_view value) {
 
 void AppendReasoningInstruction(std::string& output,
                                 const ChatTemplateOptions& options) {
-  if (!options.enable_thinking) {
+  if (!options.enable_thinking || !options.reasoning_instruction) {
     return;
   }
   switch (options.reasoning_effort) {

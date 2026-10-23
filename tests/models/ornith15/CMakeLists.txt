@@ -15,6 +15,13 @@ endfunction()
 add_ornith15_test(config "cpu")
 add_ornith15_test(weights "cpu")
 add_ornith15_test(artifact "cpu;external-model")
+add_ornith15_test(chat_template "cpu")
+add_ornith15_test(chat_tokens "cpu;external-model;tokenization")
+foreach(name IN ITEMS chat_template chat_tokens)
+  target_compile_definitions(ornith15_${name}_test PRIVATE
+    GUFO_ORNITH15_CHAT_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/ornith15_chat_goldens.json"
+    GUFO_ORNITH15_CHAT_TEMPLATE="${PROJECT_SOURCE_DIR}/tests/fixtures/ornith15_chat_template.jinja")
+endforeach()
 # Runs the scalar reference over the captured llama.cpp prompts.
 add_ornith15_test(reference_oracle "cpu;external-model;correctness"
   gufo_ornith15_reference)

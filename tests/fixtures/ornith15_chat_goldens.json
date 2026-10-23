@@ -1,0 +1,269 @@
+{
+ "schema": "gufo.ornith15-chat-goldens.v1",
+ "repo": "ornith-ai/Ornith-1.5-35B-A3B",
+ "revision": "10fbf86fed7ecee4a061f8b499a618f46001cac1",
+ "template_sha256": "182e77dd83bd8e9ca818b240b82e28f243762cd5dda32e6eef327df7b1cd107e",
+ "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+ "transformers": "5.14.1",
+ "tools": [
+  {
+   "name": "get_weather",
+   "description": "Get weather",
+   "parameters_json": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}"
+  },
+  {
+   "name": "shell",
+   "description": "Run a shell command",
+   "parameters_json": "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}"
+  }
+ ],
+ "cases": [
+  {
+   "name": "chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name one color."
+    }
+   ],
+   "tools": false,
+   "enable_thinking": false,
+   "rendered": "<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "rendered_sha256": "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7",
+   "token_count": 16,
+   "token_ids_le_u32_sha256": "f18ef8903baeb128acd6602394502b29c044153de2c4bdde5099f4225500e4b4"
+  },
+  {
+   "name": "thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name one color."
+    }
+   ],
+   "tools": false,
+   "enable_thinking": true,
+   "rendered": "<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "rendered_sha256": "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05",
+   "token_count": 14,
+   "token_ids_le_u32_sha256": "11c0c78f89b1093eb12e04a2abda17e909e5a68345789d5e729c073b9429f81b"
+  },
+  {
+   "name": "history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name one color."
+    },
+    {
+     "role": "assistant",
+     "content": "Red",
+     "thought": "I should answer with one color."
+    },
+    {
+     "role": "user",
+     "content": "Name another."
+    }
+   ],
+   "tools": false,
+   "enable_thinking": true,
+   "rendered": "<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\nI should answer with one color.\n</think>\n\nRed<|im_end|>\n<|im_start|>user\nName another.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "rendered_sha256": "4d07a9c7b9533039ba9e58596e8f388b98dec8591d2113edac3a7733b7b7b10f",
+   "token_count": 40,
+   "token_ids_le_u32_sha256": "25aaad01ac4ae49c6f4e1c913bccd4a6f96a57e03a198d30b681626bc9b5a2e7"
+  },
+  {
+   "name": "history_chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name one color."
+    },
+    {
+     "role": "assistant",
+     "content": "Red",
+     "thought": "I should answer with one color."
+    },
+    {
+     "role": "user",
+     "content": "Name another."
+    }
+   ],
+   "tools": false,
+   "enable_thinking": false,
+   "rendered": "<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\nI should answer with one color.\n</think>\n\nRed<|im_end|>\n<|im_start|>user\nName another.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "rendered_sha256": "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee",
+   "token_count": 42,
+   "token_ids_le_u32_sha256": "43067b07b0ea1aa4d8d4d3a4cd908c65fbafa62e209be0c84adf383d16959eea"
+  },
+  {
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name one color."
+    }
+   ],
+   "tools": true,
+   "enable_thinking": false,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a shell command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "rendered_sha256": "bbc24ea095e72ec5cff300f6578d4cffc2a6c99dfa2ddf963e337a4a2b387aec",
+   "token_count": 324,
+   "token_ids_le_u32_sha256": "2f27a2d2c4229db230f9ac89bcf7b24bca1cb0f89255b25debc5919d58824a59"
+  },
+  {
+   "name": "system_tools",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be concise."
+    },
+    {
+     "role": "user",
+     "content": "Name one color."
+    }
+   ],
+   "tools": true,
+   "enable_thinking": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a shell command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe concise.<|im_end|>\n<|im_start|>user\nName one color.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "rendered_sha256": "7fc39f18ff17fcf3dfbba92e0bf2fcfc89ef871f27c3b56d406262970ba4f398",
+   "token_count": 326,
+   "token_ids_le_u32_sha256": "8b263aa5a33f1f99b235ee7a48c51f1ae1873500684b740034a5509058e9b87b"
+  },
+  {
+   "name": "tool_loop",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "thought": "I need the weather tool.",
+     "tool_calls": [
+      {
+       "name": "get_weather",
+       "arguments": [
+        [
+         "city",
+         "Paris"
+        ]
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 21 C"
+    }
+   ],
+   "tools": true,
+   "enable_thinking": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a shell command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nI need the weather tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "rendered_sha256": "1fe52658910bd5d2e53905d5b1b474b31c5843543837f2501c9be441df291a30",
+   "token_count": 382,
+   "token_ids_le_u32_sha256": "7ccd570bf972b8f2f84e7463eeb2717fc3d5df94bb5551d0b14d614881fd90a9"
+  },
+  {
+   "name": "multi_tool",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be concise."
+    },
+    {
+     "role": "user",
+     "content": "Compare Paris and Rome, then list src."
+    },
+    {
+     "role": "assistant",
+     "content": "Let me check both cities.",
+     "thought": "Two weather calls and one shell call.",
+     "tool_calls": [
+      {
+       "name": "get_weather",
+       "arguments": [
+        [
+         "city",
+         "Paris"
+        ]
+       ]
+      },
+      {
+       "name": "get_weather",
+       "arguments": [
+        [
+         "city",
+         "Rome"
+        ]
+       ]
+      },
+      {
+       "name": "shell",
+       "arguments": [
+        [
+         "command",
+         "ls src\nwc -l src/*"
+        ]
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 21 C"
+    },
+    {
+     "role": "tool",
+     "content": "Cloudy, 18 C"
+    },
+    {
+     "role": "tool",
+     "content": "main.cpp\nutil.hpp"
+    },
+    {
+     "role": "assistant",
+     "content": "Paris is warmer.",
+     "thought": "Paris 21, Rome 18."
+    },
+    {
+     "role": "user",
+     "content": "Thanks. Anything else?"
+    }
+   ],
+   "tools": true,
+   "enable_thinking": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a shell command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe concise.<|im_end|>\n<|im_start|>user\nCompare Paris and Rome, then list src.<|im_end|>\n<|im_start|>assistant\n<think>\nTwo weather calls and one shell call.\n</think>\n\nLet me check both cities.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=shell>\n<parameter=command>\nls src\nwc -l src/*\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 21 C\n</tool_response>\n<tool_response>\nCloudy, 18 C\n</tool_response>\n<tool_response>\nmain.cpp\nutil.hpp\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nParis 21, Rome 18.\n</think>\n\nParis is warmer.<|im_end|>\n<|im_start|>user\nThanks. Anything else?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "rendered_sha256": "7a9f6c0a07e249232044bcfc120fde097f645b7d462706bd27b15674bb891541",
+   "token_count": 513,
+   "token_ids_le_u32_sha256": "da9f70bc200c5439118bfa828306a18c9493a75f281e2cd7bf9a07b14e479a22"
+  }
+ ],
+ "tokenization": [
+  {
+   "name": "spaces",
+   "text": "hello  world   return x;    indented\t\tword",
+   "token_count": 12,
+   "token_ids_le_u32_sha256": "15ac41cdd7b3a0df17096a33aab26022bca3b9ff0f798d0b6034ce8eec4bc594"
+  },
+  {
+   "name": "code",
+   "text": "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n",
+   "token_count": 28,
+   "token_ids_le_u32_sha256": "ec15274193e25a328a853a3c8c53132e22b8ac7608d110b8f510c8ff1ad7853c"
+  },
+  {
+   "name": "unicode",
+   "text": "naïve café — 東京 🚀 ½",
+   "token_count": 12,
+   "token_ids_le_u32_sha256": "072bb415f236b77bcbc43afe13cd218436a0299090a4f815073b99755c7a9d41"
+  },
+  {
+   "name": "numbers",
+   "text": "3.14159 1,000,000 0x1F 2026-10-23",
+   "token_count": 33,
+   "token_ids_le_u32_sha256": "da0d845761c605d2d79eef2e1f4bbd87c3cab3847b3ad158b3153bbe80494302"
+  }
+ ]
+}

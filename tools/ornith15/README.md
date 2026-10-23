@@ -56,3 +56,29 @@ mapping, raised mean KL to 8.3 and 6.0 and failed every criterion.
 High-entropy positions are bounded only through the mean: KL on near-uniform
 distributions (the largest, 1.7 nats, at about 9 nats of entropy) does not
 separate faults from noise.
+
+# Ornith chat-template goldens
+
+`chat_goldens.py` regenerates `tests/fixtures/ornith15_chat_goldens.json`: the
+fixture's messages rendered by transformers' `apply_chat_template` with
+Ornith's `chat_template.jinja`, then tokenized by the Hugging Face tokenizer.
+`tests/fixtures/ornith15_chat_template.jinja` is that template, copied from
+the pinned revision. Use the flake's pinned transformers; torch is not needed:
+
+```sh
+HF=$(mktemp -d)
+for f in chat_template.jinja tokenizer.json tokenizer_config.json; do
+  curl -sSL -o "$HF/$f" \
+    "https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B/resolve/10fbf86fed7ecee4a061f8b499a618f46001cac1/$f"
+done
+nix shell --impure --expr '((builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.x86_64-linux.python313.withPackages (ps: [ ps.transformers ps.jinja2 ]))' \
+  -c python3 tools/ornith15/chat_goldens.py "$HF" tests/fixtures/ornith15_chat_goldens.json
+```
+
+`ornith15.chat_template` replays the rendered bytes without a model.
+`ornith15.chat_tokens` checks the token IDs through the GGUF's tokenizer and
+needs `GUFO_ORNITH15_APEX_MTP_MODEL`. Ornith keeps every past assistant turn's
+reasoning and adds no reasoning-effort instruction, so client effort and
+`preserve_thinking: false` leave the rendering unchanged. System and developer
+messages after the first turn are moved to the system turn, as for the other
+Qwen models; the reference template would reject them.

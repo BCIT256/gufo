@@ -160,6 +160,9 @@ struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{true};
   QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
+  /// Qwen3.8 templates state the effort in the system turn; models whose
+  /// template has no such text (Ornith) turn it off.
+  bool reasoning_instruction{true};
   bool preserve_thinking{true};
   bool add_vision_id{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
