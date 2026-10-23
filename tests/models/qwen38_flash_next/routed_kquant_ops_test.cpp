@@ -236,6 +236,34 @@ void Run(GgmlType type, bool down) {
                                   cols, tokens, kExperts, kUsed, nullptr))
           throw std::runtime_error("gated projection failed");
         const auto gated = Output(dg, count);
+        double gated_scale = 0.0, gated_error = 0.0;
+        for (std::size_t s = 0; s < ids.size(); ++s) {
+          for (int row = 0; row < rows; ++row) {
+            const auto offset = (std::size_t(ids[s]) * rows + row) * cols;
+            const auto* gate_weights = weights.values.data() + offset;
+            const auto* up_weights = paired.values.data() + offset;
+            const auto* input = x.data() + s / kUsed * cols;
+            double ref_gate = 0.0, ref_up = 0.0;
+            for (int k = 0; k < cols; ++k) {
+              ref_gate += static_cast<double>(gate_weights[k]) * input[k];
+              ref_up += static_cast<double>(up_weights[k]) * input[k];
+            }
+            const double expected =
+                (ref_gate / (1.0 + std::exp(-ref_gate))) * ref_up;
+            gated_scale = std::max(gated_scale, std::abs(expected));
+            gated_error = std::max(gated_error,
+                                   std::abs(expected - gated[s * rows + row]));
+          }
+        }
+        const double gated_tolerance = 1e-2 * gated_scale;
+        std::cout << std::setprecision(10) << name
+                  << " gated MMVQ tokens=" << tokens
+                  << " E=256 top=8 M=" << rows << " K=" << cols
+                  << " max_error=" << gated_error
+                  << " tolerance=" << gated_tolerance
+                  << " scale=" << gated_scale << std::endl;
+        if (!(gated_error < gated_tolerance))
+          throw std::runtime_error("gated projection exceeds F64 tolerance");
         // Use the existing grouping test's bit-identity contract against
         // separate scalar device gates (same exponential implementation).
         for (int t = 0; t < tokens; ++t) {

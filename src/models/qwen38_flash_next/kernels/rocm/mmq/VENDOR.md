@@ -37,10 +37,14 @@ Down inputs are independent slot rows (eight per token). Its independent
 host unpacking and F64 dots use the existing routed test's activation
 quantization bound: maximum error below 0.01 times maximum absolute reference
 output. Output guards, paired projections and scalar/grouped gate identity
-are also checked. These are synthetic operator checks, not full-model
-Ornith AR/MTP qualification.
+are also checked. Fused gated decode at 1/2/3/8 tokens is additionally checked
+against SiLU(F64 gate) * F64 up with the same relative bound, using independent
+host-unpacked gate and up weights. These are synthetic operator checks, not
+full-model Ornith AR/MTP qualification.
 
-The [operator result summary](../../../../../../docs/models/qwen3.8-flash-next/artifacts/ornith-routed-kquant.json)
-records the toolchain, fixture identities and per-shape errors. All 21
-Flash-Next tests (the existing 20 plus this check), formatting and the 66-test
-PR suite passed on October 23, 2026. Raw logs remain outside the repository.
+The preparation repository's `docs/results/ornith-routed-kquant.json` (outside
+this fork) records the toolchain, fixture identities and per-shape errors. All 21
+Flash-Next tests (the existing 20 plus this check) and formatting passed on
+October 23, 2026. The 66-test PR suite passed for the preceding format addition;
+it was not rerun for this test-only follow-up. Raw logs remain outside the
+repository.
