@@ -1,0 +1,21 @@
+<|im_start|>user
+List the files in the src directory.<|im_end|>
+<|im_start|>assistant
+<think>
+I should call the shell tool.
+</think>
+
+<tool_call>
+<function=shell>
+<parameter=command>
+ls src
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+main.cpp
+util.hpp
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

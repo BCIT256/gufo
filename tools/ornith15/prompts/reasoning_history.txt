@@ -1,0 +1,12 @@
+<|im_start|>user
+What is 17 times 23?<|im_end|>
+<|im_start|>assistant
+<think>
+17 times 20 is 340 and 17 times 3 is 51, so 391.
+</think>
+
+17 times 23 is 391.<|im_end|>
+<|im_start|>user
+And 391 divided by 17?<|im_end|>
+<|im_start|>assistant
+<think>
