@@ -1507,7 +1507,7 @@ __global__ void PleInjectKernel(float* res, const float* gated,
 /// packed [t][kh][d] buffers the recurrence streams from, so the serial loop
 /// carries no block-wide reductions. One wave per (token, head) row.
 constexpr unsigned kGdnDim = 128;
-template<bool kBatch>
+template<bool kBatch, bool kClampEps = false>
 __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
                               std::uint32_t n_rows, std::uint32_t k_heads,
                               std::uint32_t channels, float eps,
@@ -1544,8 +1544,13 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
     qs += qv[r] * qv[r];
     ks += kv[r] * kv[r];
   }
-  qs = rsqrtf(WaveSum(qs) + eps);
-  ks = rsqrtf(WaveSum(ks) + eps);
+  if constexpr (kClampEps) {
+    qs = 1.0f / fmaxf(sqrtf(WaveSum(qs)), eps);
+    ks = 1.0f / fmaxf(sqrtf(WaveSum(ks)), eps);
+  } else {
+    qs = rsqrtf(WaveSum(qs) + eps);
+    ks = rsqrtf(WaveSum(ks) + eps);
+  }
   float* q_out = qn + static_cast<std::size_t>(row) * d;
   float* k_out = kn + static_cast<std::size_t>(row) * d;
 #pragma unroll
@@ -1556,6 +1561,7 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
   }
 }
 
+template<bool kClampEps = false>
 __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
                                 std::uint32_t n_tokens, std::uint32_t k_heads,
                                 std::uint32_t channels, float eps) {
@@ -1582,8 +1588,13 @@ __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
   }
   if (lane == 0) {
     float* dst = scales + (static_cast<std::size_t>(t) * k_heads + kh) * 3;
-    dst[0] = rsqrtf(ks + eps);
-    dst[1] = rsqrtf(qs + eps) * rsqrtf(static_cast<float>(d));
+    if constexpr (kClampEps) {
+      dst[0] = 1.0f / fmaxf(sqrtf(ks), eps);
+      dst[1] = (1.0f / fmaxf(sqrtf(qs), eps)) * rsqrtf(static_cast<float>(d));
+    } else {
+      dst[0] = rsqrtf(ks + eps);
+      dst[1] = rsqrtf(qs + eps) * rsqrtf(static_cast<float>(d));
+    }
     dst[2] = kq;
   }
 }
@@ -2066,7 +2077,7 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
 /// of the ssm_out projection (K = v_heads * d) in place of the F32 row:
 /// each wave-wide slice of 32 lanes is one K block. Otherwise a non-null
 /// `out_q8_1` also receives the F32 rows' unpadded Q8_1 rows.
-template<bool kBatch>
+template<bool kBatch, bool kSilu = false>
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
                                   float* out, void* out_q8, __half* out_half,
@@ -2106,7 +2117,8 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
 #pragma unroll
     for (std::uint32_t r = 0; r < per_lane; ++r) {
       const std::uint32_t i = r * warpSize + lane;
-      const float value = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+      const float value = v[r] * scale * norm_w[i] *
+                          (kSilu ? SiluF(zrow[i]) : SigmoidF(zrow[i]));
       if (out_half != nullptr) {
         const auto offset =
             out_half_stride != 0
@@ -2128,7 +2140,8 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
 #pragma unroll
   for (std::uint32_t r = 0; r < per_lane; ++r) {
     const std::uint32_t i = r * warpSize + lane;
-    const float n = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+    const float n =
+        v[r] * scale * norm_w[i] * (kSilu ? SiluF(zrow[i]) : SigmoidF(zrow[i]));
     float max_abs = fabsf(n);
     for (int off = 16; off > 0; off >>= 1) {
       max_abs = fmaxf(max_abs, XorLane(max_abs, off));
@@ -7416,7 +7429,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
-                   std::uint32_t out_half_stride, void* out_q8_1) {
+                   std::uint32_t out_half_stride, void* out_q8_1, GdnGate gate,
+                   GdnL2Norm l2_norm) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
@@ -7462,37 +7476,53 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                        stream, conv_scratch + count, conv_state, hist_count);
   }
   const unsigned waves = kThreads / 32;
-  if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
-    hipLaunchKernelGGL(GdnPrepKqKernel, dim3(k_heads, n_tokens), dim3(32), 0,
-                       stream, conv_scratch, qn, n_tokens, k_heads, channels,
-                       eps);
+  const auto recurrence = [&](auto clamp_tag) {
+    constexpr bool clamp = decltype(clamp_tag)::value;
+    if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
+      hipLaunchKernelGGL(GdnPrepKqKernel<clamp>, dim3(k_heads, n_tokens),
+                         dim3(32), 0, stream, conv_scratch, qn, n_tokens,
+                         k_heads, channels, eps);
+      hipLaunchKernelGGL(
+          GdnPrepAbKernel,
+          dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
+          dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
+          static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
+      hipLaunchKernelGGL(GdnRowSplitKernel,
+                         dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                         dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                         state, raw, n_tokens, k_heads, v_heads, checkpoint);
+    } else {
+      hipLaunchKernelGGL((GdnPrepKernel<false, clamp>),
+                         dim3((n_tokens * k_heads + waves - 1) / waves),
+                         dim3(kThreads), 0, stream, conv_scratch, qn, kn,
+                         n_tokens * k_heads, k_heads, channels, eps, nullptr,
+                         0);
+      hipLaunchKernelGGL(
+          GdnKernel<false>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
+          dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
+          alpha_beta, a, dt, state, raw, state_snapshots, n_tokens, k_heads,
+          v_heads, nullptr, 0, checkpoint);
+    }
+  };
+  if (l2_norm == GdnL2Norm::kClampEps)
+    recurrence(std::true_type{});
+  else
+    recurrence(std::false_type{});
+  const auto epilogue = [&](auto silu_tag) {
+    constexpr bool silu = decltype(silu_tag)::value;
     hipLaunchKernelGGL(
-        GdnPrepAbKernel,
-        dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
-        dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
-        static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
-    hipLaunchKernelGGL(GdnRowSplitKernel,
-                       dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
-                       dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
-                       state, raw, n_tokens, k_heads, v_heads, checkpoint);
-  } else {
-    hipLaunchKernelGGL(GdnPrepKernel<false>,
-                       dim3((n_tokens * k_heads + waves - 1) / waves),
-                       dim3(kThreads), 0, stream, conv_scratch, qn, kn,
-                       n_tokens * k_heads, k_heads, channels, eps, nullptr, 0);
-    hipLaunchKernelGGL(
-        GdnKernel<false>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
-        dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
-        alpha_beta, a, dt, state, raw, state_snapshots, n_tokens, k_heads,
-        v_heads, nullptr, 0, checkpoint);
-  }
-  hipLaunchKernelGGL(
-      GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),
-      dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out, out_q8,
-      out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0,
-      out_q8 == nullptr && out_half == nullptr && d == kGdnDim ? out_q8_1
-                                                               : nullptr,
-      out_half_stride);
+        (GdnEpilogueKernel<false, silu>),
+        dim3((n_tokens * v_heads + waves - 1) / waves), dim3(kThreads), 0,
+        stream, raw, z, z_stride, norm_w, out, out_q8, out_half,
+        n_tokens * v_heads, v_heads, eps, nullptr, 0,
+        out_q8 == nullptr && out_half == nullptr && d == kGdnDim ? out_q8_1
+                                                                 : nullptr,
+        out_half_stride);
+  };
+  if (gate == GdnGate::kSilu)
+    epilogue(std::true_type{});
+  else
+    epilogue(std::false_type{});
 }
 
 bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,

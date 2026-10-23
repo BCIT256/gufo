@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/ornith15/trace.hpp"
 #include "src/models/ornith15/weights.hpp"
 
 namespace gufo::models::ornith15 {
@@ -22,7 +23,8 @@ public:
   /// Runs one token at the next position; `logits` (vocab floats) receives
   /// the output distribution when non-empty.
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits,
-                          std::string* error_msg = nullptr);
+                          std::string* error_msg = nullptr,
+                          LayerTrace* trace = nullptr);
 
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   void Reset();

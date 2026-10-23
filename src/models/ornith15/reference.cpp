@@ -267,7 +267,7 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
 }
 
 bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
-                          std::string* error_msg) {
+                          std::string* error_msg, LayerTrace* trace) {
   if (position_ >= max_context_) {
     if (error_msg != nullptr) {
       *error_msg = "reference context is full";
@@ -287,6 +287,8 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     return false;
   }
   const std::uint32_t hidden = c_.hidden_size;
+  if (trace)
+    trace->resize(c_.num_layers);
 
   std::vector<float> res(hidden);
   cpu::DequantizeRow(w_.token_embd, 0, static_cast<std::uint64_t>(token),
@@ -315,6 +317,8 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     for (std::uint32_t i = 0; i < hidden; ++i) {
       res[i] += block_out[i];
     }
+    if (trace)
+      (*trace)[il] = res;
   }
   if (!logits.empty()) {
     cpu::RmsNorm(res, static_cast<const float*>(w_.output_norm.data),

@@ -17,3 +17,16 @@ target_link_libraries(gufo_ornith15_reference PUBLIC gufo_ornith15)
 # even as an oracle, so it keeps -O2 in every configuration.
 set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
+
+if (ENGINE_ENABLE_HIP)
+  add_library(gufo_ornith15_gpu STATIC
+    kernels/rocm/device_model.cpp
+    kernels/rocm/executor.cpp
+    kernels/rocm/kernels.hip.cpp)
+  set_source_files_properties(kernels/rocm/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
+  target_compile_options(gufo_ornith15_gpu PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O2>
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>)
+  target_link_libraries(gufo_ornith15_gpu PUBLIC
+    gufo_ornith15 gufo_qwen38_flash_next gufo_qwen38_flash_next_mmq hip::host)
+endif()

@@ -335,14 +335,17 @@ struct GdnCheckpoint {
   std::uint32_t tokens = 0;
 };
 
+enum class GdnGate { kSigmoid, kSilu };
+enum class GdnL2Norm { kAddEps, kClampEps };
+
 /// Gated DeltaNet over a chunk of tokens for one layer. Runs the causal
 /// conv (with rolling `conv_state`, [kernel-1][channels]) and the recurrence
 /// on `state` ([v_heads][d][d]) sequentially over tokens, parallel over heads
 /// and value dims. `alpha_beta` holds both projections per token:
 /// [t][alpha(v_heads) | beta(v_heads)]. Outputs the normalized,
-/// sigmoid-gated attention rows [tokens][v_heads*d] ready for the output
-/// projection.
-/// `state_snapshots` ([n_tokens-1][v_heads*d*d]) and `conv_snapshots`
+/// gated attention rows (sigmoid by default; SiLU for Qwen3.5)
+/// [tokens][v_heads*d] ready for the output projection. `state_snapshots`
+/// ([n_tokens-1][v_heads*d*d]) and `conv_snapshots`
 /// ([n_tokens-1][(kernel-1)*channels]), when populated, receive the state after
 /// each proper prefix. The live state already holds the full batch.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
@@ -367,7 +370,9 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
-                   std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr);
+                   std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
+                   GdnGate gate = GdnGate::kSigmoid,
+                   GdnL2Norm l2_norm = GdnL2Norm::kAddEps);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
