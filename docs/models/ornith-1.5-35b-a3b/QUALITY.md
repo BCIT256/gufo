@@ -1,7 +1,7 @@
 # Ornith GPU AR checkpoint quality
 
-Original P4 evidence is retained below; the P4b follow-up at the end records
-the current one-pass policy.
+Historical P4/P4b evidence is retained below; the P4c section at the end
+records the current policy and acceptance criteria.
 
 October 23, 2026; synthetic operators and teacher-forced full-vocabulary
 comparisons at 183 positions in three fixed histories. This is a numerical
@@ -91,3 +91,18 @@ KL against the scalar reference is higher than with blanket correction;
 this is qualification within the fixed envelope, not numerical equivalence.
 See [the full before/after record](EXPERIMENTS.md#final-uncached-qualification)
 for maxima, rejected controls, remaining uncertainties and test evidence.
+
+## P4c held-out policy decision
+
+Current policy: **B** under the rule committed before measurement.
+The current clear-flip criterion requires a reference margin above 1.0
+logit and agreement of both llama.cpp captures with reference top-1.
+Reference entropy < 0.5, confident KL <= 0.1, and per-prompt mean
+KL(llama || GPU) <= 2x KL(llama batch || sequential) remain unchanged.
+The test completes all histories and returns failure if any criterion fails.
+
+Held-out failures: A 6, B 3.
+This is a bounded policy decision, not a general capability, long-context
+or exact-logit-equivalence claim. Full per-prompt counts, confidence maxima,
+KL directions and original-prompt before/after results are in
+[EXPERIMENTS.md](EXPERIMENTS.md#p4c-held-out-results).

@@ -28,7 +28,8 @@ router and shared-gate weights stay F32. Attention output projections retain
 F32 activations and multiply their original packed Q6_K/Q8_0 weights directly;
 all remaining quantized projections use one Q8_1 MMVQ pass. No projection uses
 a second residual pass. See [experiments](EXPERIMENTS.md) for the isolation and
-quality evidence. Weights are never narrowed or replaced. The Ornith device
+quality evidence, including the pre-registered held-out comparison. Weights
+are never narrowed or replaced. The Ornith device
 helpers are the Q6_K embedding gather and the F32-input dense projection.
 
 `ornith15.gpu_ops` checks embedding bytes, single-pass routed projections and

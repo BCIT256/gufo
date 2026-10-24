@@ -57,6 +57,27 @@ High-entropy positions are bounded only through the mean: KL on near-uniform
 distributions (the largest, 1.7 nats, at about 9 nats of entropy) does not
 separate faults from noise.
 
+## Held-out activation-policy captures
+
+The six fixed histories in `prompts/heldout/` were committed before the P4c
+comparison. See the [pre-registered rule and results](../../docs/models/ornith-1.5-35b-a3b/EXPERIMENTS.md#p4c-pre-registration-held-out-activation-policy-october-23-2026).
+Use the same pinned model, existing dumper and libraries for both capture
+modes, storing output outside the source tree:
+
+```sh
+for p in tools/ornith15/prompts/heldout/*.txt; do
+  name=$(basename "$p" .txt)
+  ./llama_logits "$MODEL" "$p" "$OUT/$name.ologits" 28
+  ./llama_logits "$MODEL" "$p" "$OUT/$name.sequential.ologits" 28 sequential
+done
+```
+
+Point `GUFO_ORNITH15_LLAMA_LOGITS` at that directory and run
+`ctest --preset gpu-full -R '^ornith15\.gpu_decode$' -V` with the model variable
+set. A failing CTest run repeats its output; count each history once.
+The GPU test completes every history and reports criterion failures separately
+from ordinary top-1 disagreement. A missing-model/capture skip is not a pass.
+
 # Ornith chat-template goldens
 
 `chat_goldens.py` regenerates `tests/fixtures/ornith15_chat_goldens.json`: the

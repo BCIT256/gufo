@@ -263,3 +263,139 @@ policy search, prompt replacement or result-driven exclusion is allowed.
 Timings from synchronous traced Steps are informational only. Raw captures,
 logs, traces and private identities stay in ignored artifacts; check in bounded
 result summaries and remove the temporary A code toggle.
+
+### P4c held-out results
+
+Pre-registration: `577030c4`; criterion alignment: `34ad50f1`; starting
+policy: `b5968851`. Six histories, 649 held-out positions. All
+prompt bytes match the pinned independent Jinja template, and all paired
+captures contain identical token IDs. The existing CPU llama.cpp dumper/build
+was reused at `68d9053afd4f4d0752ced6187585f862355a40be`, with 28 threads,
+no BOS and special-token parsing. No prompt or threshold changed after
+pre-registration. Every comparison recomputed the scalar reference uncached.
+
+A = all quantized projections use single-pass Q8_1; B = F32 input only for
+full-attention o_proj. F32 stored weights retain their normal F32 path.
+KL directions below are reference || GPU, llama batch || GPU, and llama
+batch || sequential. Confident maxima use each named teacher's entropy.
+
+| Set / history | Policy | Positions | Top-1 reference / llama | Clear flips | Confident failures | Mean-KL failures | KL reference mean / max | KL llama mean / max | Confident max KL reference / llama | Llama batch/sequential mean |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- | --- | --- | ---: |
+| heldout / code_diff | A | 110 | 94/110 / 90/110 | 0 | 0 | 0 | 0.070468512 / 1.0313216 | 0.094288373 / 1.1443894 | 0.0056009285 / 0.46160684 | 0.17893345 |
+| heldout / code_diff | B | 110 | 99/110 / 91/110 | 0 | 1 | 0 | 0.073933167 / 2.8894865 | 0.088656158 / 1.1275335 | 0.12203016 / 0.081545139 | 0.17893345 |
+| heldout / kept_reasoning | A | 105 | 92/105 / 81/105 | 2 | 0 | 0 | 0.13640859 / 3.6799383 | 0.14094481 / 3.0633738 | 0.015614306 / 0.034344576 | 0.14903544 |
+| heldout / kept_reasoning | B | 105 | 88/105 / 81/105 | 0 | 0 | 0 | 0.049041231 / 0.70830451 | 0.1023016 / 2.2514763 | 0.022650992 / 0.016602408 | 0.14903544 |
+| heldout / long_reasoning | A | 113 | 94/113 / 88/113 | 0 | 1 | 0 | 0.048527514 / 1.2393714 | 0.055289752 / 0.56602558 | 0.12334056 / 0.00019811087 | 0.055639588 |
+| heldout / long_reasoning | B | 113 | 99/113 / 84/113 | 0 | 0 | 0 | 0.04206219 / 1.3063301 | 0.052702931 / 0.62567909 | 0.04689614 / 9.29108e-05 | 0.055639588 |
+| heldout / plain_prose | A | 100 | 87/100 / 76/100 | 0 | 0 | 0 | 0.025913674 / 0.31505611 | 0.12046446 / 3.4974406 | 0.033517009 / 1.99137 | 0.074674158 |
+| heldout / plain_prose | B | 100 | 89/100 / 79/100 | 0 | 0 | 0 | 0.063396081 / 3.1470488 | 0.094277856 / 2.9361005 | 0.027702202 / 0.035650701 | 0.074674158 |
+| heldout / spanish | A | 100 | 81/100 / 79/100 | 0 | 0 | 0 | 0.037649034 / 0.33639265 | 0.063203406 / 1.0661992 | 0.022700281 / 0.012956418 | 0.056702974 |
+| heldout / spanish | B | 100 | 78/100 / 77/100 | 0 | 0 | 0 | 0.036191724 / 0.4110262 | 0.052564251 / 0.59908337 | 0.022550202 / 0.020454059 | 0.056702974 |
+| heldout / tool_two_parameters | A | 121 | 108/121 / 101/121 | 3 | 0 | 0 | 0.073414922 / 1.3188008 | 0.093053286 / 1.5166993 | 0.048204906 / 1.0630969 | 0.13134111 |
+| heldout / tool_two_parameters | B | 121 | 110/121 / 106/121 | 2 | 0 | 0 | 0.071854248 / 0.72470664 | 0.098024796 / 1.0103834 | 0.055388525 / 0.21469149 | 0.13134111 |
+| original / reasoning_history | A | 87 | 76/87 / 80/87 | 1 | 1 | 0 | 0.082250022 / 1.9611435 | 0.087975424 / 2.1981747 | 0.54480881 / 0.58774378 | 0.051043799 |
+| original / reasoning_history | B | 87 | 84/87 / 78/87 | 0 | 0 | 0 | 0.026664561 / 0.64002507 | 0.046719767 / 0.96422866 | 0.028198478 / 0.00970574 | 0.051043799 |
+| original / tool_round_trip | A | 75 | 62/75 / 65/75 | 0 | 1 | 0 | 0.069785238 / 1.3760381 | 0.089850426 / 2.1064567 | 0.12531203 / 0.075479761 | 0.085345053 |
+| original / tool_round_trip | B | 75 | 70/75 / 67/75 | 0 | 0 | 0 | 0.049597389 / 0.85085553 | 0.079625509 / 1.5319457 | 0.082325103 / 0.083623695 | 0.085345053 |
+| original / user_turn | A | 21 | 18/21 / 16/21 | 0 | 0 | 0 | 0.025165854 / 0.3006784 | 0.029226662 / 0.19225252 | 0.0031156069 / 0.010902197 | 0.0324381 |
+| original / user_turn | B | 21 | 19/21 / 19/21 | 0 | 0 | 0 | 0.0098896201 / 0.097234518 | 0.020284993 / 0.16821371 | 0.0019467432 / 0.0067746719 | 0.0324381 |
+
+Original-prompt before/after alignment, current B policy: all three pass
+under both versions, with identical top-1 counts and every KL statistic above.
+The old-criterion binary was retained before rebuilding the aligned test.
+
+| Original history | B old / aligned clear flips | A old-margin / aligned clear flips |
+| --- | ---: | ---: |
+| reasoning_history | 0 / 0 | 2 / 1 |
+| tool_round_trip | 0 / 0 | 1 / 0 |
+| user_turn | 0 / 0 | 0 / 0 |
+
+A's old-margin counts are computed alongside the aligned run; they are
+not a second A run under the old test's early-exit behavior.
+
+Held-out criterion failures: A **6**, B **3**.
+Position-weighted total mean KL(llama || GPU): A **0.094059943**,
+B **0.081655605**; B's relative reduction is
+**13.1877%**. The pre-registered rule
+therefore keeps **B**. Original prompts do not contribute to this choice.
+
+### P4c informational timings
+
+Same synchronous traced Step scope as P4b: includes GPU launches, full logits
+and layer downloads; excludes model upload, scalar-reference work and reset.
+Measurements are interleaved with uncached CPU-reference steps. All inference
+and capture jobs ran sequentially, on AC power with the balanced platform
+profile. These are single runs in B-then-A order, not an alternating production
+benchmark or an equivalent-fidelity speedup claim.
+
+| Set / history | A ms/token | B ms/token |
+| --- | ---: | ---: |
+| heldout / code_diff | 48.3580 | 50.0372 |
+| heldout / kept_reasoning | 48.1195 | 50.1268 |
+| heldout / long_reasoning | 47.9679 | 50.0629 |
+| heldout / plain_prose | 47.8842 | 49.9818 |
+| heldout / spanish | 48.1723 | 50.0421 |
+| heldout / tool_two_parameters | 48.3374 | 50.0149 |
+| original / reasoning_history | 48.3775 | 50.2090 |
+| original / tool_round_trip | 47.9242 | 49.9192 |
+| original / user_turn | 48.2836 | 50.0510 |
+
+Held-out position-weighted timing: A 48.1460, B 50.0442 ms/token.
+
+Identity hashes and all numeric rows are in [p4c-results.json](p4c-results.json).
+Raw rows, build/test logs, traces and private identities remain in ignored
+`artifacts/p4c/`; held-out ORNL captures remain in ignored
+`artifacts/reference/heldout/`. Toolchain and model are unchanged from P4b;
+the full model digest was reverified before comparison.
+
+### P4c limits and unexplained behavior
+
+B is retained because it has fewer held-out criterion failures (3 versus 6),
+not because it clears the 20% KL-reduction arm (13.1877%). Neither policy
+passes the complete held-out numerical contract. B fails confident-reference
+KL at code_diff position 75 (0.1220301624) and has corroborated clear flips
+at tool_two_parameters positions 96 and 104. A instead fails kept_reasoning
+with two clear flips, long_reasoning with one confident-KL violation, and
+the tool history with three criterion failures. All six held-out prompt
+mean-KL criteria pass for both policies.
+
+The direction and location of the failures depend on the activation policy.
+These measured observations do not establish a monotonic benefit from more
+F32 arithmetic, an operator bug, or universal generalization. A causal account
+of the recurrent/routing decisions amplifying each perturbation remains
+unexplained. No further policies were tried and no thresholds were changed.
+The o-F32 kernel and its independent F64 tests remain; the temporary A source
+toggle is removed.
+
+CTest repeats verbose output for a failed test. The initial orchestration
+counted those repeated rows twice and stopped after B completed; its
+bookkeeping was corrected to count unique history names, then A was run.
+All completed B measurements were retained without a rerun or exclusion.
+
+Reproduction: use the held-out batch/sequential capture loop in
+[tools/ornith15/README.md](../../../tools/ornith15/README.md#held-out-activation-policy-captures),
+then the documented GPU configure/build and decode test with each capture
+directory. To reproduce A, temporarily replace only the full-attention
+`Session::Attention` call to `DenseMatVecF32` with
+`Dense(l.attn_out, ctx_, block_out_)`, rebuild, and restore the source after
+measurement. B is the committed default; no runtime policy selector exists.
+
+### P4c final validation
+
+GPU configure and both target builds passed. Retained B's rebuilt executable
+has exactly the pre-comparison B SHA256; production source is unchanged from
+`b5968851`. The final combined Ornith and Flash-Next suite passed **29/29**,
+zero failures/skips, **571.07 seconds**, using the original oracle directory.
+Its B results reproduce every original-prompt top-1/KL/failure statistic above.
+This original-set suite pass does not erase the held-out failures.
+Formatting passed **650 C++ files**. Plain host `cmake --preset cpu-test` and
+`cmake --build --preset pr -j 28` passed **66/66**, zero failures/skips,
+**36.01 seconds**. AC power and balanced profile matched at start and finish.
+
+The first CPU attempt incorrectly wrapped the existing host-configured
+CPU build in `nix develop`: 56/66 tests failed at startup with glibc 2.43
+requirements versus Nix's 2.42 runtime, including loader errors and aborts.
+The plain host commands above resolve that environment mismatch without
+source changes. Both attempts remain in the raw logs (`pr-final.log` and
+`pr-host.log`); this did not affect the GPU-policy comparison or its pinned
+Nix toolchain. CPU host tool versions are recorded in `p4c-results.json`.

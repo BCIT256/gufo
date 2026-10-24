@@ -1,7 +1,7 @@
 # Ornith GPU AR checkpoint measurements
 
-Original P4 evidence is retained below; the P4b follow-up at the end records
-the current one-pass policy.
+Historical P4/P4b evidence is retained below; the P4c section at the end
+records the current policy and acceptance criteria.
 
 October 23, 2026; gfx1151, pinned Nix RelWithDebInfo correctness build with
 assertions. These are informational measurements from eager single-token
@@ -53,3 +53,11 @@ benchmarks, and do not establish equivalent numerical fidelity. See
 AC power, balanced platform profile. Model-owned weight allocations remain
 22,811,415,040 bytes. Correction scratch decreases by 1,161,216 bytes per
 session; no extra persistent unpacked-weight allocation is introduced.
+
+## P4c held-out A/B timings
+
+Position-weighted held-out eager traced Steps: A 48.1460,
+B 50.0442 ms/token over 649 positions. Kept policy: B.
+Single sequential B-then-A comparison with uncached scalar-reference
+interleave, not an alternating production benchmark or an equivalent-fidelity
+speedup claim. See [per-prompt timings and scope](EXPERIMENTS.md#p4c-informational-timings).
