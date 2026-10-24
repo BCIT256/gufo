@@ -792,3 +792,38 @@ left-associated Q8_0 sequences are not bit-identical to G on those 10
 rows. Layer-0 Q6_K projections, which are the linear-attention dots,
 match a predeclared sequence on every synthetic row tried here. This
 does not locate the three held-out logit failures.
+
+### P4e layer-0 replay (held-out code_diff tokens 0–75)
+
+`ornith15_layer0_replay_test` replays layer 0 only, from a zero
+convolution history and a zero recurrent state, using `EmbedQ6`,
+`RmsNormRows`, `qfn_mmq_quantize_q8_1`, `qfn_mmq_moe_vec` and
+`GatedDeltaNet`. It does not run MoE or layers 1–39. Token IDs are the
+first 76 entries of held-out `code_diff.ologits`. The host Q6 sequences
+were checked against the synthetic GPU dump before this replay: 8 of 8
+rows at K = 256 and 8 of 8 at K = 2048 matched a declared sequence.
+The log is ignored `artifacts/p4e/wp2-layer0-replay.log`.
+
+On all 76 tokens, embedding bytes match the host Q6 reconstruction, and
+every row of `ssm_qkv`, `ssm_gate`, `ssm_alpha`, `ssm_beta` and
+`ssm_out` matches `D_mul`, `D_fma_inner` or `D_fma_outer`. There is no
+first unexplained Q6 dot.
+
+The independent encoder matches the GPU Q8_1 codes and stored scale on
+every block of all 76 norm rows (K = 2048, 64 blocks each). Two blocks,
+token 63 block 16 and token 66 block 47, differ only in the auxiliary
+half, by one binary16 ulp. Nearby binary32 scales that keep the same
+codes and the same stored scale reproduce that auxiliary, so the device
+`amax / 127` division is not always the correctly rounded quotient.
+Q6_K MMVQ does not read the auxiliary. The layer-0 dots are unaffected.
+
+Host SiLU of the GPU convolution association stays within 1.9e-6
+absolute of the GPU post-SiLU value. The pairwise gap between the two
+f32 add associations exceeds the published one-summation `γ_3` bound on
+some channels (first token 4 in this run). A host-only Monte Carlo of
+those same two associations also exceeds it, up to about 1.23 times
+`γ_3 P`, so that excess is the pairwise gap against a one-summation
+sufficient bound. Prep, libm recurrence and epilogue stay within
+1.8e-7, 1.9e-6 and 7.2e-7 absolute. Those gaps are math-library drift,
+not a broken layer-0 dot. Position 75's registered logit failure is not
+explained inside layer 0.
