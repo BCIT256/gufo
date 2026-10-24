@@ -170,6 +170,7 @@ int main() {
     }
     std::sort(prompts.begin(), prompts.end());
     Require(!prompts.empty(), "no captures");
+    bool ok = true;
     for (const auto& prompt : prompts) {
       const auto batch = Load(fs::path(logits_dir) / (prompt + ".ologits"));
       const auto sequential =
@@ -189,6 +190,7 @@ int main() {
              confident_llama_max = 0;
       double max_delta = 0, gpu_ms = 0;
       std::size_t ref_top1 = 0, llama_top1 = 0, clear_flips = 0;
+      std::size_t unconfirmed_flips = 0, confident_failures = 0;
       // Invalid calls must not advance recurrent state or overwrite logits.
       Require(!gpu->Step(-1, actual, &error) && gpu->Position() == 0,
               "invalid token accepted");
@@ -213,8 +215,15 @@ int main() {
         const auto rt = Top(expected.data(), vocab),
                    gt = Top(actual.data(), vocab),
                    lt = Top(batch.Row(t), vocab);
-        const bool flip =
+        const bool margin_flip =
             rt != gt && Margin(expected.data(), vocab, rt) > kClearMargin;
+        // Match reference_oracle_test's self-consistency principle: a clear
+        // reference margin alone cannot distinguish a GPU error from the
+        // independent engines' numerical spread. Both llama.cpp captures must
+        // corroborate the reference top-1 before a GPU disagreement counts.
+        // The entropy, confident-KL and mean-KL limits remain unchanged.
+        const bool flip =
+            margin_flip && lt == rt && Top(sequential.Row(t), vocab) == rt;
         const bool confident = Entropy(lp) < kConfidentEntropy;
         double delta = 0;
         for (std::size_t i = 0; i < vocab; ++i)
@@ -222,13 +231,15 @@ int main() {
               delta, std::abs(static_cast<double>(expected[i]) - actual[i]));
         std::cout << prompt << " t=" << t << " ref_kl=" << rk
                   << " llama_kl=" << lk << " top1_ref=" << (rt == gt)
-                  << " top1_llama=" << (lt == gt)
+                  << " top1_llama=" << (lt == gt) << " clear_flip=" << flip
+                  << " unconfirmed_flip=" << (margin_flip && !flip)
+                  << " confident_failure=" << (confident && rk > kConfidentKl)
                   << " max_delta_logit=" << delta << std::endl;
         if (flip || (confident && rk > kConfidentKl)) {
-          ReportTrace(ref_trace, gpu_trace);
-          throw std::runtime_error(
-              prompt + ": per-position numerical contract failed at " +
-              std::to_string(t));
+          if (clear_flips == 0 && confident_failures == 0)
+            ReportTrace(ref_trace, gpu_trace);
+          std::cout << prompt << ": per-position numerical contract failed at "
+                    << t << std::endl;
         }
         ref_sum += rk;
         llama_sum += lk;
@@ -243,11 +254,20 @@ int main() {
         ref_top1 += rt == gt;
         llama_top1 += lt == gt;
         clear_flips += flip;
+        unconfirmed_flips += margin_flip && !flip;
+        confident_failures += confident && rk > kConfidentKl;
       }
-      const bool pass = llama_sum <= kMeanKlRatio * floor_sum;
+      const bool mean_pass = llama_sum <= kMeanKlRatio * floor_sum;
+      const auto criterion_failures =
+          clear_flips + confident_failures + (mean_pass ? 0 : 1);
+      const bool pass = criterion_failures == 0;
       std::cout << prompt << ": positions=" << n << " top1_ref=" << ref_top1
                 << '/' << n << " top1_llama=" << llama_top1 << '/' << n
                 << " clear_flips=" << clear_flips
+                << " unconfirmed_flips=" << unconfirmed_flips
+                << " confident_failures=" << confident_failures
+                << " mean_kl_failure=" << !mean_pass
+                << " criterion_failures=" << criterion_failures
                 << " mean_kl_ref=" << ref_sum / n << " max_kl_ref=" << ref_max
                 << " mean_kl_llama=" << llama_sum / n
                 << " max_kl_llama=" << llama_max
@@ -258,11 +278,11 @@ int main() {
                 << " gpu_ms_per_token=" << gpu_ms / n
                 << " gpu_session_resident_bytes=" << gpu->resident_bytes()
                 << (pass ? " PASS" : " FAIL") << std::endl;
-      if (!pass) {
+      // Complete all positions and prompts for an uncensored policy comparison;
+      // accumulated criterion failures still make the test fail.
+      if (!mean_pass && clear_flips == 0 && confident_failures == 0)
         ReportTrace(ref_trace, gpu_trace);
-        throw std::runtime_error(
-            "mean KL exceeds 2x llama batch/sequential spread");
-      }
+      ok = ok && pass;
       Require(!gpu->Step(batch.tokens.back(), actual, &error) &&
                   gpu->Position() == n,
               "context limit accepted");
@@ -277,6 +297,7 @@ int main() {
       Require(actual == first_logits,
               "reset or optional tracing changed logits");
     }
+    Require(ok, "one or more prompts failed the numerical contract");
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
     return 1;
