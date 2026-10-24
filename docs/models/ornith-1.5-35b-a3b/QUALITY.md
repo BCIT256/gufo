@@ -106,3 +106,33 @@ This is a bounded policy decision, not a general capability, long-context
 or exact-logit-equivalence claim. Full per-prompt counts, confidence maxima,
 KL directions and original-prompt before/after results are in
 [EXPERIMENTS.md](EXPERIMENTS.md#p4c-held-out-results).
+
+## P4d: scalar-oracle failures and control limits
+
+October 24, 2026 diagnostic record. Production policy remains B. No threshold
+changed. The details, identities and control limits are in
+[EXPERIMENTS.md](EXPERIMENTS.md#p4d-prior-evidence-recorded-october-24-2026-not-a-new-measurement).
+
+The scalar reference fails its existing native-oracle contract on held-out
+`code_diff`, `plain_prose` and `tool_two_parameters`. `kept_reasoning`,
+`long_reasoning` and `spanish` pass. Native batch and sequential captures
+themselves reach confident KL 5.0404 on code and 1.4487 on the tool history.
+That spread does not waive B's three GPU failures and does not relax the
+GPU gates.
+
+F32 K/V storage alone did not change llama.cpp captures, because Flash
+Attention casts K/V back to F16. Disabling Flash Attention as well, and
+evaluating Q8_0, Q5_K, Q6_K and IQ4_XS dots in F64 on dequantized blocks,
+brings sequential prose and tool top-1 to full agreement with the scalar
+reference and leaves code at 108/110 with mean KL about 0.00364. F32-weight
+projections, including routing, were not part of that change. An unmodified
+quantized rebuild reproduced the three original sequential captures
+byte-for-byte. These controls are not replacement goldens.
+
+A uniform second activation-residual pass on the remaining Q8_1 projections
+removed the tool flips and created confident KL 5.280833756 at code position
+54. It was rejected. B's binary was restored to
+`a5358cb088996ee0b69dec483edcedd21789c062535a8bb76e9cb2c5fb7d332d`.
+The next measurement protocol is registered in
+[EXPERIMENTS.md](EXPERIMENTS.md#p4e-protocol-registered-october-24-2026-before-new-scoring)
+and is not itself a result.

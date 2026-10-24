@@ -399,3 +399,349 @@ The plain host commands above resolve that environment mismatch without
 source changes. Both attempts remain in the raw logs (`pr-final.log` and
 `pr-host.log`); this did not affect the GPU-policy comparison or its pinned
 Nix toolchain. CPU host tool versions are recorded in `p4c-results.json`.
+
+## P4d prior evidence (recorded October 24, 2026; not a new measurement)
+
+P4d ran after `a97a8495` and did not change production sources. On October 24
+the following identities were rehashed and matched the P4c pins, so the P4d
+artifacts below are adopted as prior evidence rather than rerun:
+
+| Identity | SHA256 |
+| --- | --- |
+| Engine HEAD | `a97a84950d11191ab1dfa9fe0081ef0e011d0009` |
+| APEX MTP Quality GGUF | `c83373e4c502c6d4929339406ffbb1f442598b153a3ade02b628752e00a282fd` |
+| Restored B `ornith15_gpu_decode_test` | `a5358cb088996ee0b69dec483edcedd21789c062535a8bb76e9cb2c5fb7d332d` |
+| Native dumper | `f5bd6218664e66bc837e81f4727f79536a70cb5850d7b4034d9dd0edccb1137b` |
+| llama.cpp archive `68d9053a` | `7ec6ef2e02c29a15879cd4c997b55976f1f0bbce4a042de15b71b376df52dc40` |
+
+`reference.cpp`, `executor.cpp`, `gpu_decode_test.cpp` and
+`reference_oracle_test.cpp` match `artifacts/p4d/identities.json`. All six
+original captures, all twelve held-out captures, the five reference libraries,
+the six held-out prompt bytes and the three frozen confirmation prompts match
+the recorded digests. Confirmation prompts were hashed only; they were not
+scored. Git status at this record is `ornith-apex` with those production
+sources clean. No push was done.
+
+The scalar reference's unchanged native-oracle contract fails 3 of 6 held-out
+histories. Original-set passage did not qualify these histories.
+
+| History | Positions | Outcome | Clear-flip positions | Confident-KL positions | Confident max KL | Mean KL | Native self-spread confident max |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: |
+| code_diff | 110 | fail | 62 | 48 | 0.3352508399 | 0.1136313756 | 5.040428549 |
+| kept_reasoning | 105 | pass | none | none | 0.01184742515 | 0.09683127252 | 0.008572688449 |
+| long_reasoning | 113 | pass | none | none | 0.001439062827 | 0.05190873378 | 0.001561245914 |
+| plain_prose | 100 | fail | 47 | 87 | 1.676610564 | 0.1138889323 | 0.04933347484 |
+| spanish | 100 | pass | none | none | 0.003007087172 | 0.06015610973 | 0.03758152676 |
+| tool_two_parameters | 121 | fail | 86 | 44, 58, 82 | 0.8428643482 | 0.09802616422 | 1.448712299 |
+
+Native batch-versus-sequential confident KL reaches 5.0404 on code and 1.4487
+on the tool history. That is reference numerical spread. It does not erase a
+GPU criterion and it is not a reason to change a threshold.
+
+Precision controls kept packed weights, token IDs and the pinned llama.cpp
+revision. Modified Q8_0, Q5_K, Q6_K and IQ4_XS dots used original F32
+activations and F64 accumulation over dequantized blocks. F32-weight
+projections, including the router, kept native accumulation. F32 K/V alone
+left captures byte-identical because Flash Attention casts K/V back to F16.
+With F32 K/V and Flash Attention disabled, sequential control versus scalar:
+
+| History | Top-1 | Mean KL(scalar \|\| control) |
+| --- | ---: | ---: |
+| code_diff | 108/110 | 0.003641090934 |
+| plain_prose | 100/100 | 3.512098409e-10 |
+| tool_two_parameters | 121/121 | 2.212404796e-10 |
+
+A matched unmodified quantized build with the same optional CPU backends
+disabled reproduced all three original native sequential captures exactly.
+These controls are not goldens and do not make every operation equivalent to
+the scalar reference. The code-history remainder is unexplained.
+
+At B's three failing positions the first differing expert sets are at layers
+0, 6 and 13. Independent F64 routing on the GPU inputs supported selected-set
+membership only. It did not establish ordered IDs, normalized weights or the
+final expert reduction. The first residual relative RMS above the diagnostic
+marker 0.1 was after MoE at layers 29, 23 and 17. That marker is not an
+operator tolerance and not a causal attribution.
+
+Uniform control C added a second activation-residual pass on every remaining
+quantized projection while keeping B's o-F32 path. Tool flips disappeared and
+code position 54 reached confident KL 5.280833756. C failed the zero-violation
+guard, was rejected, and B was restored. That run used cached scalar rows. It
+is not qualification and its timings are not comparable to P4c. Frozen
+confirmation histories were not captured or scored.
+
+P4d also contains failed startup and build attempts. Those are provenance,
+not numerical results. Raw logs stay in ignored `artifacts/p4d/`. CTest
+repeats failed output; histories are counted once.
+
+## P4e protocol (registered October 24, 2026, before new scoring)
+
+This section is the measurement protocol for the next diagnosis. It defines
+references, the token target, boundaries, the identical-state matrix, the
+arithmetic distinctions, operator bounds and the unchanged gates. No P4e
+candidate is scored above this heading. Operator bounds are derived from the
+declared representation, the reduction length and the rounding operations.
+They are not fitted to observed GPU error. The 0.1 residual-RMS marker is
+not reused as a tolerance.
+
+### Three references
+
+| Reference | Definition | What a disagreement means | Limit |
+| --- | --- | --- | --- |
+| N, native llama.cpp | Existing batch and sequential ORNL captures. Batch is the compatibility direction in the mean-KL gate. | A GPU criterion uses N as written. Native batch/sequential spread is reported beside it. | N is not a mathematical oracle. Spread does not waive a GPU failure. |
+| S, scalar graph, with P4d controls as context | `ReferenceModel` at this revision: F32 activations, F64 dots where that file accumulates in F64, libm `exp`/`log1p`. P4d's four-format F64 llama control is supporting context for the quantized dots only. | S versus GPU mixes representation cost, reduction order and any implementation defect. | Router and other F32-weight dots were not changed in the llama control. S already fails three held-out native contracts. S is not replaced by a control. |
+| B-eval, independent evaluator of policy B | Host code that does not call the GPU quantizer or the GPU dot. M evaluates packed activation fields and the consumed packed-weight formula. F evaluates original F32 activations times independently dequantized weights, summed in F64, then rounded to binary32. G is the production GPU output on the same input. | G−M is implementation arithmetic. M−F is representation cost. | B-eval cannot replace N, S or the acceptance gates. A smaller whole-model KL does not attribute an operator. |
+
+Policy B, unchanged: one Q8_1 activation pass for quantized projections,
+except full-attention `o_proj`, which keeps F32 activations and reads the
+original packed weights once. Stored F32 weights stay on the F32 path.
+Experts, packed weight formats, token histories and reasoning length stay
+as they are. AR skips `blk.40`.
+
+### Graph fact used by the layer-0 replay
+
+In both `ReferenceModel::Step` and `rocm::Session::Step`, a token's layer-0
+input is the RMSNorm of that token's embedding. Layer-0 MoE and every later
+layer run after linear attention returns. They do not write the layer-0
+convolution history or the layer-0 recurrent state. The next token's layer-0
+call reads only its own embedding and those two histories. Replaying tokens
+0 through 75 of layer 0 from the embeddings therefore reconstructs the
+production layer-0 state. It does not reconstruct the other 39 layers.
+State orientation in both sources is `[value head][value row][key column]`,
+with value head `h` reading key head `h mod n_k_heads`.
+
+### Target and fixed gates
+
+Diagnostic replay uses token IDs from native `code_diff.ologits`, positions
+0 through 75 inclusive. The same IDs are in the sequential capture. Captures
+are not regenerated. Tool positions 96 and 104 are in scope only after the
+code prefix has located a boundary, and only with the same method.
+
+GPU acceptance gates stay exactly:
+
+- Clear flip: GPU top-1 differs from the scalar reference, the reference
+  top-two margin is greater than 1.0, and both native captures agree with
+  the reference top-1 at that position.
+- Confident reference: entropy below 0.5 nats, and KL(reference \|\| GPU)
+  at most 0.1 there.
+- Per prompt, mean KL(llama batch \|\| GPU) at most 2.0 times mean
+  KL(llama batch \|\| sequential).
+
+Every position is reported, including positions after a failure. Histories,
+prompts, denominators and weights are not changed after results are seen.
+Final qualification recomputes S uncached. Cached scalar rows are allowed
+only in a run labelled diagnostic. Missing model, device or captures are
+skips, never passes. Confirmation prompts stay untouched until a candidate
+has zero registered violations on all original and all exposed held-out
+histories. Their hashes are
+`schedule_confirmation.txt` `c0e732b0…81803`,
+`french_confirmation.txt` `46b54896…108b3`,
+`json_confirmation.txt` `5cf20820…c359f`.
+
+### Q8_1 encoding contract
+
+Production decode quantizes with `quantize_q8_1` into `block_q8_1`, not the
+MMQ tile layout. Block length B = 32. The allocated row length is
+`ne0 = ceil(K / 512) * 512`. Elements at indices `>= K` are exact zeros and
+participate in the block maximum and the auxiliary sum. The independent
+encoder uses that same tail. Tests keep the tail at this allocation boundary.
+
+For finite `x` in a block, let `a = max |x_i|`. Absolute value and maximum
+of finite binary32 values are exact. If `a = 0`, every code is 0 and both
+stored halves are `+0`. Otherwise:
+
+- `d = RN32(a / 127)`, IEEE-754 binary32 division.
+- `q_i = round_half_away_from_zero(RN32(x_i / d))`, the C `roundf` rule.
+- Because `|d - a/127| <= 2^{-24} |a/127|` for a normal result,
+  `|a/d - 127| < 2e-5`, so the maximum-magnitude code is exactly `±127` and
+  every code lies in `[-127, 127]`. An implementation that emits `-128` or
+  that saturates by truncation is outside the contract.
+- `sumq = Σ q_i` is an exact integer. `|sumq| <= 4064`, so it is an exact
+  binary32 integer.
+- The stored scale is `RN16(d)`. The stored auxiliary is
+  `RN16(RN32(d * sumq))`. The scale that created the codes is `d`, not the
+  stored half. The auxiliary is not `RN16(RN16(d) * sumq)`.
+
+Binary16 rounding is ties-to-even. GPU-emitted `qs`, scale and auxiliary
+must be bit-identical to this encoder. There is no ulp allowance on the
+encoding. Nonfinite inputs are rejected by the evaluator. A GPU NaN is not
+a pass.
+
+Which field a consumer reads is part of the formula:
+
+- Q8_0 and Q6_K MMVQ read the stored scale only, promoted exactly from
+  binary16 to binary32. They do not read the auxiliary sum.
+- Q4_1, Q5_1, Q4_K and Q5_K dots read the auxiliary sum as its own rounded
+  value. A generic dot of reconstructed activations `scale * q` is not the
+  consumed formula for those types.
+- IQ4_XS is specified from its MMVQ consumer when a routed projection of
+  that type is evaluated. It is not assumed to match Q6_K.
+
+Layer-0 linear projections are the first tensors inventoried. The o-F32
+kernel is in scope when a shared-kernel regression needs it. The whole
+model is not expanded into a second persistent F32 copy.
+
+### M, F, D and the dot bounds
+
+Let `u = 2^{-24}` and `γ_k = k u / (1 - k u)` for `k u < 1`. Let `P` be the
+sum of absolute exact per-element products under the consumed formula.
+`M_real` is that sum in real arithmetic. `M = RN32(M_real)`.
+
+`F_real` is the F64 dot of the original finite F32 activations with
+independently dequantized weights. Dequantization uses the stored integer
+codes and the stored scales as exact dyadics: for Q6_K,
+`d_half * int8_scale * (q6 - 32)`; for Q8_0, `d_half * q8`. `F = RN32(F_real)`.
+Padding zeros are included. `M − F` is reported as representation cost.
+It is not an implementation failure.
+
+`G` is the production GPU result. `G − M` is an implementation discrepancy
+only when `G` matches none of the declared binary32 sequences below. Those
+sequences are the source expression with and without contraction of a
+multiply into a following add. They are not a tolerance fitted to `G`.
+
+Q6_K MMVQ, `VDR = 1`, `qi = 32`, one warp, superblock 256. Lane `L` owns
+`iqs = L`. Each superblock partial is two exact 4-wide integer dots
+(`dp4a`), each multiplied by its int8 scale (the integer product is an
+exact binary32 value), then by the Q8_1 scale. The two terms sum from zero,
+then multiply by the Q6_K superblock scale. Lanes walk superblocks in
+increasing order and add into a zero accumulator. The warp then butterfly-
+adds with xor offsets 16, 8, 4, 2, 1. Declared sequences:
+
+- `D_mul`: every multiply and add rounded separately.
+- `D_fma_inner`: the `sumf += d8 * (dot * scale)` step is one `fma`.
+- `D_fma_outer`: that inner `fma`, and `tmp += d6 * sumf` is one `fma`.
+
+Q8_0 MMVQ uses `qi = 8`, `VDR = 2`, so a lane's block stride is 8. The same
+three sequences apply to `d_w * d_a * integer_dot` and to the running sum.
+Q8_0 does not read the auxiliary sum.
+
+The o-F32 kernel is a different formula. Each lane sequentially sums
+reconstructed weights times the original F32 activation. Q6_K
+reconstruction is `(RN32(d_half * scale)) * code`, then times `x`. The
+warp reduction is a shuffle-down tree of offsets 16, 8, 4, 2, 1. `D_mul`
+and the contracted `sum += weight * x` are the two declared sequences.
+This path does not replace nonfinite outputs with zero. The Q8_1 MMVQ
+writer does replace a nonfinite row sum with zero; a finite fixture must
+not rely on that replacement.
+
+`G` satisfies the implementation contract for a projection when it is
+bit-identical to one declared `D`. Otherwise the difference is unexplained.
+Separately, before any GPU result is interpreted, each `D` must satisfy
+
+`|D - M_real| <= (γ_n + (1 + γ_n) ((1 + u)^3 - 1)) P`
+
+where `n` is the number of binary32 additions on one element's path:
+inner group adds, plus `n_partials - 1` sequential partial adds, plus 5
+butterfly adds. For a layer-0 Q6_K projection with input length 2048,
+`n_partials = 8` and `n = 1 + 7 + 5 = 13`. For `ssm_out`, input length
+4096, `n_partials = 16` and `n = 21`. If a `D` exceeds this bound, that
+diagnostic is wrong and is not used to excuse `G`. The bound is not a
+GPU pass/fail substitute for bit-identity with `D`.
+
+Relative RMS uses the reference Euclidean norm. If both vectors are zero,
+relative RMS is 0. If the reference norm is 0 and the other vector is not,
+relative RMS is reported as infinite and the absolute error is kept.
+Nonfinite values fail the comparison.
+
+### Layer-0 boundaries
+
+For every token `t` in `0..75`, and for every evaluator that applies,
+record the first nonzero difference and, separately, the first difference
+that is outside its declared bound or outside its declared sequence.
+Drift does not have to grow. Do not binary-search a threshold.
+
+| Boundary | Data | Declared distinction |
+| --- | --- | --- |
+| Embedding | Q6_K or Q8_0 row for the token id. No dot reduction. | `M` is the binary32 reconstruction `(d * scale) * code`. `F` is the F64 dyadic rounded to binary32. |
+| Attention RMSNorm | Exact input and output bytes, weight, `rms_eps`. | Scalar sum of squares is F64. GPU norm is its own kernel. Compare bytes; do not treat a later 0.1 residual marker as this bound. |
+| QKV, z, alpha, beta | Projection output and the Q8_1 bytes actually stored. | `G−M` and `M−F` as above. Alpha and beta have 32 outputs and K = 2048. |
+| Convolution | History in, current projection, taps, pre-SiLU value, post-SiLU value, history out. | Four products. Scalar association is `((w3 v + w0 h0) + w1 h1) + w2 h2`. GPU `SsmConv4Kernel` association is `((w0 h0 + w1 h1) + w2 h2) + w3 v`. Both then apply SiLU. Association difference of the pre-SiLU value is at most `γ_3` times the sum of absolute products. SiLU itself is libm on the scalar side and `__expf` on the device. |
+| Q/K preparation | Head index, pre-norm and post-norm values, scale. | Both use clamp-epsilon L2: `1 / max(sqrt(sum of squares), eps)`, not `rsqrt(sum + eps)`. Scalar sum of squares is F64. GPU sum is a binary32 wave reduction. The clamp form is the selected semantics, not a discrepancy by itself. |
+| Decay and beta | Alpha, beta, `a`, `dt`, decay, sigmoid. | Scalar: `exp(softplus(alpha + dt) * a)` and `1/(1+exp(-beta))` with libm, softplus threshold 20. GPU: `__expf` and `log1pf(__expf)`. No host guess at an `__expf` ulp budget is added. An expression-tree mismatch is a defect. A libm-versus-device numeric gap is reported as math-library drift and is causal only if an intervention shows it. |
+| Recurrent update | Incoming state, decayed state, `u`, error or delta, outgoing state. | Scalar dots are F64 then rounded, and the update is `(v - u) * beta` added as `delta * key`. GPU non-tail lanes use `fma(beta, RN(error * key), decayed)`. Each lane's last key, indices 31, 63, 95 and 127, uses `fma(pre_decay, decay, RN(RN(error * key) * beta))`. Lane width is 32, four lanes, xor offsets 2 then 1. These sequences are predeclared. A nonzero scalar-versus-GPU gap is not by itself a defect. |
+| Recurrent output | Raw output and the query scale. | Scalar scale is `1/sqrt(float(128))`. GPU scale is `rsqrtf(128)`. Output dots differ in the same way as `u`. |
+| Gated norm | RMSNorm output, SiLU of z, product. | Same norm and SiLU distinctions as above. |
+| ssm_out | Q8_1 bytes if quantized, projection, residual add. | Same `G−M` / `M−F` contract. K = 4096 for this projection. |
+
+Raw arrays stay in ignored `artifacts/p4e/`. Each array's manifest records
+dtype, shape, layout, little-endian, token, layer, boundary, source hashes
+and the incoming-state hash. The recurrent state is 32×128×128 binary32,
+2 MiB per boundary. Identical incoming and outgoing states may be stored
+once. Production replay uses the production launcher and the real weights.
+A lookalike kernel is not `G`. Instrumentation is test-only. Instrumented
+and uninstrumented outputs must match where both are collected; a mismatch
+means the instrumented run is not production evidence.
+
+### Identical-input, identical-state matrix
+
+At the earliest unexplained update, freeze one operand bundle and one
+incoming state from each source. If the operation includes convolution, the
+incoming convolution history is part of the bundle. Reset state before
+every trial. Hashes of the fixtures are recorded.
+
+| Operands | Incoming state | Question |
+| --- | --- | --- |
+| Reference | Reference | Reference trajectory control |
+| GPU | GPU | GPU trajectory control |
+| Reference | GPU | State contribution with reference operands |
+| GPU | Reference | Operand contribution with reference state |
+
+These crosses are counterfactuals. They are not claims about the real
+trajectory. Outgoing state and output are both compared. Inherited history
+is reported separately from the local update. The local recurrence
+comparison uses the scalar formula and the GPU non-tail and tail formulas
+above on identical operands. It does not rewrite the GPU sequence into the
+scalar algebra.
+
+### Routing audit, only at implicated boundaries
+
+On identical logits the audit reports full-softmax probabilities, ordered
+top-8 IDs, the 8th-versus-9th margin, renormalized weights, the clamp
+`max(sum, 6.103515625e-5)`, expert-to-slot mapping, the weighted reduction
+and the shared-expert sigmoid gate. Selected-set equality is not enough.
+
+The GPU router keeps the higher probability and breaks remaining ties by
+the lower expert index (`other > best || (other == best && oi < index)`).
+The scalar `partial_sort` comparator is `probs[a] > probs[b]` with no tie
+key. Exact ties and probabilities that match only after rounding are
+tested on synthetic logits. The scalar comparator is not silently changed.
+Nothing in P4d shows that a tie caused the three registered GPU failures.
+
+Expert reduction is checked with ordered expert outputs and weights held
+fixed, so selection is not confused with reduction order. The epilogue
+adds `weight * down` from a zero accumulator and then `sigmoid(gate) * shared`.
+
+### Causal intervention rule
+
+Before changing any output, write the prediction: which local quantity
+becomes explained, which later route, weight or state changes, and which
+of the three known logit violations moves. State whether the substitute is
+`M` (matched representation) or `F` (higher-precision mathematical output).
+Those answer different questions.
+
+The harness is run first with the original output and state. That control
+must reproduce the uninstrumented baseline. Only the suspect operation,
+and its outgoing state when it is stateful, is replaced. The suffix tokens,
+packed weights and unrelated state stay as they were. Continuing the full
+model requires every layer's state through the prefix. Layer-0 state alone
+cannot initialize layers 1–39. A stateful intervention continues from the
+intervened state.
+
+A correction is causal only when the local unexplained error disappears
+and the predicted downstream route, state or logit response occurs. A
+lower final KL by itself is compensation. One operation may explain one
+failure and not the other two. An unsuccessful intervention is kept in
+the record.
+
+### What this protocol does not authorize
+
+No expert-count change, no shorter history, no truncated reasoning, no
+artifact substitution, no runtime precision selector, and no per-layer
+precision sweep. No CLI, server, MTP, vision, driver or Q6_K comparison
+work. If every checked B operation matches its declared sequence and the
+contract still fails, B is reported insufficient on the checked scope and
+a mechanism-based next policy is proposed without running it. If the first
+unexplained boundary is not closed, the result is inconclusive and names
+that boundary. B remains the production policy until a replacement has
+zero registered violations on the original set, the exposed held-out set
+and the untouched confirmation set.
