@@ -30,6 +30,8 @@ set_tests_properties(ornith15.reference_oracle PROPERTIES TIMEOUT 3600)
 if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_ops "gpu;hip;gfx1151"
     gufo_ornith15_gpu gufo_ornith15_reference)
+  add_ornith15_test(representation_gpu "gpu;hip;gfx1151"
+    gufo_ornith15_gpu)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)

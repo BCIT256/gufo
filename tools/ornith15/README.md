@@ -106,6 +106,27 @@ python3 tools/ornith15/build_precision_reference.py \
   /path/to/new-control-directory --prepare-only
 ```
 
+## Policy B representation evaluator
+
+`representation.py` is the host side of B-eval. It rounds with its own
+binary32 and binary16 operations and does not call the GPU quantizer, the
+GPU dot, or the host dequantizer. `M` is the consumed packed formula in
+real arithmetic, then rounded to binary32. `F` is the F64 dot of the
+original binary32 activations with dyadic weights, then rounded to
+binary32. `D_mul`, `D_fma_inner` and `D_fma_outer` are the left-associated
+binary32 sequences. Q8_0 also reports `D_compiled`, the
+`fma(RN(d_w * dot), d_a, acc)` order written beside
+`mul_mat_vec_q8_ahead`. o-F32 declares `D_mul` and `D_fma` only.
+
+`representation_gpu_test` launches `qfn_mmq_quantize_q8_1`,
+`qfn_mmq_moe_vec` and `DenseMatVecF32`, writes a dump, and does not score
+it. Missing device or dump directory skips. Score with:
+
+```sh
+python3 tests/models/ornith15/representation_test.py
+python3 tools/ornith15/representation.py score /path/to/dump
+```
+
 # Ornith chat-template goldens
 
 `chat_goldens.py` regenerates `tests/fixtures/ornith15_chat_goldens.json`: the
