@@ -1,0 +1,12 @@
+<|im_start|>user
+We have twelve seats and three equal tables. How many seats belong at each table?<|im_end|>
+<|im_start|>assistant
+<think>
+Twelve divided by three gives four; each table receives the same share.
+</think>
+
+Place four seats at each table.<|im_end|>
+<|im_start|>user
+Two guests cancel, but we keep all three tables. Propose a balanced seating plan, state the largest difference between table sizes, and explain why perfectly equal seating is impossible. Please keep the arithmetic explicit.<|im_end|>
+<|im_start|>assistant
+<think>

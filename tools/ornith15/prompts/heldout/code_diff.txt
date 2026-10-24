@@ -1,0 +1,13 @@
+<|im_start|>user
+Review this proposed Python edit. Explain the bug it fixes, find a remaining edge case, and return a corrected unified diff. Preserve input order and avoid changing the public signature.
+```diff
+--- a/cache.py
++++ b/cache.py
+@@ -1,3 +1,3 @@
+ def unique(items):
+-    return list(set(items))
++    return list(dict.fromkeys(items))
+```
+The caller may supply dictionaries as well as strings. Give one small test.<|im_end|>
+<|im_start|>assistant
+<think>

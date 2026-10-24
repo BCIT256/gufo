@@ -1,0 +1,23 @@
+<|im_start|>user
+Find the rainfall forecast for Kyoto tomorrow, using millimeters, and explain whether I should carry an umbrella.<|im_end|>
+<|im_start|>assistant
+<think>
+I need the local forecast before advising.
+</think>
+
+<tool_call>
+<function=forecast>
+<parameter=city>
+Kyoto
+</parameter>
+<parameter=units>
+metric
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"city":"Kyoto","rain_mm":12,"rain_probability":0.85,"period":"tomorrow"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

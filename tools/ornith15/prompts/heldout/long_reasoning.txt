@@ -1,0 +1,4 @@
+<|im_start|>user
+A museum schedules four talks in four consecutive rooms. Astronomy must finish before botany starts. Chemistry cannot be first or last. Design must immediately follow astronomy, but the two speakers cannot share a room. Each talk lasts thirty minutes, and walking between neighboring rooms takes five minutes. The first starts at nine. A visitor wants to attend all four talks without missing any opening remarks. Determine a valid order and the earliest finishing time if you may insert breaks. Explain whether the order is unique and identify every assumption about travel.<|im_end|>
+<|im_start|>assistant
+<think>

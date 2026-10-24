@@ -225,3 +225,41 @@ zero failed/skipped**, 644.07 seconds, including all 21 unchanged Flash-Next
 tests and both unchanged independent oracle tests. Format: 650 C++ files
 passed. PR suite: 66 passed, zero failed/skipped. Model SHA256 was reverified
 as `c83373e4c502c6d4929339406ffbb1f442598b153a3ade02b628752e00a282fd`.
+
+## P4c pre-registration: held-out activation policy (October 23, 2026)
+
+Registered before any P4c logit capture, inference or policy measurement.
+The six fixed ChatML histories in `tools/ornith15/prompts/heldout/` cover
+a code edit with a diff, a long single-turn reasoning question, a two-parameter
+tool call and response, kept multi-turn reasoning, plain prose and Spanish.
+Each ends with the template's open assistant thinking prefix. These prompts
+were not used to choose the P4b policy. Token counts include all framing and
+are constrained to 60–150 using the pinned model tokenizer before capture.
+
+Compare only A (all quantized projections use one Q8_1 activation pass) and B
+(current F32 activations for full-attention o_proj only). F32 stored weights
+retain their existing F32 path in both. No experts, reasoning, stored weight
+precision, token histories or other arithmetic change. Use the same model,
+llama.cpp build/dumper, pinned toolchain, uncached scalar reference and traces.
+Run both policies on the original three histories as controls and all six
+held-out histories; only held-out results determine the policy.
+
+**Decision rule:** keep B only if it has fewer criterion failures than A on
+the held-out set **OR** lowers total mean KL(llama batch || GPU) by **more than
+20%**; otherwise remove B and keep the simpler, faster A. Total mean is the
+position-weighted mean across all held-out histories (sum of KL / total
+positions). Criterion failures count each clear-flip position, each position
+exceeding the confident-reference KL bound, and each prompt exceeding the
+mean-KL bound separately. Finish every prompt even after a criterion failure
+to avoid censoring either policy; the test must still return failure.
+
+Before comparison, align clear flips with the independent reference oracle's
+self-consistency principle: GPU top-1 differs from scalar-reference top-1,
+reference top-two margin > 1.0 logit, and both llama.cpp batch and sequential
+captures agree with that reference top-1. Keep confident entropy 0.5 nats,
+confident KL 0.1 nats and per-prompt mean-KL ratio 2.0 unchanged. Record original
+prompt outcomes before and after alignment. No threshold adjustment, extra
+policy search, prompt replacement or result-driven exclusion is allowed.
+Timings from synchronous traced Steps are informational only. Raw captures,
+logs, traces and private identities stay in ignored artifacts; check in bounded
+result summaries and remove the temporary A code toggle.

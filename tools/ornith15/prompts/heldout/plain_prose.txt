@@ -1,0 +1,4 @@
+<|im_start|>user
+Write a short letter from a lighthouse keeper to a friend who has moved inland. Mention the smell of wet rope, an unreliable kitchen clock, and a boat arriving after sunset. Keep the language concrete and restrained. Let the friendship emerge through a shared memory instead of naming any emotion. End with a practical request for something the keeper cannot buy locally. Use two paragraphs, with no title or greeting, and avoid turning the lighthouse into a metaphor.<|im_end|>
+<|im_start|>assistant
+<think>

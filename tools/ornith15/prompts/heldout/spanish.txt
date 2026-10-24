@@ -1,0 +1,4 @@
+<|im_start|>user
+Una biblioteca de barrio quiere prestar herramientas además de libros. Redacta en español una propuesta breve para sus vecinos. Incluye cómo reservar una herramienta, quién revisará su estado al devolverla y qué hacer si falta una pieza. Hay poco presupuesto y solo dos voluntarios los sábados. Propón una regla justa para las personas que llegan tarde, sin multas económicas. Termina con una pregunta concreta que ayude a decidir qué herramientas comprar primero.<|im_end|>
+<|im_start|>assistant
+<think>
