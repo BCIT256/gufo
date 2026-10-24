@@ -745,3 +745,50 @@ unexplained boundary is not closed, the result is inconclusive and names
 that boundary. B remains the production policy until a replacement has
 zero registered violations on the original set, the exposed held-out set
 and the untouched confirmation set.
+
+### P4e operator comparison (synthetic fixtures, October 24, 2026)
+
+This is not a model-logit score and not a qualification. The host
+evaluator is `tools/ornith15/representation.py`. The dump binary
+`ornith15_representation_gpu_test` calls `qfn_mmq_quantize_q8_1`,
+`qfn_mmq_moe_vec` and `DenseMatVecF32` only. Production decode was not
+rebuilt: its SHA256 remains `a5358cb0…7d332d`. Raw dumps are in ignored
+`artifacts/p4e/wp1-representation/`.
+
+Layer 0 of the selected GGUF, from the header only: token embedding
+Q6_K; linear projections `attn_qkv`, `attn_gate`, `ssm_alpha`,
+`ssm_beta` and `ssm_out` are Q6_K; routed experts are Q6_K; shared
+experts are Q8_0; norms, convolution, `ssm_a`, `ssm_dt` and both router
+inputs are F32. There is no layer-0 `o_proj`. The first full-attention
+output, `blk.3.attn_output.weight`, is Q6_K and is the o-F32 path.
+Q5_K routed experts begin at `blk.5`. IQ4_XS is present and is not a
+layer-0 tensor. `blk.40.attn_output` is Q8_0; decode skips that block.
+
+On the synthetic dump, 55 scored rows:
+
+- Q8_1 bytes for K = 32, 512 and 544, including the zero row, the
+  half-away row and the K = 544 tail, match the independent encoder.
+  No ulp slack was allowed.
+- Every Q6_K MMVQ row (K = 256 and K = 2048, duplicate expert slots
+  included) matches `D_fma_inner` or `D_fma_outer`, and some also match
+  `D_mul`. Every predeclared D is inside the registered gamma bound.
+  Rounded G−M is 0 or about 2^-13 to 2^-12. Rounded M−F on the same
+  rows is orders of magnitude larger, up to about 2^4 on a K = 2048
+  row. That gap is representation cost.
+- Every o-F32 row matches `D_fma`, and some also match `D_mul`. On
+  these fixtures M−F is 0: o-F32 has no Q8_1 substitution, and the F64
+  sum rounded to binary32 matched the real sum. G−M is 0 or about
+  2^-18 to 2^-13.
+- Q8_0 MMVQ at K = 32 matches every left-associated sequence. At
+  K = 512 and K = 2048, 10 of 16 rows match only `D_compiled`:
+  `acc = fma(RN(d_w * dot), d_a, acc)`, which is the association
+  written beside `mul_mat_vec_q8_ahead`. Those rows are one ulp or less
+  from M (about 2^-18 to 2^-15, or zero) and do not match the
+  left-associated `(d_w * d_a) * dot` sequences. Their D values still
+  satisfy the gamma bound. M−F remains the larger term.
+
+No row is unexplained once `D_compiled` is reported separately. The
+left-associated Q8_0 sequences are not bit-identical to G on those 10
+rows. Layer-0 Q6_K projections, which are the linear-attention dots,
+match a predeclared sequence on every synthetic row tried here. This
+does not locate the three held-out logit failures.
