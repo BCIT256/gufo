@@ -1,6 +1,5 @@
 #include "src/models/ornith15/kernels/rocm/executor.hpp"
 
-#include <algorithm>
 #include <stdexcept>
 
 #include "src/core/hip/managed_alloc.hpp"
@@ -88,16 +87,6 @@ std::unique_ptr<Session> Session::Create(const DeviceModel& model,
     s->shared_up_ = s->Floats(c.shared_expert_ff);
     s->shared_out_ = s->Floats(c.hidden_size);
     s->shared_inp_ = s->Floats(1);
-    // The second Q8 pass resolves the first pass's activation residual.
-    // Weight encodings, expert count and token history remain identical.
-    const auto max_k =
-        std::max({c.hidden_size, c.SsmValueDim(), c.AttentionQDim(),
-                  c.expert_ff, c.shared_expert_ff});
-    s->q8_ = s->Allocate(qfn_mmq_q8_1_bytes(c.num_experts_used, max_k));
-    s->input_residual_ = s->Floats(std::size_t(c.num_experts_used) * max_k);
-    s->correction_ =
-        s->Floats(std::max(std::size_t(c.vocab_size),
-                           std::size_t(c.num_experts_used) * c.hidden_size));
     s->state_.resize(c.num_layers);
     for (std::size_t i = 0; i < c.num_layers; ++i) {
       auto& state = s->state_[i];
@@ -167,18 +156,9 @@ void Session::Dense(const DeviceTensor& w, const float* x, float* out) {
 void Session::Quantized(const DeviceTensor& w, const float* x,
                         const std::int32_t* ids, float* out, std::uint32_t rows,
                         std::uint32_t used) {
-  if (qfn_mmq_quantize_q8_1(x, q8_, rows, w.cols, stream_) ||
-      qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, w.rows,
+  if (qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, w.rows,
                       w.cols, rows, w.experts, used, stream_))
     throw std::runtime_error("quantized projection failed");
-  const auto padded =
-      static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, w.cols) / 36 * 32);
-  Q8Residual(x, q8_, input_residual_, rows, w.cols, padded, stream_);
-  if (qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, input_residual_, ids,
-                      correction_, w.rows, w.cols, rows, w.experts, used,
-                      stream_))
-    throw std::runtime_error("projection residual failed");
-  fn::MtpAddEmbedding(correction_, out, rows * used, w.rows, 1, stream_);
 }
 
 void Session::LinearAttention(const DeviceLayer& l, std::size_t layer) {
@@ -220,7 +200,11 @@ void Session::Attention(const DeviceLayer& l, std::size_t layer) {
                 device_pos_, c.num_heads, c.num_kv_heads, c.head_dim, 1,
                 stream_);
   fn::SigmoidMul(ctx_, gate_, c.AttentionQDim(), stream_);
-  Dense(l.attn_out, ctx_, block_out_);
+  // Keep this input in F32: quantizing both V and the gated context can
+  // amplify activation rounding through the attention value path. This dot
+  // reads the original packed weights once, without a residual pass.
+  DenseMatVecF32(l.attn_out.type, l.attn_out.data, ctx_, block_out_,
+                 l.attn_out.rows, l.attn_out.cols, stream_);
 }
 
 void Session::Moe(const DeviceLayer& l) {

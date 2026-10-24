@@ -2,26 +2,53 @@
 
 #include <hip/hip_fp16.h>
 
+#include <stdexcept>
+
 namespace gufo::models::ornith15::rocm {
 namespace {
 
-struct Q8Block {
-  __half2 ds;
-  std::int8_t qs[32];
-};
-static_assert(sizeof(Q8Block) == 36);
-
-__global__ void Q8ResidualKernel(const float* x, const Q8Block* q8,
-                                 float* residual, std::uint32_t count,
-                                 std::uint32_t cols,
-                                 std::uint32_t padded_cols) {
-  const auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < count) {
-    const auto j = (i / cols) * padded_cols + i % cols;
-    const auto& b = q8[j / 32];
-    residual[i] = x[i] - __half2float(__low2half(b.ds)) *
-                             static_cast<float>(b.qs[j % 32]);
+// Each wave reduces one output row. Weights stay in their GGUF encoding;
+// only the activation quantization boundary is removed.
+template<core::GgmlType type>
+__global__ void DenseF32Kernel(const unsigned char* weights, const float* x,
+                               float* out, std::uint32_t rows,
+                               std::uint32_t cols) {
+  constexpr bool q6 = type == core::GgmlType::kQ6_K;
+  constexpr int block = q6 ? 256 : 32;
+  constexpr int bytes = q6 ? 210 : 34;
+  const auto lane = threadIdx.x % 32;
+  const auto row = blockIdx.x * 4 + threadIdx.x / 32;
+  if (row >= rows)
+    return;
+  const auto* w = weights + std::size_t(row) * (cols / block) * bytes;
+  float sum = 0;
+  for (std::uint32_t b = 0; b < cols / block; ++b) {
+    const auto* p = w + b * bytes;
+    const float d =
+        __half2float(*reinterpret_cast<const __half*>(p + (q6 ? 208 : 0)));
+    for (std::uint32_t j = lane; j < block; j += 32) {
+      float weight;
+      if constexpr (q6) {
+        const auto half = j / 128, segment = j % 128 / 32;
+        const auto low = p[half * 64 + segment % 2 * 32 + lane];
+        const int code =
+            (((low >> (segment / 2 * 4)) & 15) |
+             (((p[128 + half * 32 + lane] >> (2 * segment)) & 3) << 4)) -
+            32;
+        const auto scale =
+            reinterpret_cast<const std::int8_t*>(p + 192)[j / 16];
+        weight = (d * static_cast<float>(scale)) * static_cast<float>(code);
+      } else {
+        weight = d * static_cast<float>(
+                         reinterpret_cast<const std::int8_t*>(p + 2)[j]);
+      }
+      sum += weight * x[b * block + j];
+    }
   }
+  for (int delta = 16; delta; delta /= 2)
+    sum += __shfl_down(sum, delta, 32);
+  if (lane == 0)
+    out[row] = sum;
 }
 
 __global__ void EmbedQ6Kernel(const unsigned char* table, std::uint32_t token,
@@ -49,12 +76,22 @@ void EmbedQ6(const void* table, std::uint32_t token, float* out,
       static_cast<const unsigned char*>(table), token, out, hidden);
 }
 
-void Q8Residual(const float* x, const void* q8, float* residual,
-                std::uint32_t rows, std::uint32_t cols,
-                std::uint32_t padded_cols, hipStream_t stream) {
-  const auto count = rows * cols;
-  Q8ResidualKernel<<<(count + 255) / 256, 256, 0, stream>>>(
-      x, static_cast<const Q8Block*>(q8), residual, count, cols, padded_cols);
+void DenseMatVecF32(core::GgmlType type, const void* weights, const float* x,
+                    float* out, std::uint32_t rows, std::uint32_t cols,
+                    hipStream_t stream) {
+  const auto* w = static_cast<const unsigned char*>(weights);
+  switch (type) {
+    case core::GgmlType::kQ6_K:
+      DenseF32Kernel<core::GgmlType::kQ6_K>
+          <<<(rows + 3) / 4, 128, 0, stream>>>(w, x, out, rows, cols);
+      break;
+    case core::GgmlType::kQ8_0:
+      DenseF32Kernel<core::GgmlType::kQ8_0>
+          <<<(rows + 3) / 4, 128, 0, stream>>>(w, x, out, rows, cols);
+      break;
+    default:
+      throw std::invalid_argument("unsupported F32-input dense weight format");
+  }
 }
 
 }  // namespace gufo::models::ornith15::rocm

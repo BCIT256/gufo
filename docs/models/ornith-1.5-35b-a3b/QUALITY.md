@@ -1,5 +1,8 @@
 # Ornith GPU AR checkpoint quality
 
+Original P4 evidence is retained below; the P4b follow-up at the end records
+the current one-pass policy.
+
 October 23, 2026; synthetic operators and teacher-forced full-vocabulary
 comparisons at 183 positions in three fixed histories. This is a numerical
 checkpoint, not broad model capability, tool-use or long-context qualification.
@@ -69,3 +72,22 @@ Required configure/build succeeded. CTest: 29 passed, zero failed/skipped
 (883.33 seconds), including all 21 unchanged Flash-Next tests. Formatting:
 650 C++ files passed. Hosted PR suite: 66 passed, zero failed/skipped
 (53.83 seconds). The model was rehashed and matched its pinned SHA256.
+
+## P4b follow-up: one weight pass per projection
+
+The tables above retain the original P4 checkpoint. P4b removes every
+activation-residual pass and keeps F32 activation inputs only at full
+attention output projections. All 183 original positions pass the unchanged
+criteria, with no clear-margin flips. The independent CPU and GPU oracle
+test sources are byte-identical to `49113bb2`; final qualification is uncached.
+
+| History | Top-1 reference / llama | Mean KL reference / llama | Confident maximum KL vs reference |
+| --- | --- | --- | ---: |
+| reasoning_history | 84/87 / 78/87 | 0.02666456063 / 0.04671976705 | 0.02819847754 |
+| tool_round_trip | 70/75 / 67/75 | 0.04959738944 / 0.07962550927 | 0.08232510347 |
+| user_turn | 19/21 / 19/21 | 0.009889620099 / 0.02028499337 | 0.001946743154 |
+
+KL against the scalar reference is higher than with blanket correction;
+this is qualification within the fixed envelope, not numerical equivalence.
+See [the full before/after record](EXPERIMENTS.md#final-uncached-qualification)
+for maxima, rejected controls, remaining uncertainties and test evidence.

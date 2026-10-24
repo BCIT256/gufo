@@ -21,17 +21,19 @@ gating and clamped L2 normalization explicitly; Flash-Next's defaults retain
 sigmoid gating and additive epsilon. Attention uses the generic dense path
 with F16 KV. Conv/recurrent states remain F32. All capacities come from Config.
 
-Each quantized projection dispatches its own GGUF format. Dense matrices use
-the one-expert view of MMVQ; routed gate/up/down retain all eight selected
+Each quantized projection dispatches its own GGUF format. Most dense matrices
+use the one-expert view of MMVQ; routed gate/up/down retain all eight selected
 experts and the per-layer Q6_K/Q5_K/IQ4_XS formats. Shared experts stay Q8_0;
-router and shared-gate weights stay F32. A second MMVQ pass resolves the Q8
-activation residual; see [experiments](EXPERIMENTS.md). Weights are never
-narrowed or replaced. The only Ornith device helpers are the Q6_K embedding
-gather and activation-residual construction.
+router and shared-gate weights stay F32. Attention output projections retain
+F32 activations and multiply their original packed Q6_K/Q8_0 weights directly;
+all remaining quantized projections use one Q8_1 MMVQ pass. No projection uses
+a second residual pass. See [experiments](EXPERIMENTS.md) for the isolation and
+quality evidence. Weights are never narrowed or replaced. The Ornith device
+helpers are the Q6_K embedding gather and the F32-input dense projection.
 
-`ornith15.gpu_ops` checks embedding bytes and corrected projections against a
-host-unpacked F64 oracle. `ornith15.gpu_decode` compares the GPU and scalar
-reference on the captured histories when both `GUFO_ORNITH15_APEX_MTP_MODEL`
+`ornith15.gpu_ops` checks embedding bytes, single-pass routed projections and
+the F32-input dense projection against a host-unpacked F64 oracle.
+`ornith15.gpu_decode` compares the GPU and scalar reference on the captured histories when both `GUFO_ORNITH15_APEX_MTP_MODEL`
 and `GUFO_ORNITH15_LLAMA_LOGITS` are set. Missing inputs yield skip code 77.
 An optional `LayerTrace` records the residual after each layer on either
 implementation without changing their arithmetic.

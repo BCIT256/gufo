@@ -5,18 +5,20 @@
 
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
+
 namespace gufo::models::ornith15::rocm {
 
-/// Single Q6_K embedding row; the remaining operators come from Flash-Next.
+/// Gather a single Q6_K embedding row.
 void EmbedQ6(const void* table, std::uint32_t token, float* out,
              std::uint32_t hidden, hipStream_t stream);
 
-/// Residual of the original F32 activations after MMQ's actual Q8_1
-/// reconstruction (including its rounded F16 scale). Used by a second MMVQ
-/// pass to retain more activation precision without changing weight formats.
-void Q8Residual(const float* x, const void* q8, float* residual,
-                std::uint32_t rows, std::uint32_t cols,
-                std::uint32_t padded_cols, hipStream_t stream);
+/// Dense Q6_K/Q8_0 dot retaining F32 activations. One weight pass, no
+/// activation quantization or persistent unpacked-weight copy. Only the
+/// numerically sensitive attention output projection uses this route.
+void DenseMatVecF32(core::GgmlType type, const void* weights, const float* x,
+                    float* out, std::uint32_t rows, std::uint32_t cols,
+                    hipStream_t stream);
 
 }  // namespace gufo::models::ornith15::rocm
 

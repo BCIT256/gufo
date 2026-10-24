@@ -70,9 +70,6 @@ private:
       *expert_up_{nullptr}, *expert_down_{nullptr}, *shared_gate_{nullptr},
       *shared_up_{nullptr}, *shared_out_{nullptr}, *shared_inp_{nullptr};
   std::int32_t* ids_{nullptr};
-  void* q8_{nullptr};
-  float* input_residual_{nullptr};
-  float* correction_{nullptr};
 };
 
 }  // namespace gufo::models::ornith15::rocm
