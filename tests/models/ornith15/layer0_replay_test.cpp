@@ -370,6 +370,7 @@ struct ReplayStats {
   int q8_scale_bad{0};
   int q8_aux_bad{0};
   int gg_mismatch_tokens{0};
+  int scalar_rr_mismatch_tokens{0};
   double conv_assoc_max{0};
   double conv_silu_max{0};
   double prep_max{0};
@@ -460,6 +461,8 @@ int Disposition(const ReplayStats& stats) {
     return 6;
   if (stats.conv_pairwise_exceed_tokens)
     return 7;
+  if (stats.scalar_rr_mismatch_tokens)
+    return 8;
   return 0;
 }
 
@@ -480,6 +483,8 @@ int ProveExitLogic() {
   scale.q8_scale_bad = 1;
   ReplayStats rerun = clean;
   rerun.gg_mismatch_tokens = 1;
+  ReplayStats scalar_rr = clean;
+  scalar_rr.scalar_rr_mismatch_tokens = 1;
   ReplayStats pairwise = clean;
   pairwise.conv_pairwise_exceed_tokens = 1;
   ReplayStats unmeasured;
@@ -491,8 +496,8 @@ int ProveExitLogic() {
   const bool fails = Disposition(embed) && Disposition(dot) &&
                      Disposition(aux) && Disposition(code) &&
                      Disposition(scale) && Disposition(rerun) &&
-                     Disposition(pairwise) && Disposition(unmeasured) &&
-                     Disposition(bad);
+                     Disposition(scalar_rr) && Disposition(pairwise) &&
+                     Disposition(unmeasured) && Disposition(bad);
   if (!fails || Disposition(diagnostic) != 0)
     return 1;
   std::cout << "prove_exit_ok injected_mismatch_fails=1 "
@@ -523,14 +528,23 @@ bool SameBits(const std::vector<float>& left, const std::vector<float>& right) {
              0;
 }
 
-// Independent scalar layer-0 step. This follows ReferenceModel::LinearAttention:
-// F64 matvecs, libm SiLU/L2/softplus, and the scalar recurrence association.
-void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
-                   const std::vector<float>& normed, std::vector<float>& conv,
-                   std::vector<float>& state, std::vector<float>& qkv,
-                   std::vector<float>& z, std::vector<float>& alpha,
-                   std::vector<float>& beta, std::vector<float>& silu,
-                   std::vector<float>& attn, std::vector<float>& y) {
+struct BundleOut {
+  std::vector<float> conv, state, attn, y;
+};
+
+// Scalar conv, recurrence and ssm_out from a frozen projection bundle and
+// frozen incoming convolution history plus recurrent state.
+BundleOut ScalarFromBundle(const orn::LayerWeights& layer,
+                           const orn::Config& config,
+                           const std::vector<float>& qkv,
+                           const std::vector<float>& z,
+                           const std::vector<float>& alpha,
+                           const std::vector<float>& beta,
+                           const std::vector<float>& conv_in,
+                           const std::vector<float>& state_in) {
+  BundleOut out;
+  out.conv = conv_in;
+  out.state = state_in;
   const int channels = static_cast<int>(config.SsmConvChannels());
   const int key_dim = static_cast<int>(config.SsmKeyDim());
   const int value_dim = static_cast<int>(config.SsmValueDim());
@@ -538,29 +552,21 @@ void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
   const int heads_v = static_cast<int>(config.ssm_num_v_heads);
   const int width = static_cast<int>(config.ssm_head_dim);
   const int kernel = static_cast<int>(config.ssm_conv_kernel);
-  qkv.assign(channels, 0);
-  z.assign(value_dim, 0);
-  alpha.assign(heads_v, 0);
-  beta.assign(heads_v, 0);
-  orn::cpu::MatVec(layer.ssm_qkv, 0, normed, qkv);
-  orn::cpu::MatVec(layer.ssm_gate, 0, normed, z);
-  orn::cpu::MatVec(layer.ssm_alpha, 0, normed, alpha);
-  orn::cpu::MatVec(layer.ssm_beta, 0, normed, beta);
   const auto* conv_w = static_cast<const float*>(layer.ssm_conv1d.data);
-  silu.assign(channels, 0);
+  std::vector<float> silu(channels);
   for (int channel = 0; channel < channels; ++channel) {
     float acc = conv_w[channel * kernel + kernel - 1] * qkv[channel];
     for (int tap = 0; tap + 1 < kernel; ++tap) {
       acc += conv_w[channel * kernel + tap] *
-             conv[static_cast<std::size_t>(tap) * channels + channel];
+             out.conv[static_cast<std::size_t>(tap) * channels + channel];
     }
     silu[channel] = orn::cpu::Silu(acc);
   }
   if (kernel > 1) {
-    std::vector<float> next(conv.size());
-    std::copy(conv.begin() + channels, conv.end(), next.begin());
+    std::vector<float> next(out.conv.size());
+    std::copy(out.conv.begin() + channels, out.conv.end(), next.begin());
     std::copy(qkv.begin(), qkv.end(), next.end() - channels);
-    conv.swap(next);
+    out.conv.swap(next);
   }
   std::vector<float> mixed = silu;
   for (int head = 0; head < heads_k; ++head) {
@@ -573,7 +579,7 @@ void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
   const auto* a = static_cast<const float*>(layer.ssm_a.data);
   const auto* dt = static_cast<const float*>(layer.ssm_dt.data);
   const float q_scale = 1.0F / std::sqrt(static_cast<float>(width));
-  attn.assign(value_dim, 0);
+  out.attn.assign(value_dim, 0);
   for (int head = 0; head < heads_v; ++head) {
     const float* query =
         mixed.data() + static_cast<std::size_t>(head % heads_k) * width;
@@ -582,7 +588,7 @@ void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
     const float* value = mixed.data() + 2 * key_dim +
                          static_cast<std::size_t>(head) * width;
     float* matrix =
-        state.data() + static_cast<std::size_t>(head) * width * width;
+        out.state.data() + static_cast<std::size_t>(head) * width * width;
     const float decay =
         std::exp(orn::cpu::Softplus(alpha[head] + dt[head]) * a[head]);
     const float gate = orn::cpu::Sigmoid(beta[head]);
@@ -604,23 +610,50 @@ void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
         line[col] += delta * key[col];
         dot += static_cast<double>(line[col]) * query[col];
       }
-      attn[static_cast<std::size_t>(head) * width + row] =
+      out.attn[static_cast<std::size_t>(head) * width + row] =
           static_cast<float>(dot) * q_scale;
     }
     const auto* norm = static_cast<const float*>(layer.ssm_norm.data);
-    orn::cpu::RmsNorm(
-        std::span<float>(attn.data() + static_cast<std::size_t>(head) * width,
-                         width),
-        norm, config.rms_eps);
+    orn::cpu::RmsNorm(std::span<float>(out.attn.data() +
+                                           static_cast<std::size_t>(head) * width,
+                                       width),
+                      norm, config.rms_eps);
     for (int col = 0; col < width; ++col) {
-      attn[static_cast<std::size_t>(head) * width + col] *=
+      out.attn[static_cast<std::size_t>(head) * width + col] *=
           orn::cpu::Silu(z[static_cast<std::size_t>(head) * width + col]);
     }
   }
-  y.assign(config.hidden_size, 0);
-  orn::cpu::MatVec(layer.ssm_out, 0, attn, y);
+  out.y.assign(config.hidden_size, 0);
+  orn::cpu::MatVec(layer.ssm_out, 0, out.attn, out.y);
+  return out;
 }
 
+// Independent scalar layer-0 step. This follows ReferenceModel::LinearAttention:
+// F64 matvecs, libm SiLU/L2/softplus, and the scalar recurrence association.
+void ScalarAdvance(const orn::LayerWeights& layer, const orn::Config& config,
+                   const std::vector<float>& normed, std::vector<float>& conv,
+                   std::vector<float>& state, std::vector<float>& qkv,
+                   std::vector<float>& z, std::vector<float>& alpha,
+                   std::vector<float>& beta, std::vector<float>& silu,
+                   std::vector<float>& attn, std::vector<float>& y) {
+  const int channels = static_cast<int>(config.SsmConvChannels());
+  const int value_dim = static_cast<int>(config.SsmValueDim());
+  const int heads_v = static_cast<int>(config.ssm_num_v_heads);
+  qkv.assign(channels, 0);
+  z.assign(value_dim, 0);
+  alpha.assign(heads_v, 0);
+  beta.assign(heads_v, 0);
+  orn::cpu::MatVec(layer.ssm_qkv, 0, normed, qkv);
+  orn::cpu::MatVec(layer.ssm_gate, 0, normed, z);
+  orn::cpu::MatVec(layer.ssm_alpha, 0, normed, alpha);
+  orn::cpu::MatVec(layer.ssm_beta, 0, normed, beta);
+  auto stepped = ScalarFromBundle(layer, config, qkv, z, alpha, beta, conv, state);
+  conv.swap(stepped.conv);
+  state.swap(stepped.state);
+  attn.swap(stepped.attn);
+  y.swap(stepped.y);
+  silu.clear();
+}
 }  // namespace
 
 int main() {
@@ -711,7 +744,7 @@ int main() {
     Buffer<float> r_qkv(channels), r_z(value), r_ab(v_heads * 2);
     Buffer<float> r_conv(3 * channels);
     Buffer<float> r_scratch((1 + c.ssm_conv_kernel) * channels);
-    Buffer<float> r_qn(key), r_kn(key), r_raw(value), r_gdn(value);
+    Buffer<float> r_qn(key), r_kn(key), r_raw(value), r_gdn(value), r_ssm(hidden);
     Buffer<float> r_state(static_cast<std::size_t>(v_heads) * d * d);
     Buffer<std::int32_t> zero(1);
     Require(hipMemset(conv_state.data, 0, 3 * channels * 4) == hipSuccess,
@@ -751,12 +784,13 @@ int main() {
     std::vector<float> scalar_state(static_cast<std::size_t>(v_heads) * d * d,
                                     0.0F);
     double scalar_norm_max = 0, scalar_qkv_max = 0, scalar_state_max = 0,
-           scalar_out_max = 0, rg_max = 0, gr_max = 0;
+           scalar_out_max = 0;
     struct Note {
       int token, embed_bad, onesum, pairwise, gg_bad;
       long qkv_miss, gate_miss, alpha_miss, beta_miss, out_miss;
-      double assoc, silu, prep, state, raw, epi, snorm, sqkv, sstate, sout,
-          rg, gr;
+      double assoc, silu, prep, state, raw, epi, snorm, sqkv, sstate, sout;
+      double gpu_state[4], gpu_out[4], scalar_state_gap[4], scalar_out_gap[4];
+      int scalar_rr_bad;
     };
     std::vector<Note> notes;
     const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(1, hidden);
@@ -1034,26 +1068,71 @@ int main() {
             k_heads, v_heads, d, c.ssm_conv_kernel, false, false, c.rms_eps,
             nullptr, nullptr, {}, 0, nullptr, fn::GdnGate::kSilu,
             fn::GdnL2Norm::kClampEps);
+        Require(qfn_mmq_quantize_q8_1(r_gdn.data, q8_out.data, 1, value,
+                                      nullptr) == 0,
+                "rerun quantize");
+        Require(qfn_mmq_moe_vec(static_cast<int>(GgmlType::kQ6_K),
+                                layer.ssm_out.data, r_gdn.data, zero.data,
+                                r_ssm.data, hidden, value, 1, 1, 1,
+                                nullptr) == 0,
+                "rerun ssm_out");
         struct Out {
-          std::vector<float> state, gdn;
+          std::vector<float> state, gdn, y;
         };
-        return Out{r_state.Download(sv.size()), r_gdn.Download(value)};
+        return Out{r_state.Download(sv.size()), r_gdn.Download(value),
+                   r_ssm.Download(hidden)};
       };
-      const auto matched_gg = rerun(hq, hz, hab, hist, sin);
-      const int gg_bad =
-          SameBits(matched_gg.state, sout) && SameBits(matched_gg.gdn, hgdn) ? 0
-                                                                             : 1;
-      if (gg_bad)
-        ++stats.gg_mismatch_tokens;
       std::vector<float> sab(static_cast<std::size_t>(v_heads) * 2);
       std::copy(salpha.begin(), salpha.end(), sab.begin());
       std::copy(sbeta.begin(), sbeta.end(), sab.begin() + v_heads);
-      const auto rg = rerun(sqkv, sz, sab, conv_before, sin);
-      const auto gr = rerun(hq, hz, hab, hist, state_before);
-      const double rg_gap = MaxAbs(rg.state, sout, row_nonfinite);
-      const double gr_gap = MaxAbs(gr.state, scalar_state, row_nonfinite);
-      rg_max = std::max(rg_max, rg_gap);
-      gr_max = std::max(gr_max, gr_gap);
+      std::vector<float> galpha(hab.begin(), hab.begin() + v_heads);
+      std::vector<float> gbeta(hab.begin() + v_heads, hab.end());
+      // Input is the projection bundle and the convolution history. State is
+      // the recurrent matrix. Order: reference/reference, GPU/GPU,
+      // reference/GPU, GPU/reference.
+      const auto gpu_rr = rerun(sqkv, sz, sab, conv_before, state_before);
+      const auto gpu_gg = rerun(hq, hz, hab, hist, sin);
+      const auto gpu_rg = rerun(sqkv, sz, sab, conv_before, sin);
+      const auto gpu_gr = rerun(hq, hz, hab, hist, state_before);
+      const int gg_bad = SameBits(gpu_gg.state, sout) &&
+                                 SameBits(gpu_gg.gdn, hgdn) &&
+                                 SameBits(gpu_gg.y, hs)
+                             ? 0
+                             : 1;
+      if (gg_bad)
+        ++stats.gg_mismatch_tokens;
+      const auto scalar_rr = ScalarFromBundle(host, c, sqkv, sz, salpha, sbeta,
+                                              conv_before, state_before);
+      const auto scalar_gg =
+          ScalarFromBundle(host, c, hq, hz, galpha, gbeta, hist, sin);
+      const auto scalar_rg =
+          ScalarFromBundle(host, c, sqkv, sz, salpha, sbeta, conv_before, sin);
+      const auto scalar_gr =
+          ScalarFromBundle(host, c, hq, hz, galpha, gbeta, hist, state_before);
+      const int scalar_rr_bad =
+          SameBits(scalar_rr.state, scalar_state) && SameBits(scalar_rr.y, sy)
+              ? 0
+              : 1;
+      if (scalar_rr_bad)
+        ++stats.scalar_rr_mismatch_tokens;
+      const double gpu_state_gap[4] = {
+          MaxAbs(gpu_rr.state, sout, row_nonfinite),
+          MaxAbs(gpu_gg.state, sout, row_nonfinite),
+          MaxAbs(gpu_rg.state, sout, row_nonfinite),
+          MaxAbs(gpu_gr.state, sout, row_nonfinite)};
+      const double gpu_out_gap[4] = {
+          MaxAbs(gpu_rr.y, hs, row_nonfinite), MaxAbs(gpu_gg.y, hs, row_nonfinite),
+          MaxAbs(gpu_rg.y, hs, row_nonfinite), MaxAbs(gpu_gr.y, hs, row_nonfinite)};
+      const double scalar_state_gap[4] = {
+          MaxAbs(scalar_rr.state, sout, row_nonfinite),
+          MaxAbs(scalar_gg.state, sout, row_nonfinite),
+          MaxAbs(scalar_rg.state, sout, row_nonfinite),
+          MaxAbs(scalar_gr.state, sout, row_nonfinite)};
+      const double scalar_out_gap[4] = {
+          MaxAbs(scalar_rr.y, hs, row_nonfinite),
+          MaxAbs(scalar_gg.y, hs, row_nonfinite),
+          MaxAbs(scalar_rg.y, hs, row_nonfinite),
+          MaxAbs(scalar_gr.y, hs, row_nonfinite)};
       auto save = [&](const std::string& name, const std::vector<float>& data) {
         std::ofstream out(dump_dir / name, std::ios::binary);
         out.write(reinterpret_cast<const char*>(data.data()),
@@ -1071,26 +1150,73 @@ int main() {
       save(id + "_gdn.f32", hgdn);
       save(id + "_ssm.f32", hs);
       save(id + "_scalar_state_out.f32", scalar_state);
-      notes.push_back(
-          Note{t, embed_bad, bound_fail, pairwise_fail, gg_bad,
-               static_cast<long>(qkv_stat.rows - qkv_stat.matched),
-               static_cast<long>(gate_stat.rows - gate_stat.matched),
-               static_cast<long>(alpha_stat.rows - alpha_stat.matched),
-               static_cast<long>(beta_stat.rows - beta_stat.matched),
-               static_cast<long>(out_stat.rows - out_stat.matched), assoc_max,
-               silu_max, prep, state_max, raw_max, epi, snorm, sq, ss, so,
-               rg_gap, gr_gap});
+      const char* combos[] = {"rr", "gg", "rg", "gr"};
+      const std::vector<float>* gpu_states[] = {&gpu_rr.state, &gpu_gg.state,
+                                                 &gpu_rg.state, &gpu_gr.state};
+      const std::vector<float>* gpu_outs[] = {&gpu_rr.y, &gpu_gg.y, &gpu_rg.y,
+                                              &gpu_gr.y};
+      const std::vector<float>* gpu_gdns[] = {&gpu_rr.gdn, &gpu_gg.gdn,
+                                              &gpu_rg.gdn, &gpu_gr.gdn};
+      const std::vector<float>* scalar_states[] = {
+          &scalar_rr.state, &scalar_gg.state, &scalar_rg.state, &scalar_gr.state};
+      const std::vector<float>* scalar_outs[] = {&scalar_rr.y, &scalar_gg.y,
+                                                 &scalar_rg.y, &scalar_gr.y};
+      const std::vector<float>* scalar_gdns[] = {
+          &scalar_rr.attn, &scalar_gg.attn, &scalar_rg.attn, &scalar_gr.attn};
+      for (int combo = 0; combo < 4; ++combo) {
+        save(id + "_gpu_" + combos[combo] + "_state.f32", *gpu_states[combo]);
+        save(id + "_gpu_" + combos[combo] + "_out.f32", *gpu_outs[combo]);
+        save(id + "_gpu_" + combos[combo] + "_gdn.f32", *gpu_gdns[combo]);
+        save(id + "_scalar_" + combos[combo] + "_state.f32",
+             *scalar_states[combo]);
+        save(id + "_scalar_" + combos[combo] + "_out.f32", *scalar_outs[combo]);
+        save(id + "_scalar_" + combos[combo] + "_gdn.f32",
+             *scalar_gdns[combo]);
+      }
+      Note row{};
+      row.token = t;
+      row.embed_bad = embed_bad;
+      row.onesum = bound_fail;
+      row.pairwise = pairwise_fail;
+      row.gg_bad = gg_bad;
+      row.scalar_rr_bad = scalar_rr_bad;
+      row.qkv_miss = static_cast<long>(qkv_stat.rows - qkv_stat.matched);
+      row.gate_miss = static_cast<long>(gate_stat.rows - gate_stat.matched);
+      row.alpha_miss = static_cast<long>(alpha_stat.rows - alpha_stat.matched);
+      row.beta_miss = static_cast<long>(beta_stat.rows - beta_stat.matched);
+      row.out_miss = static_cast<long>(out_stat.rows - out_stat.matched);
+      row.assoc = assoc_max;
+      row.silu = silu_max;
+      row.prep = prep;
+      row.state = state_max;
+      row.raw = raw_max;
+      row.epi = epi;
+      row.snorm = snorm;
+      row.sqkv = sq;
+      row.sstate = ss;
+      row.sout = so;
+      std::copy(gpu_state_gap, gpu_state_gap + 4, row.gpu_state);
+      std::copy(gpu_out_gap, gpu_out_gap + 4, row.gpu_out);
+      std::copy(scalar_state_gap, scalar_state_gap + 4, row.scalar_state_gap);
+      std::copy(scalar_out_gap, scalar_out_gap + 4, row.scalar_out_gap);
+      notes.push_back(row);
       std::cout << "token=" << t << " embed_bad=" << embed_bad
-                << " qkv_miss=" << notes.back().qkv_miss
-                << " out_miss=" << notes.back().out_miss
-                << " conv_pairwise_channels=" << pairwise_fail
-                << " scalar_state=" << ss << " gg_bad=" << gg_bad
-                << " rg_state=" << rg_gap << " gr_state=" << gr_gap << '\n';
+                << " qkv_miss=" << row.qkv_miss << " out_miss=" << row.out_miss
+                << " gg_bad=" << gg_bad << " scalar_rr_bad=" << scalar_rr_bad
+                << " gpu_rg_state=" << gpu_state_gap[2]
+                << " gpu_rg_out=" << gpu_out_gap[2]
+                << " scalar_gg_state=" << scalar_state_gap[1]
+                << " scalar_gg_out=" << scalar_out_gap[1] << '\n';
     }
-    const std::string script = "tools/ornith15/representation.py";
+#ifndef GUFO_ORNITH15_SOURCE_DIR
+#define GUFO_ORNITH15_SOURCE_DIR "."
+#endif
+    const fs::path script = fs::path(GUFO_ORNITH15_SOURCE_DIR) /
+                            "tools/ornith15/representation.py";
     if (fs::is_regular_file(script)) {
       const int encoded = std::system(
-          ("python3 " + script + " encode-check " + dump_dir.string()).c_str());
+          ("python3 " + script.string() + " encode-check " + dump_dir.string())
+              .c_str());
       std::ifstream report(dump_dir / "q8-encode-check.json");
       const std::string text((std::istreambuf_iterator<char>(report)), {});
       auto field = [&](const char* key) {
@@ -1122,7 +1248,11 @@ int main() {
              "qkv_miss\tgate_miss\talpha_miss\tbeta_miss\tout_miss\t"
              "conv_onesum_channels\tconv_pairwise_channels\tconv_silu\tprep\t"
              "local_state\tscalar_norm\tscalar_qkv\tscalar_state\tscalar_out\t"
-             "gg_bad\trg_state\tgr_state\n";
+             "gg_bad\tscalar_rr_bad\t"
+             "gpu_rr_state\tgpu_gg_state\tgpu_rg_state\tgpu_gr_state\t"
+             "gpu_rr_out\tgpu_gg_out\tgpu_rg_out\tgpu_gr_out\t"
+             "scalar_rr_state\tscalar_gg_state\tscalar_rg_state\tscalar_gr_state\t"
+             "scalar_rr_out\tscalar_gg_out\tscalar_rg_out\tscalar_gr_out\n";
     for (const auto& note : notes) {
       const auto q8 = q8_rows.count(note.token) ? q8_rows[note.token]
                                                 : std::array<int, 3>{-1, -1, -1};
@@ -1133,7 +1263,16 @@ int main() {
             << '\t' << note.pairwise << '\t' << note.silu << '\t' << note.prep
             << '\t' << note.state << '\t' << note.snorm << '\t' << note.sqkv
             << '\t' << note.sstate << '\t' << note.sout << '\t' << note.gg_bad
-            << '\t' << note.rg << '\t' << note.gr << '\n';
+            << '\t' << note.scalar_rr_bad;
+      for (double value : note.gpu_state)
+        table << '\t' << value;
+      for (double value : note.gpu_out)
+        table << '\t' << value;
+      for (double value : note.scalar_state_gap)
+        table << '\t' << value;
+      for (double value : note.scalar_out_gap)
+        table << '\t' << value;
+      table << '\n';
     }
     std::ofstream manifest(dump_dir / "fixture-manifest.json");
     manifest << "{\n  \"dtype\": \"float32\",\n  \"endian\": \"little\",\n"
@@ -1145,7 +1284,11 @@ int main() {
              << ",\n  \"channels\": " << channels << ",\n  \"value_heads\": "
              << v_heads << ",\n  \"head_dim\": " << d
              << ",\n  \"hashes\": \"fixture-sha256.txt\",\n"
-             << "  \"q8_codes_scales_aux_are_separate\": true\n}\n";
+             << "  \"q8_codes_scales_aux_are_separate\": true,\n"
+             << "  \"crossed_matrix\": \"input is qkv, gate, alpha, beta and "
+                "convolution history; state is the recurrent matrix; "
+                "rr/gg/rg/gr under gpu and scalar; out is ssm_out; gdn is the "
+                "gated normalized recurrent output\"\n}\n";
     Require(std::system(("cd " + dump_dir.string() +
                          " && find . -type f \\( -name '*.f32' -o -name '*.bin' "
                          "\\) -print0 | sort -z | xargs -0 sha256sum > "
@@ -1162,11 +1305,12 @@ int main() {
               << " conv_onesum_tokens=" << stats.conv_onesum_exceed_tokens
               << " conv_pairwise_tokens=" << stats.conv_pairwise_exceed_tokens
               << " gg_mismatch_tokens=" << stats.gg_mismatch_tokens
+              << " scalar_rr_mismatch_tokens="
+              << stats.scalar_rr_mismatch_tokens
               << " max_scalar_norm=" << scalar_norm_max
               << " max_scalar_qkv=" << scalar_qkv_max
               << " max_scalar_state=" << scalar_state_max
               << " max_scalar_out=" << scalar_out_max
-              << " max_rg_state=" << rg_max << " max_gr_state=" << gr_max
               << " nonfinite=" << stats.nonfinite
               << " disposition=" << status << '\n';
     return status;
