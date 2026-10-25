@@ -960,3 +960,38 @@ state and `ssm_out` differ from production, so a later routing and logit
 test on an unchanged suffix is justified. That test has not been run.
 Production remains policy B. The code_diff/75 KL failure and the two
 tool flips remain unresolved.
+
+### Registered downstream test: layer-0 QKV on code_diff 0–75
+
+This section is the registration. It is written before the measurement.
+The target is the retained code_diff position-75 confident KL,
+0.1220301624, against the unchanged limit 0.1. The two tool-history
+flips are outside this run. Confirmation histories are not read.
+
+Three arms each start from a clear session and carry that session's
+full model state through captured code_diff tokens 0–75 inclusive.
+Token IDs, packed weights, expert count and the o-F32 attention path
+stay on production B.
+
+| Arm | Layer-0 QKV consumed by `GatedDeltaNet` |
+| --- | --- |
+| Production | The production Q6 projection. No rewrite. |
+| Reinsert | That same production QKV, downloaded and uploaded again. |
+| F64 on GPU norm | F64 matvec of `ssm_qkv` on the exact GPU RMSNorm output. |
+
+The reinsert arm is a harness control. Its full-vocabulary logits must
+match production byte for byte at every position, and its layer-0
+convolution history and recurrent state must match production byte for
+byte. A mismatch stops the run before the F64 arm is interpreted.
+Routing ids, routing weights, the shared-expert gate and the trunk
+residuals are recorded for the same control. There is no forecast for
+the position-75 KL. A later result will say whether the F64 arm
+improves, worsens or leaves the measured violation unchanged relative
+to this run's production arm and relative to 0.1220301624, and whether
+position 75 still fails the unchanged confident-KL rule. A routing,
+residual or logit change is causal influence. Correcting the failure
+additionally requires position 75 to satisfy the 0.1 limit and the
+prefix to gain no confident-KL failure or corroborated clear flip.
+Prefix means are diagnostic. A passing position 75 does not prove an
+operator defect and does not qualify a policy. The production decode
+binary and the numeric thresholds stay as they are.
