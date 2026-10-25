@@ -33,8 +33,12 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(representation_gpu "gpu;hip;gfx1151"
     gufo_ornith15_gpu)
   add_ornith15_test(layer0_replay "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu)
+    gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.layer0_replay PROPERTIES TIMEOUT 3600)
+  add_test(NAME ornith15.layer0_exit_logic COMMAND ornith15_layer0_replay_test)
+  set_tests_properties(ornith15.layer0_exit_logic PROPERTIES
+    ENVIRONMENT "GUFO_ORNITH15_LAYER0_MODE=prove-exit"
+    LABELS "ornith15;gpu;hip" SKIP_RETURN_CODE 77)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)
