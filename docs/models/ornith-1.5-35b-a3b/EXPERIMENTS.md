@@ -820,10 +820,42 @@ Q6_K MMVQ does not read the auxiliary. The layer-0 dots are unaffected.
 Host SiLU of the GPU convolution association stays within 1.9e-6
 absolute of the GPU post-SiLU value. The pairwise gap between the two
 f32 add associations exceeds the published one-summation `γ_3` bound on
-some channels (first token 4 in this run). A host-only Monte Carlo of
-those same two associations also exceeds it, up to about 1.23 times
-`γ_3 P`, so that excess is the pairwise gap against a one-summation
-sufficient bound. Prep, libm recurrence and epilogue stay within
-1.8e-7, 1.9e-6 and 7.2e-7 absolute. Those gaps are math-library drift,
-not a broken layer-0 dot. Position 75's registered logit failure is not
-explained inside layer 0.
+some channels (40 tokens, first at token 4; that log is retained). A
+host-only search also finds inputs whose two orders exceed `γ_3 P`, up
+to about 1.23 times that allowance. That does not justify a fitted
+constant. Each order is within `γ_3` of the exact sum of the same four
+rounded products, so the triangle inequality gives a pairwise allowance
+of `2 γ_3 Σ|p_i|`. The corrected replay has zero channels above that
+pairwise allowance. Prep and one-step recurrence gaps stay small. They
+are unallocated numerical differences, not a math-library attribution
+and not a cleared layer-0 path.
+
+### Review corrections (same prefix, exit status enforced)
+
+The replay now returns non-zero for mandatory mismatches. An injected
+embed, Q6, Q8, nonfinite, GPU-rerun and pairwise failure each produce a
+non-zero disposition; the old one-summation convolution count does not.
+Missing model or captures return 77. Self-check is a separate mode.
+The rerun log is `artifacts/p4e/wp2-layer0-replay-r2.log`. It exits 5.
+
+Q8 codes and stored scales still match on all 4,864 blocks. The two
+auxiliary-only mismatches are in the table (`q8_aux_bad` 1 at tokens 63
+and 66) and fail the process. Q6 rows still match a registered sequence
+on every token, and a second GPU launch from the saved inputs and state
+is byte-identical (`gg_bad` 0).
+
+An independent scalar trajectory, using the reference matvec, SiLU, L2
+and recurrence, runs beside the GPU trajectory from the same token IDs
+and a zero initial state. The largest absolute gaps are about 3.8e-6 in
+the attention norm, 0.104 in `ssm_qkv`, 0.108 in recurrent state and
+0.00240 in `ssm_out`. At token 75 the state gap is about 0.0576.
+Crossing scalar projections with GPU state, and GPU projections with
+scalar state, moves the outgoing state by up to about 0.091. These are
+trajectory differences, not a located operator defect. The saved
+boundaries, both state trajectories and fixture hashes are under
+`artifacts/p4e/wp2-layer0/`.
+
+The synthetic Q8_0 score is split the same way. Ten rows match only
+`D_compiled`. `original_protocol_pass` is false and the scorer exits 1.
+`supplemental_explained` is 10. The earlier aggregate that treated those
+rows as a pass is kept as `score-compiled-aggregate.json`.
