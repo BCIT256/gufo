@@ -859,3 +859,60 @@ The synthetic Q8_0 score is split the same way. Ten rows match only
 `D_compiled`. `original_protocol_pass` is false and the scorer exits 1.
 `supplemental_explained` is 10. The earlier aggregate that treated those
 rows as a pass is kept as `score-compiled-aggregate.json`.
+
+### Crossed evaluators and one-operand swaps (same prefix)
+
+`ornith15.layer0_replay` now gets `GUFO_ORNITH15_SOURCE_DIR` from CMake
+and CTest runs it with the engine source tree as its working directory.
+The encoder script resolves from that root. A missing script still leaves
+the Q8 check unmeasured. The measured rerun is
+`artifacts/p4e/wp2-layer0-replay-swap.log`. It exits 5. The original
+one-summation log `artifacts/p4e/wp2-layer0-replay.log` stays in place:
+40 tokens, first at token 4. This run counts the same 40 tokens, first
+at token 4, and zero channels above the pairwise `2 γ_3 Σ|p_i|` allowance.
+
+Each of the four input/state combinations ran on the production GPU
+launcher and on the scalar evaluator. Incoming input means the qkv, gate,
+alpha, beta and convolution history. State means the recurrent matrix.
+Outgoing state, gated output and `ssm_out` were compared and saved for
+all eight cells. GPU/GPU is byte-identical on those three tensors
+(`gg_bad` 0). Scalar/scalar matches the independent scalar trajectory
+(`scalar_rr_bad` 0). With the GPU bundle and the GPU incoming state, the
+scalar state stays within 2.861e-6 (token 20) and the scalar gated output
+stays within 7.153e-7 (token 24). In that same cell `ssm_out` still
+differs by up to 0.002423 (token 17), beside Q6 rows that match a
+registered sequence.
+
+The reference-input/GPU-state cell moves state by up to 0.09116 (token
+6). The GPU-input/reference-state cell moves state by up to 0.08638
+(token 7) and is the larger cell on 70 of the 76 tokens. At token 0 the
+history and the recurrent state are zero, so the trajectory gap of
+0.004060 is entirely the reference-input cell. At token 75 the trajectory
+state gap is 0.05761: 0.05595 of that step follows the incoming reference
+state, and 0.01595 follows the current reference bundle.
+
+A further production launch replaced one scalar operand at a time and
+kept every other projection, the history and the incoming state on the
+GPU trajectory. Replacing the gate changes the state by 0 on all 76
+tokens and changes `ssm_out` by up to 0.001378 (token 59). At token 0,
+alpha and history replacements also leave the state unchanged, while qkv
+and beta move it by 0.002572 and 0.002429. The token-1 history gap,
+0.017666, equals the token-0 qkv gap. Over the prefix the largest
+one-step state movement is the convolution history on 64 tokens, beta on
+7 and the current qkv on 5. Those peaks are 0.09007 (history, token 6),
+0.04801 (beta, token 59), 0.02629 (current qkv, token 4) and 0.02094
+(alpha, token 55).
+
+The selected diagnostic intervention is a continued layer-0 trajectory
+that substitutes only the scalar `ssm_qkv` output, carries the outgoing
+history and recurrent state forward, and leaves the gate, alpha, beta,
+`GatedDeltaNet` and `ssm_out` on the production implementation. The
+prediction is that the history-sized part of the state gap shrinks, a
+residual on the scale of the beta write remains, and the matched-operand
+`ssm_out` gap of about 0.0024 remains. That continued substitution has
+not been run. Every `ssm_qkv` row still matches a registered sequence, so
+the substitution measures declared representation cost. Production stays
+policy B. The code_diff/75 KL failure and the two tool flips remain
+unresolved. Q8 codes and scales still match; tokens 63 and 66 still
+differ by one auxiliary ulp. The table and fixtures are under
+`artifacts/p4e/wp2-layer0/`.
