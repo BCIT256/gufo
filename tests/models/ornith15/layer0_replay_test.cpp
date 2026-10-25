@@ -4,7 +4,10 @@
 // Mandatory process failures: nonfinite values, embedding or registered Q6
 // mismatches, any Q8 code/scale/auxiliary mismatch, a GPU/GPU rerun that
 // is not byte-identical, a pairwise convolution bound failure, or an
-// unmeasured Q8 check. Other gaps are recorded without a cause label.
+// unmeasured Q8 check, or a carried harness that is not byte-identical.
+// Other gaps are recorded without a cause label. The carried qkv
+// substitute is an F64 matvec on the GPU RMSNorm output. Gaps from the
+// scalar RMSNorm are a broader scalar-qkv substitution.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -375,6 +378,7 @@ struct ReplayStats {
   int q8_aux_bad{0};
   int gg_mismatch_tokens{0};
   int scalar_rr_mismatch_tokens{0};
+  int harness_mismatch_tokens{0};
   double conv_assoc_max{0};
   double conv_silu_max{0};
   double prep_max{0};
@@ -467,6 +471,8 @@ int Disposition(const ReplayStats& stats) {
     return 7;
   if (stats.scalar_rr_mismatch_tokens)
     return 8;
+  if (stats.harness_mismatch_tokens)
+    return 9;
   return 0;
 }
 
@@ -489,6 +495,8 @@ int ProveExitLogic() {
   rerun.gg_mismatch_tokens = 1;
   ReplayStats scalar_rr = clean;
   scalar_rr.scalar_rr_mismatch_tokens = 1;
+  ReplayStats harness = clean;
+  harness.harness_mismatch_tokens = 1;
   ReplayStats pairwise = clean;
   pairwise.conv_pairwise_exceed_tokens = 1;
   ReplayStats unmeasured;
@@ -500,8 +508,9 @@ int ProveExitLogic() {
   const bool fails = Disposition(embed) && Disposition(dot) &&
                      Disposition(aux) && Disposition(code) &&
                      Disposition(scale) && Disposition(rerun) &&
-                     Disposition(scalar_rr) && Disposition(pairwise) &&
-                     Disposition(unmeasured) && Disposition(bad);
+                     Disposition(scalar_rr) && Disposition(harness) &&
+                     Disposition(pairwise) && Disposition(unmeasured) &&
+                     Disposition(bad);
   if (!fails || Disposition(diagnostic) != 0)
     return 1;
   std::cout << "prove_exit_ok injected_mismatch_fails=1 "
@@ -789,6 +798,14 @@ int main() {
                                     0.0F);
     double scalar_norm_max = 0, scalar_qkv_max = 0, scalar_state_max = 0,
            scalar_out_max = 0;
+    double proj_qkv_max = 0, carry_state_max = 0, carry_gdn_max = 0,
+           carry_out_max = 0, carry_conv_max = 0;
+    int carry_state_token = -1, carry_out_token = -1;
+    std::vector<float> carry_conv(3 * channels, 0.0F);
+    std::vector<float> carry_state(static_cast<std::size_t>(v_heads) * d * d,
+                                   0.0F);
+    std::vector<float> harness_conv = carry_conv;
+    std::vector<float> harness_state = carry_state;
     struct Note {
       int token, embed_bad, onesum, pairwise, gg_bad;
       long qkv_miss, gate_miss, alpha_miss, beta_miss, out_miss;
@@ -796,9 +813,14 @@ int main() {
       double gpu_state[4], gpu_out[4], scalar_state_gap[4], scalar_out_gap[4];
       double swap_state[5], swap_out[5];
       double gap_gate, gap_alpha, gap_beta, gap_conv;
-      int scalar_rr_bad;
+      double proj_qkv, carry_state, carry_gdn, carry_out, carry_conv;
+      int scalar_rr_bad, harness_bad;
     };
     std::vector<Note> notes;
+    std::cout << "qkv_substitution=f64_matvec_on_gpu_rms_norm\n"
+                 "broader_scalar_qkv=f64_matvec_on_scalar_rms_norm\n"
+                 "prediction=harness_byte_identical_no_magnitude_forecast\n"
+                 "decision=downstream_only_if_carried_state_or_ssm_out_differs\n";
     const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(1, hidden);
     Buffer<std::uint8_t> q8(q8_bytes);
     const std::size_t q8_out_bytes = qfn_mmq_q8_1_bytes(1, value);
@@ -894,6 +916,7 @@ int main() {
       auto hraw = raw.Download(value);
       auto hgdn = gdn.Download(value);
       auto sout = state.Download(static_cast<std::size_t>(v_heads) * d * d);
+      auto hout = conv_state.Download(3 * channels);
 
       double assoc_max = 0;
       double silu_max = 0;
@@ -1083,10 +1106,10 @@ int main() {
                                 nullptr) == 0,
                 "rerun ssm_out");
         struct Out {
-          std::vector<float> state, gdn, y;
+          std::vector<float> state, gdn, y, conv;
         };
         return Out{r_state.Download(sv.size()), r_gdn.Download(value),
-                   r_ssm.Download(hidden)};
+                   r_ssm.Download(hidden), r_conv.Download(cv.size())};
       };
       std::vector<float> sab(static_cast<std::size_t>(v_heads) * 2);
       std::copy(salpha.begin(), salpha.end(), sab.begin());
@@ -1139,9 +1162,11 @@ int main() {
           MaxAbs(scalar_gg.y, hs, row_nonfinite),
           MaxAbs(scalar_rg.y, hs, row_nonfinite),
           MaxAbs(scalar_gr.y, hs, row_nonfinite)};
-      // One GPU operand is replaced by the scalar value. The other projections,
-      // the convolution history and the incoming state stay on the GPU
-      // trajectory. Gate is included because it should not write the state.
+      // One-step replacements on the GPU trajectory. swap_qkv uses the
+      // scalar trajectory's qkv, which is an F64 matvec of the scalar
+      // RMSNorm. That is a broader substitution than the carried
+      // projection test below. Gate is included because it should not
+      // write the state. These gaps are not additive contributions.
       const double gap_gate = MaxAbs(sz, hz, row_nonfinite);
       const double gap_alpha = MaxAbs(salpha, galpha, row_nonfinite);
       const double gap_beta = MaxAbs(sbeta, gbeta, row_nonfinite);
@@ -1171,6 +1196,47 @@ int main() {
           MaxAbs(swap_alpha.y, hs, row_nonfinite),
           MaxAbs(swap_beta.y, hs, row_nonfinite),
           MaxAbs(swap_conv.y, hs, row_nonfinite)};
+      // Frozen projection substitute: F64 matvec on this token's GPU
+      // RMSNorm output. History and recurrent state are the outgoing
+      // values of this chain. No magnitude is forecast.
+      std::vector<float> qkv_proj(static_cast<std::size_t>(channels), 0.0F);
+      orn::cpu::MatVec(host.ssm_qkv, 0,
+                       std::span<const float>(nhost.data(), nhost.size()),
+                       std::span<float>(qkv_proj.data(), qkv_proj.size()));
+      const double proj_qkv = MaxAbs(qkv_proj, hq, row_nonfinite);
+      const auto harness = rerun(hq, hz, hab, harness_conv, harness_state);
+      const int harness_bad =
+          SameBits(harness.state, sout) && SameBits(harness.gdn, hgdn) &&
+                  SameBits(harness.y, hs) && SameBits(harness.conv, hout)
+              ? 0
+              : 1;
+      if (harness_bad)
+        ++stats.harness_mismatch_tokens;
+      harness_conv = harness.conv;
+      harness_state = harness.state;
+      const auto carried = rerun(qkv_proj, hz, hab, carry_conv, carry_state);
+      const double carry_state_gap = MaxAbs(carried.state, sout, row_nonfinite);
+      const double carry_gdn_gap = MaxAbs(carried.gdn, hgdn, row_nonfinite);
+      const double carry_out_gap = MaxAbs(carried.y, hs, row_nonfinite);
+      const double carry_conv_gap = MaxAbs(carried.conv, hout, row_nonfinite);
+      carry_conv = carried.conv;
+      carry_state = carried.state;
+      mark(qkv_proj);
+      mark(carried.state);
+      mark(carried.gdn);
+      mark(carried.y);
+      mark(carried.conv);
+      proj_qkv_max = std::max(proj_qkv_max, proj_qkv);
+      if (carry_state_gap > carry_state_max) {
+        carry_state_max = carry_state_gap;
+        carry_state_token = t;
+      }
+      if (carry_out_gap > carry_out_max) {
+        carry_out_max = carry_out_gap;
+        carry_out_token = t;
+      }
+      carry_gdn_max = std::max(carry_gdn_max, carry_gdn_gap);
+      carry_conv_max = std::max(carry_conv_max, carry_conv_gap);
       auto save = [&](const std::string& name, const std::vector<float>& data) {
         std::ofstream out(dump_dir / name, std::ios::binary);
         out.write(reinterpret_cast<const char*>(data.data()),
@@ -1188,6 +1254,12 @@ int main() {
       save(id + "_gdn.f32", hgdn);
       save(id + "_ssm.f32", hs);
       save(id + "_scalar_state_out.f32", scalar_state);
+      save(id + "_proj_qkv.f32", qkv_proj);
+      save(id + "_carry_conv.f32", carried.conv);
+      save(id + "_carry_state.f32", carried.state);
+      save(id + "_carry_gdn.f32", carried.gdn);
+      save(id + "_carry_out.f32", carried.y);
+      save(id + "_conv_out.f32", hout);
       const char* combos[] = {"rr", "gg", "rg", "gr"};
       const std::vector<float>* gpu_states[] = {&gpu_rr.state, &gpu_gg.state,
                                                  &gpu_rg.state, &gpu_gr.state};
@@ -1243,6 +1315,12 @@ int main() {
       row.gap_alpha = gap_alpha;
       row.gap_beta = gap_beta;
       row.gap_conv = gap_conv;
+      row.proj_qkv = proj_qkv;
+      row.harness_bad = harness_bad;
+      row.carry_state = carry_state_gap;
+      row.carry_gdn = carry_gdn_gap;
+      row.carry_out = carry_out_gap;
+      row.carry_conv = carry_conv_gap;
       notes.push_back(row);
       std::cout << "token=" << t << " embed_bad=" << embed_bad
                 << " qkv_miss=" << row.qkv_miss << " out_miss=" << row.out_miss
@@ -1251,14 +1329,18 @@ int main() {
                 << " gpu_rg_out=" << gpu_out_gap[2]
                 << " scalar_gg_state=" << scalar_state_gap[1]
                 << " scalar_gg_out=" << scalar_out_gap[1]
-                << " swap_qkv_state=" << swap_state[0]
+                << " swap_scalar_qkv_state=" << swap_state[0]
                 << " swap_gate_state=" << swap_state[1]
                 << " swap_alpha_state=" << swap_state[2]
                 << " swap_beta_state=" << swap_state[3]
                 << " swap_conv_state=" << swap_state[4]
                 << " gap_gate=" << gap_gate << " gap_alpha=" << gap_alpha
                 << " gap_beta=" << gap_beta << " gap_conv=" << gap_conv
-                << '\n';
+                << " proj_qkv=" << proj_qkv << " harness_bad=" << harness_bad
+                << " carry_state=" << carry_state_gap
+                << " carry_gdn=" << carry_gdn_gap
+                << " carry_out=" << carry_out_gap
+                << " carry_conv=" << carry_conv_gap << '\n';
     }
     const fs::path script = fs::path(GUFO_ORNITH15_SOURCE_DIR) /
                             "tools/ornith15/representation.py";
@@ -1304,10 +1386,12 @@ int main() {
              "gpu_rr_out\tgpu_gg_out\tgpu_rg_out\tgpu_gr_out\t"
              "scalar_rr_state\tscalar_gg_state\tscalar_rg_state\tscalar_gr_state\t"
              "scalar_rr_out\tscalar_gg_out\tscalar_rg_out\tscalar_gr_out\t"
-             "swap_qkv_state\tswap_gate_state\tswap_alpha_state\t"
+             "swap_scalar_qkv_state\tswap_gate_state\tswap_alpha_state\t"
              "swap_beta_state\tswap_conv_state\t"
-             "swap_qkv_out\tswap_gate_out\tswap_alpha_out\tswap_beta_out\t"
-             "swap_conv_out\tgap_gate\tgap_alpha\tgap_beta\tgap_conv\n";
+             "swap_scalar_qkv_out\tswap_gate_out\tswap_alpha_out\t"
+             "swap_beta_out\tswap_conv_out\tgap_gate\tgap_alpha\tgap_beta\t"
+             "gap_conv\tproj_qkv\tharness_bad\tcarry_state\tcarry_gdn\t"
+             "carry_out\tcarry_conv\n";
     for (const auto& note : notes) {
       const auto q8 = q8_rows.count(note.token) ? q8_rows[note.token]
                                                 : std::array<int, 3>{-1, -1, -1};
@@ -1332,7 +1416,10 @@ int main() {
       for (double value : note.swap_out)
         table << '\t' << value;
       table << '\t' << note.gap_gate << '\t' << note.gap_alpha << '\t'
-            << note.gap_beta << '\t' << note.gap_conv << '\n';
+            << note.gap_beta << '\t' << note.gap_conv << '\t' << note.proj_qkv
+            << '\t' << note.harness_bad << '\t' << note.carry_state << '\t'
+            << note.carry_gdn << '\t' << note.carry_out << '\t'
+            << note.carry_conv << '\n';
     }
     std::ofstream manifest(dump_dir / "fixture-manifest.json");
     manifest << "{\n  \"dtype\": \"float32\",\n  \"endian\": \"little\",\n"
@@ -1349,8 +1436,13 @@ int main() {
                 "convolution history; state is the recurrent matrix; "
                 "rr/gg/rg/gr under gpu and scalar; out is ssm_out; gdn is the "
                 "gated normalized recurrent output\",\n"
-             << "  \"operand_swap\": \"one scalar operand on the GPU "
-                "trajectory: qkv, gate, alpha, beta, conv history\"\n}\n";
+             << "  \"operand_swap\": \"one-step replacements on the GPU "
+                "trajectory; swap_scalar_qkv is the F64 matvec of the scalar "
+                "RMSNorm and is not the carried projection substitute\",\n"
+             << "  \"qkv_substitution\": \"F64 matvec of ssm_qkv on the GPU "
+                "RMSNorm output; gate, alpha, beta, GatedDeltaNet and ssm_out "
+                "stay on the production launch; conv history and recurrent "
+                "state are carried from this chain\"\n}\n";
     Require(std::system(("cd " + dump_dir.string() +
                          " && find . -type f \\( -name '*.f32' -o -name '*.bin' "
                          "\\) -print0 | sort -z | xargs -0 sha256sum > "
@@ -1369,6 +1461,19 @@ int main() {
               << " gg_mismatch_tokens=" << stats.gg_mismatch_tokens
               << " scalar_rr_mismatch_tokens="
               << stats.scalar_rr_mismatch_tokens
+              << " harness_mismatch_tokens=" << stats.harness_mismatch_tokens
+              << " max_proj_qkv=" << proj_qkv_max
+              << " max_carry_state=" << carry_state_max
+              << " carry_state_token=" << carry_state_token
+              << " max_carry_gdn=" << carry_gdn_max
+              << " max_carry_out=" << carry_out_max
+              << " carry_out_token=" << carry_out_token
+              << " max_carry_conv=" << carry_conv_max
+              << " local_response_justifies_downstream="
+              << (stats.harness_mismatch_tokens == 0 &&
+                          (carry_state_max > 0.0 || carry_out_max > 0.0)
+                      ? 1
+                      : 0)
               << " max_scalar_norm=" << scalar_norm_max
               << " max_scalar_qkv=" << scalar_qkv_max
               << " max_scalar_state=" << scalar_state_max
