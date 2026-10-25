@@ -16,6 +16,25 @@
 
 namespace gufo::models::ornith15::rocm {
 
+/// Optional layer-0 diagnostic. A null probe does not change a launch.
+/// `edit_qkv`, when set, may overwrite layer-0 QKV after the production
+/// projection and before `GatedDeltaNet`. Callers other than the downstream
+/// measurement leave the probe null. This is not a precision policy.
+struct Layer0Probe {
+  void (*edit_qkv)(void* ctx, float* qkv, const float* norm,
+                   std::uint32_t channels, std::uint32_t hidden,
+                   hipStream_t stream) = nullptr;
+  void* edit_ctx{nullptr};
+  float* norm_out{nullptr};
+  float* qkv_before{nullptr};
+  float* qkv_out{nullptr};
+  float* conv_out{nullptr};
+  float* state_out{nullptr};
+  std::int32_t* route_ids{nullptr};
+  float* route_weights{nullptr};
+  float* shared_gate{nullptr};
+};
+
 /// One eager single-token AR session. The DeviceModel must outlive it.
 /// Each session owns its stream, scratch, KV and recurrent/conv state.
 /// No graphs, batching, speculative decode or chunked prefill.
@@ -29,7 +48,8 @@ public:
                                          std::string* error = nullptr);
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits,
                           std::string* error = nullptr,
-                          LayerTrace* trace = nullptr);
+                          LayerTrace* trace = nullptr,
+                          Layer0Probe* probe = nullptr);
   [[nodiscard]] bool Reset(std::string* error = nullptr);
   std::uint32_t Position() const noexcept { return position_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
@@ -39,9 +59,10 @@ private:
   void Dense(const DeviceTensor& w, const float* x, float* out);
   void Quantized(const DeviceTensor& w, const float* x, const std::int32_t* ids,
                  float* out, std::uint32_t rows, std::uint32_t used);
-  void LinearAttention(const DeviceLayer& l, std::size_t layer);
+  void LinearAttention(const DeviceLayer& l, std::size_t layer,
+                       Layer0Probe* probe);
   void Attention(const DeviceLayer& l, std::size_t layer);
-  void Moe(const DeviceLayer& l);
+  void Moe(const DeviceLayer& l, std::size_t layer, Layer0Probe* probe);
   void* Allocate(std::size_t bytes);
   float* Floats(std::size_t count);
 

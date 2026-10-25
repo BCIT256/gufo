@@ -46,4 +46,8 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)
+  add_ornith15_test(qkv_downstream "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu gufo_ornith15_reference)
+  set_tests_properties(ornith15.qkv_downstream PROPERTIES
+    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 endif()

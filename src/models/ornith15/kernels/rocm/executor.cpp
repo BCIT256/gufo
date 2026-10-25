@@ -161,12 +161,34 @@ void Session::Quantized(const DeviceTensor& w, const float* x,
     throw std::runtime_error("quantized projection failed");
 }
 
-void Session::LinearAttention(const DeviceLayer& l, std::size_t layer) {
+void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
+                               Layer0Probe* probe) {
   const auto& c = model_->config();
   Dense(l.ssm_qkv, xn_, qkv_);
   Dense(l.ssm_gate, xn_, z_);
   Dense(l.ssm_alpha, xn_, ab_);
   Dense(l.ssm_beta, xn_, ab_ + c.ssm_num_v_heads);
+  const bool layer0 = probe && layer == 0;
+  if (layer0 && (probe->norm_out || probe->qkv_before || probe->qkv_out ||
+                 probe->edit_qkv)) {
+    if (probe->norm_out)
+      Check(hipMemcpyAsync(probe->norm_out, xn_, c.hidden_size * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_),
+            "layer0 norm");
+    if (probe->qkv_before)
+      Check(hipMemcpyAsync(probe->qkv_before, qkv_,
+                           c.SsmConvChannels() * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_),
+            "layer0 qkv before");
+    if (probe->edit_qkv)
+      probe->edit_qkv(probe->edit_ctx, qkv_, xn_, c.SsmConvChannels(),
+                      c.hidden_size, stream_);
+    if (probe->qkv_out)
+      Check(hipMemcpyAsync(probe->qkv_out, qkv_,
+                           c.SsmConvChannels() * sizeof(float),
+                           hipMemcpyDeviceToHost, stream_),
+            "layer0 qkv out");
+  }
   auto& state = state_[layer];
   fn::GatedDeltaNet(
       qkv_, c.SsmConvChannels(), z_, c.SsmValueDim(), ab_, l.ssm_conv1d.f32(),
@@ -175,6 +197,18 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer) {
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
       false, false, c.rms_eps, stream_, nullptr, {}, 0, nullptr,
       fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
+  if (layer0 && probe->conv_out)
+    Check(hipMemcpyAsync(probe->conv_out, state.conv,
+                         (c.ssm_conv_kernel - 1) * c.SsmConvChannels() *
+                             sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "layer0 conv");
+  if (layer0 && probe->state_out)
+    Check(hipMemcpyAsync(probe->state_out, state.recurrent,
+                         std::size_t(c.ssm_num_v_heads) * c.ssm_head_dim *
+                             c.ssm_head_dim * sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "layer0 state");
   Dense(l.ssm_out, gdn_out_, block_out_);
 }
 
@@ -207,11 +241,21 @@ void Session::Attention(const DeviceLayer& l, std::size_t layer) {
                  l.attn_out.rows, l.attn_out.cols, stream_);
 }
 
-void Session::Moe(const DeviceLayer& l) {
+void Session::Moe(const DeviceLayer& l, std::size_t layer, Layer0Probe* probe) {
   const auto& c = model_->config();
   Dense(l.router, xn_, router_);
   fn::RouterTopK(router_, c.num_experts, ids_, route_weights_, 1, c.num_experts,
                  c.num_experts_used, stream_);
+  if (probe && probe->route_ids && probe->route_weights) {
+    const auto k = c.num_experts_used;
+    Check(hipMemcpyAsync(probe->route_ids + layer * k, ids_,
+                         k * sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                         stream_),
+          "route ids");
+    Check(hipMemcpyAsync(probe->route_weights + layer * k, route_weights_,
+                         k * sizeof(float), hipMemcpyDeviceToHost, stream_),
+          "route weights");
+  }
   // Dispatch each tensor's format independently; no model-wide expert type.
   Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, 1, c.num_experts_used);
   Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, 1, c.num_experts_used);
@@ -224,12 +268,16 @@ void Session::Moe(const DeviceLayer& l) {
   fn::Swiglu(shared_gate_, shared_up_, c.shared_expert_ff, stream_);
   Dense(l.shexp_down, shared_gate_, shared_out_);
   Dense(l.shexp_gate_inp, xn_, shared_inp_);
+  if (probe && probe->shared_gate)
+    Check(hipMemcpyAsync(probe->shared_gate + layer, shared_inp_, sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "shared gate");
   fn::MoeEpilogue(expert_down_, route_weights_, shared_out_, shared_inp_, 1,
                   block_out_, 1, c.num_experts_used, c.hidden_size, stream_);
 }
 
 bool Session::Step(std::int32_t token, std::span<float> logits,
-                   std::string* error, LayerTrace* trace) {
+                   std::string* error, LayerTrace* trace, Layer0Probe* probe) {
   const auto& c = model_->config();
   // Reject invalid calls before any session state or caller output changes.
   if (failed_ || token < 0 ||
@@ -262,13 +310,13 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
       fn::RmsNormRows(res_, l.attn_norm.f32(), xn_, 1, c.hidden_size, 1,
                       c.rms_eps, stream_);
       if (l.linear)
-        LinearAttention(l, i);
+        LinearAttention(l, i, probe);
       else
         Attention(l, i);
       fn::MtpAddEmbedding(block_out_, res_, 1, c.hidden_size, 1, stream_);
       fn::RmsNormRows(res_, l.post_attention_norm.f32(), xn_, 1, c.hidden_size,
                       1, c.rms_eps, stream_);
-      Moe(l);
+      Moe(l, i, probe);
       fn::MtpAddEmbedding(block_out_, res_, 1, c.hidden_size, 1, stream_);
       if (trace)
         Check(hipMemcpyAsync((*trace)[i].data(), res_,
