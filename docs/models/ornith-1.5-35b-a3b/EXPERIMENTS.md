@@ -1097,3 +1097,46 @@ set against the scalar trajectory follows the different incoming norm.
 Different routes are not evidence of a router-kernel defect. The
 earliest boundary in this prefix remains the token-0 layer-0 residual.
 No new operation is selected for an intervention. Production stays B.
+
+### Layer-6 expert rows and the corrected boundary margin
+
+The previous probability margin read `order[k]` after `partial_sort` of
+only the top eight. That entry is an unsorted tail value, not the ninth
+place, and it was reported as a logit margin. The host regression
+`ornith15.route_margin` places the true ninth in the tail and checks
+that a logit margin is not reported as a probability margin. Recomputed
+from `layer6_router_gpu.f32`, the eighth expert is 218 and the ninth is
+130. The probability margin is 1.568360316e-5. The logit margin is
+0.001614570618. There are no ties. The F64 logits give the same two
+experts and the same logit margin. Expert 130 is the scalar trajectory's
+eighth slot, so the GPU's own logits rank it immediately after 218.
+
+The expert rows were recomputed from the frozen GPU norm and the GPU
+order 202, 120, 108, 37, 165, 33, 106, 218. Layer 6 gate, up and down
+are Q5_K. The shared experts are Q8_0 and the shared gate input is F32.
+Slot `s` reads expert `ids[s]`: the isolated down rows match the
+captured production rows byte for byte. K is 2048 for gate and up and
+512 for down, both already multiples of the 512-wide activation pad, so
+no padding blocks are added.
+
+The Q8_1 encoding of the gate/up input matches the host `roundf` encoder
+on all 64 blocks, including the auxiliary half. The post-SwiGLU down
+input matches codes and scales on all 128 blocks and differs in one
+auxiliary half. Q5_K MMVQ does not read that stored auxiliary. It
+recomputes the code sum with `dp4a`. SwiGLU differs from libm SiLU by
+at most 5.960464478e-8, which is the `__expf` expression already used
+by the kernel.
+
+Two source readings of the Q5_K partial were scored: separate rounding,
+and contraction of `sumf += d8 * (dot * scale)` together with
+`fma(d, sumf_d, -(dmin * sumf_m))`. Rows matching neither reading:
+gate 2468 of 4096, up 2612 of 4096, down 9177 of 16384. The absolute
+gap from each GPU value to the closer reading is at most 1.341104507e-7
+for up, 1.192092896e-7 for gate and 7.450580597e-9 for down. The
+matching reading's gap from F64 dequant-times-input is 0.008681691252
+for up, 0.008051991463 for gate and 0.0004061022773 for down. The bit
+gap is not that representation cost. It is not grounds for a production
+edit. A causal test, before any kernel change, would compare one
+unmatched row's device partial with these two host readings. The shared
+Q8_0 experts were not scored. This audit still does not explain the
+different norm that reaches layer 6.
