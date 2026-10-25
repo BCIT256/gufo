@@ -995,3 +995,50 @@ prefix to gain no confident-KL failure or corroborated clear flip.
 Prefix means are diagnostic. A passing position 75 does not prove an
 operator defect and does not qualify a policy. The production decode
 binary and the numeric thresholds stay as they are.
+
+### Downstream result (same registration)
+
+The run is `artifacts/p4e/wp5-qkv-downstream/run.log`, with per-position
+rows in `prefix-metrics.tsv`. The process exits 0. The reinsertion
+control matches production byte for byte on logits, layer-0 convolution
+history, layer-0 recurrent state, routing ids, routing weights, the
+shared-expert gate and every trunk residual, at all 76 positions.
+The retained decode binary is still
+`a5358cb088996ee0b69dec483edcedd21789c062535a8bb76e9cb2c5fb7d332d`.
+
+Production reproduces the registered position-75 failure. Reference
+entropy is 0.2809280138 and the top-two margin is 3.277677536. Reference,
+production, llama batch and llama sequential all select token 10.
+KL(reference‖production) is 0.1220301624 and KL(llama batch‖production)
+is 0.0208078550. The confident-KL disposition is a failure. It is not a
+corroborated clear flip.
+
+The F64 arm uses the GPU RMSNorm row. At token 0 its QKV differs from
+production by 0.0176659822, the layer-0 state by 0.0025720298 and the
+convolution history by 0.0176659822. The first routing difference is
+token 0 layer 0: the expert ids match and the weights differ by
+0.0001512766. The first residual difference is the same step at layer 0,
+0.0003351569, and logits differ from token 0. Expert ids differ on every
+token at some later layer. At position 75 the layer-0 state gap is
+0.0620384216 and the largest trunk residual gap is 0.2907419205.
+
+At position 75 the F64 arm keeps token 10 for reference, GPU, llama
+batch and llama sequential. KL(reference‖GPU) is 0.0307924361 and
+KL(llama batch‖GPU) is 0.0094384502. The confident-KL disposition at
+that position passes. Relative to this run's production arm and to
+0.1220301624, the target KL improves. The prefix does not. Position 54
+is a new confident failure: reference entropy 0.0654518071, margin
+6.198556423, KL(reference‖GPU) 4.750642920 against a production value of
+0.0001699049. Reference and llama batch select token 11; the sequential
+capture and the F64 arm select token 96256, so the registered clear-flip
+rule does not fire. Forty-three positions have a larger reference KL and
+thirty-three have a smaller one. The diagnostic prefix means rise from
+0.0844455726 to 0.1407702477 for KL(reference‖GPU) and from
+0.0929808296 to 0.2005518476 for KL(llama batch‖GPU).
+
+The layer-0 QKV representation therefore reaches routing, residuals and
+logits, including the position-75 KL. That is causal influence. It does
+not correct the failure: the new position-54 confident violation remains,
+and a passing position 75 does not prove an operator defect or qualify
+a new policy. Production stays B. The two tool-history flips and the
+confirmation histories were not run.
