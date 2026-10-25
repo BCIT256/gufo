@@ -928,3 +928,35 @@ policy B. The auxiliary-field failure still fails the process. The three
 registered logit failures stay unresolved until that later test is run.
 Q8 codes and scales still match; tokens 63 and 66 still differ by one
 auxiliary ulp. The table and fixtures are under `artifacts/p4e/wp2-layer0/`.
+
+### Carried GPU-norm qkv substitution (same prefix)
+
+The definition and prediction in the previous section were committed
+before this run. The log is
+`artifacts/p4e/wp2-layer0-replay-qkv-carry.log`. The process exits 5.
+Q8 codes and scales match. Tokens 63 and 66 still fail the auxiliary
+half. The one-summation count is again 40, first at token 4, and the
+pairwise count is 0. The harness mismatches on 0 of 76 tokens.
+Reinserting the production qkv and carrying that chain's history and
+state reproduces the production state, gated output, `ssm_out` and
+outgoing history.
+
+The F64 `ssm_qkv` on the GPU RMSNorm output differs from the production
+Q6 row at all 76 positions. Its maximum absolute difference is 0.103668
+at token 21. The broader scalar-norm column has the same maximum. The
+two printed per-token maxima differ by at most 3.8e-6, and they are
+equal on 55 tokens. At token 0 both are 0.017666.
+
+The carried chain differs from production at every position. The state
+gap is 0.002572 at token 0, reaches 0.108024 at token 6, and is 0.062038
+at token 75. The outgoing history gap reaches 0.103668. The gated-output
+gap reaches 0.001230 at token 0. The `ssm_out` gap is the production Q6
+kernel applied to the substituted gated output. It reaches 0.000828 at
+token 6 and is 0.000130 at token 75. These magnitudes are the
+measurement. The one-step table was not used to assign them.
+
+The frozen decision rule is met. The harness matches, and the carried
+state and `ssm_out` differ from production, so a later routing and logit
+test on an unchanged suffix is justified. That test has not been run.
+Production remains policy B. The code_diff/75 KL failure and the two
+tool flips remain unresolved.
