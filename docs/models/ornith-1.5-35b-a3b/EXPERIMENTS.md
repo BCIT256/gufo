@@ -903,16 +903,28 @@ one-step state movement is the convolution history on 64 tokens, beta on
 0.04801 (beta, token 59), 0.02629 (current qkv, token 4) and 0.02094
 (alpha, token 55).
 
-The selected diagnostic intervention is a continued layer-0 trajectory
-that substitutes only the scalar `ssm_qkv` output, carries the outgoing
-history and recurrent state forward, and leaves the gate, alpha, beta,
-`GatedDeltaNet` and `ssm_out` on the production implementation. The
-prediction is that the history-sized part of the state gap shrinks, a
-residual on the scale of the beta write remains, and the matched-operand
-`ssm_out` gap of about 0.0024 remains. That continued substitution has
-not been run. Every `ssm_qkv` row still matches a registered sequence, so
-the substitution measures declared representation cost. Production stays
-policy B. The code_diff/75 KL failure and the two tool flips remain
-unresolved. Q8 codes and scales still match; tokens 63 and 66 still
-differ by one auxiliary ulp. The table and fixtures are under
-`artifacts/p4e/wp2-layer0/`.
+The one-step state movements are not additive contributions. They
+support a carried test of qkv/history propagation. They do not establish
+that a continued substitution shrinks the state gap, and they do not
+establish that the `ssm_out` gap keeps the matched-operand magnitude of
+about 0.0024. That magnitude forecast is withdrawn.
+
+The frozen substitute is an F64 matvec of `ssm_qkv` on the exact GPU
+RMSNorm output of that token. Gate, alpha, beta, `GatedDeltaNet` and
+`ssm_out` stay on the production launch. The convolution history and the
+recurrent state carried forward are the outgoing values of this chain,
+starting from zero. The qkv taken from the scalar trajectory uses the
+scalar RMSNorm output as well as the F64 matvec. The one-step
+`swap_scalar_qkv` column is that broader substitution.
+
+The frozen prediction has no magnitude. It says that the harness, which
+reinserts the production qkv and carries its own history and state, is
+byte-identical to the production state, gated output, `ssm_out` and
+outgoing history at all 76 positions. The substituted trajectory is
+compared at all 76 positions and is not assigned a forecast. A local response that justifies
+a later routing and logit test is a matching harness together with a
+carried state or `ssm_out` that differs from production. Production stays
+policy B. The auxiliary-field failure still fails the process. The three
+registered logit failures stay unresolved until that later test is run.
+Q8 codes and scales still match; tokens 63 and 66 still differ by one
+auxiliary ulp. The table and fixtures are under `artifacts/p4e/wp2-layer0/`.
