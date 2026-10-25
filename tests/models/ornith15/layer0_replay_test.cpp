@@ -31,6 +31,10 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
+#ifndef GUFO_ORNITH15_SOURCE_DIR
+#define GUFO_ORNITH15_SOURCE_DIR "."
+#endif
+
 namespace fs = std::filesystem;
 namespace orn = gufo::models::ornith15;
 namespace fn = gufo::models::qwen38_flash_next::rocm;
@@ -790,6 +794,8 @@ int main() {
       long qkv_miss, gate_miss, alpha_miss, beta_miss, out_miss;
       double assoc, silu, prep, state, raw, epi, snorm, sqkv, sstate, sout;
       double gpu_state[4], gpu_out[4], scalar_state_gap[4], scalar_out_gap[4];
+      double swap_state[5], swap_out[5];
+      double gap_gate, gap_alpha, gap_beta, gap_conv;
       int scalar_rr_bad;
     };
     std::vector<Note> notes;
@@ -1133,6 +1139,38 @@ int main() {
           MaxAbs(scalar_gg.y, hs, row_nonfinite),
           MaxAbs(scalar_rg.y, hs, row_nonfinite),
           MaxAbs(scalar_gr.y, hs, row_nonfinite)};
+      // One GPU operand is replaced by the scalar value. The other projections,
+      // the convolution history and the incoming state stay on the GPU
+      // trajectory. Gate is included because it should not write the state.
+      const double gap_gate = MaxAbs(sz, hz, row_nonfinite);
+      const double gap_alpha = MaxAbs(salpha, galpha, row_nonfinite);
+      const double gap_beta = MaxAbs(sbeta, gbeta, row_nonfinite);
+      const double gap_conv = MaxAbs(conv_before, hist, row_nonfinite);
+      std::vector<float> ab_alpha = hab;
+      std::vector<float> ab_beta = hab;
+      Require(salpha.size() == static_cast<std::size_t>(v_heads) &&
+                  sbeta.size() == static_cast<std::size_t>(v_heads) &&
+                  ab_alpha.size() == static_cast<std::size_t>(v_heads) * 2,
+              "alpha beta width");
+      std::copy(salpha.begin(), salpha.end(), ab_alpha.begin());
+      std::copy(sbeta.begin(), sbeta.end(), ab_beta.begin() + v_heads);
+      const auto swap_qkv = rerun(sqkv, hz, hab, hist, sin);
+      const auto swap_gate = rerun(hq, sz, hab, hist, sin);
+      const auto swap_alpha = rerun(hq, hz, ab_alpha, hist, sin);
+      const auto swap_beta = rerun(hq, hz, ab_beta, hist, sin);
+      const auto swap_conv = rerun(hq, hz, hab, conv_before, sin);
+      const double swap_state[5] = {
+          MaxAbs(swap_qkv.state, sout, row_nonfinite),
+          MaxAbs(swap_gate.state, sout, row_nonfinite),
+          MaxAbs(swap_alpha.state, sout, row_nonfinite),
+          MaxAbs(swap_beta.state, sout, row_nonfinite),
+          MaxAbs(swap_conv.state, sout, row_nonfinite)};
+      const double swap_out[5] = {
+          MaxAbs(swap_qkv.y, hs, row_nonfinite),
+          MaxAbs(swap_gate.y, hs, row_nonfinite),
+          MaxAbs(swap_alpha.y, hs, row_nonfinite),
+          MaxAbs(swap_beta.y, hs, row_nonfinite),
+          MaxAbs(swap_conv.y, hs, row_nonfinite)};
       auto save = [&](const std::string& name, const std::vector<float>& data) {
         std::ofstream out(dump_dir / name, std::ios::binary);
         out.write(reinterpret_cast<const char*>(data.data()),
@@ -1199,6 +1237,12 @@ int main() {
       std::copy(gpu_out_gap, gpu_out_gap + 4, row.gpu_out);
       std::copy(scalar_state_gap, scalar_state_gap + 4, row.scalar_state_gap);
       std::copy(scalar_out_gap, scalar_out_gap + 4, row.scalar_out_gap);
+      std::copy(swap_state, swap_state + 5, row.swap_state);
+      std::copy(swap_out, swap_out + 5, row.swap_out);
+      row.gap_gate = gap_gate;
+      row.gap_alpha = gap_alpha;
+      row.gap_beta = gap_beta;
+      row.gap_conv = gap_conv;
       notes.push_back(row);
       std::cout << "token=" << t << " embed_bad=" << embed_bad
                 << " qkv_miss=" << row.qkv_miss << " out_miss=" << row.out_miss
@@ -1206,16 +1250,23 @@ int main() {
                 << " gpu_rg_state=" << gpu_state_gap[2]
                 << " gpu_rg_out=" << gpu_out_gap[2]
                 << " scalar_gg_state=" << scalar_state_gap[1]
-                << " scalar_gg_out=" << scalar_out_gap[1] << '\n';
+                << " scalar_gg_out=" << scalar_out_gap[1]
+                << " swap_qkv_state=" << swap_state[0]
+                << " swap_gate_state=" << swap_state[1]
+                << " swap_alpha_state=" << swap_state[2]
+                << " swap_beta_state=" << swap_state[3]
+                << " swap_conv_state=" << swap_state[4]
+                << " gap_gate=" << gap_gate << " gap_alpha=" << gap_alpha
+                << " gap_beta=" << gap_beta << " gap_conv=" << gap_conv
+                << '\n';
     }
-#ifndef GUFO_ORNITH15_SOURCE_DIR
-#define GUFO_ORNITH15_SOURCE_DIR "."
-#endif
     const fs::path script = fs::path(GUFO_ORNITH15_SOURCE_DIR) /
                             "tools/ornith15/representation.py";
     if (fs::is_regular_file(script)) {
+      const fs::path encode_stdout = dump_dir / "q8-encode-stdout.txt";
       const int encoded = std::system(
-          ("python3 " + script.string() + " encode-check " + dump_dir.string())
+          ("python3 '" + script.string() + "' encode-check '" +
+           dump_dir.string() + "' > '" + encode_stdout.string() + "'")
               .c_str());
       std::ifstream report(dump_dir / "q8-encode-check.json");
       const std::string text((std::istreambuf_iterator<char>(report)), {});
@@ -1252,7 +1303,11 @@ int main() {
              "gpu_rr_state\tgpu_gg_state\tgpu_rg_state\tgpu_gr_state\t"
              "gpu_rr_out\tgpu_gg_out\tgpu_rg_out\tgpu_gr_out\t"
              "scalar_rr_state\tscalar_gg_state\tscalar_rg_state\tscalar_gr_state\t"
-             "scalar_rr_out\tscalar_gg_out\tscalar_rg_out\tscalar_gr_out\n";
+             "scalar_rr_out\tscalar_gg_out\tscalar_rg_out\tscalar_gr_out\t"
+             "swap_qkv_state\tswap_gate_state\tswap_alpha_state\t"
+             "swap_beta_state\tswap_conv_state\t"
+             "swap_qkv_out\tswap_gate_out\tswap_alpha_out\tswap_beta_out\t"
+             "swap_conv_out\tgap_gate\tgap_alpha\tgap_beta\tgap_conv\n";
     for (const auto& note : notes) {
       const auto q8 = q8_rows.count(note.token) ? q8_rows[note.token]
                                                 : std::array<int, 3>{-1, -1, -1};
@@ -1272,7 +1327,12 @@ int main() {
         table << '\t' << value;
       for (double value : note.scalar_out_gap)
         table << '\t' << value;
-      table << '\n';
+      for (double value : note.swap_state)
+        table << '\t' << value;
+      for (double value : note.swap_out)
+        table << '\t' << value;
+      table << '\t' << note.gap_gate << '\t' << note.gap_alpha << '\t'
+            << note.gap_beta << '\t' << note.gap_conv << '\n';
     }
     std::ofstream manifest(dump_dir / "fixture-manifest.json");
     manifest << "{\n  \"dtype\": \"float32\",\n  \"endian\": \"little\",\n"
@@ -1288,7 +1348,9 @@ int main() {
              << "  \"crossed_matrix\": \"input is qkv, gate, alpha, beta and "
                 "convolution history; state is the recurrent matrix; "
                 "rr/gg/rg/gr under gpu and scalar; out is ssm_out; gdn is the "
-                "gated normalized recurrent output\"\n}\n";
+                "gated normalized recurrent output\",\n"
+             << "  \"operand_swap\": \"one scalar operand on the GPU "
+                "trajectory: qkv, gate, alpha, beta, conv history\"\n}\n";
     Require(std::system(("cd " + dump_dir.string() +
                          " && find . -type f \\( -name '*.f32' -o -name '*.bin' "
                          "\\) -print0 | sort -z | xargs -0 sha256sum > "
