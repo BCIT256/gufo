@@ -321,5 +321,68 @@ class LayoutAndDotTest(unittest.TestCase):
             rep.relative_rms([math.nan], [0.0])
 
 
+class ProtocolScoreTest(unittest.TestCase):
+    def test_compiled_match_is_not_a_protocol_pass(self):
+        protocol = {"name": "q", "matched": ["D_mul"], "bound_ok": True,
+                    "unexplained": False}
+        compiled = {"name": "q", "matched": ["D_compiled"], "bound_ok": True,
+                    "unexplained": False}
+        self.assertEqual(rep.row_class(protocol), "protocol")
+        self.assertEqual(rep.row_class(compiled), "supplemental")
+        self.assertFalse(rep.row_class(
+            {"name": "q", "matched": [], "bound_ok": True, "unexplained": True})
+            == "protocol")
+
+    def test_compiled_q8_formula_is_hand_evaluated(self):
+        # One Q8_0 block, constant codes. Each of the four active lanes dots
+        # eight 3*2 products. D_compiled is p = RN(d_w * dot), then
+        # acc = fma(p, d_a, 0), then the warp butterfly. This expected value
+        # is written out here; it is not taken from a GPU output.
+        weight = pack_q8_0([3] * 32, rep.rn16(1.5))
+        activation = rep.Q8Block(rep.rn16(0.5), 0, [2] * 32)
+        sequences = rep.q8_0_mmvq_sequences(weight, [activation], 32)
+        dot = 8 * 3 * 2
+        from fractions import Fraction
+        partial = rep.fma32(
+            rep.rn32(Fraction(rep.f16_to_f32(rep.rn16(1.5))) * dot),
+            rep.f16_to_f32(rep.rn16(0.5)), 0.0)
+        lanes = [0.0] * 32
+        for lane in range(4):
+            lanes[lane] = partial
+        for offset in (16, 8, 4, 2, 1):
+            lanes = [rep.rn32(Fraction(lanes[i]) + Fraction(lanes[i ^ offset]))
+                     for i in range(32)]
+        self.assertTrue(rep.same_f32(sequences["D_compiled"], lanes[0]))
+
+    def test_pairwise_sum_needs_both_allowances(self):
+        # Four binary32 terms. The one-summation gamma_3 bound does not cover
+        # the gap between two association orders. Twice that allowance does:
+        # each order is within gamma_3 of the exact sum.
+        from fractions import Fraction
+
+        def add(a, b):
+            return f32(a + b)
+
+        gamma3 = float((3 * Fraction(1, 2**24)) / (1 - 3 * Fraction(1, 2**24)))
+        # A fixed seed is searched only to find some witness that the
+        # one-summation allowance is not a pairwise bound. The allowance used
+        # below is 2 * gamma_3, from the triangle inequality, not from the
+        # size of the witness.
+        rng = random.Random(1)
+        witness = None
+        for _ in range(100000):
+            sample = tuple(f32(rng.uniform(-2, 2)) for _ in range(4))
+            left = add(add(add(sample[0], sample[1]), sample[2]), sample[3])
+            right = add(add(add(sample[3], sample[0]), sample[1]), sample[2])
+            total = sum(abs(v) for v in sample)
+            if total and abs(left - right) > gamma3 * total:
+                witness = (sample, abs(left - right), total)
+                break
+        self.assertIsNotNone(witness)
+        _, gap, absolute = witness
+        self.assertGreater(gap, gamma3 * absolute)
+        self.assertLessEqual(gap, 2 * gamma3 * absolute + 1e-15)
+
+
 if __name__ == "__main__":
     unittest.main()

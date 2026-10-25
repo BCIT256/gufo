@@ -114,9 +114,10 @@ GPU dot, or the host dequantizer. `M` is the consumed packed formula in
 real arithmetic, then rounded to binary32. `F` is the F64 dot of the
 original binary32 activations with dyadic weights, then rounded to
 binary32. `D_mul`, `D_fma_inner` and `D_fma_outer` are the left-associated
-binary32 sequences. Q8_0 also reports `D_compiled`, the
+sequences named by the P4e protocol. Q8_0 also reports `D_compiled`, the
 `fma(RN(d_w * dot), d_a, acc)` order written beside
-`mul_mat_vec_q8_ahead`. o-F32 declares `D_mul` and `D_fma` only.
+`mul_mat_vec_q8_ahead`. A compiled-only match is supplemental. It does not
+make `original_protocol_pass` true. o-F32 declares `D_mul` and `D_fma` only.
 
 `representation_gpu_test` launches `qfn_mmq_quantize_q8_1`,
 `qfn_mmq_moe_vec` and `DenseMatVecF32`, writes a dump, and does not score

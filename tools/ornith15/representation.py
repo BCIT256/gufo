@@ -701,16 +701,46 @@ def find_auxiliary_stage_witness():
     return None
 
 
+# Sequences named by the P4e protocol before any GPU scoring. D_compiled is a
+# later, source-derived reassociation. It can explain a row. It is not one of
+# these sequences, and a compiled-only match is not a protocol pass.
+PROTOCOL_SEQUENCES = {"D_mul", "D_fma_inner", "D_fma_outer", "D_fma", "encoder"}
+
+
+def row_class(row):
+    """protocol, supplemental, or unexplained.
+
+    supplemental means the row matches D_compiled and no protocol sequence.
+    """
+    matched = set(row.get("matched") or [])
+    if row.get("kind") == "q8_1":
+        return "unexplained" if row.get("unexplained") else "protocol"
+    if row.get("unexplained") or not row.get("bound_ok", True):
+        return "unexplained"
+    if matched & PROTOCOL_SEQUENCES:
+        return "protocol"
+    if "D_compiled" in matched:
+        return "supplemental"
+    return "unexplained"
+
+
 def score_dump(directory):
-    """Score a production-launcher dump. Missing files raise."""
+    """Score a production-launcher dump. Missing files raise.
+
+    original_protocol_pass is true only when every row matches a sequence
+    named in the registered protocol. supplemental_explained counts rows
+    that match only the later D_compiled association.
+    """
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text())
     rows = []
     for case in manifest["cases"]:
         rows.extend(_score_case(root, case))
+    classes = [row_class(row) for row in rows]
     return {"cases": rows,
-            "all_declared": all(not row["unexplained"] and row["bound_ok"]
-                                for row in rows)}
+            "original_protocol_pass": all(kind == "protocol" for kind in classes),
+            "supplemental_explained": sum(kind == "supplemental" for kind in classes),
+            "unexplained": sum(kind == "unexplained" for kind in classes)}
 
 
 def _read(root, name):
@@ -838,29 +868,71 @@ def _score_of32(root, case):
     return scored
 
 
+def encode_check(directory):
+    """Compare saved layer-0 norm rows with GPU Q8_1 bytes.
+
+    Codes, stored scale and auxiliary are counted separately. Exit status is
+    1 when any of the three disagree. A missing pair is an error, not a pass.
+    """
+    root = Path(directory)
+    tokens = []
+    for path in sorted(root.glob("t*_norm.f32")):
+        token = int(path.name[1:].split("_", 1)[0])
+        qpath = root / f"t{token}_q8.bin"
+        if not qpath.is_file():
+            raise ContractError("missing " + qpath.name)
+        values = list(struct.unpack("<" + "f" * (path.stat().st_size // 4),
+                                    path.read_bytes()))
+        expected = encode_q8_1_row(values)
+        got = parse_q8_1_bytes(qpath.read_bytes())
+        if len(got) < len(expected):
+            raise ContractError("short Q8 capture")
+        code_bad = scale_bad = aux_bad = 0
+        for left, right in zip(expected, got):
+            if left.codes != right.codes:
+                code_bad += 1
+            if left.scale_bits != right.scale_bits:
+                scale_bad += 1
+            if left.aux_bits != right.aux_bits:
+                aux_bad += 1
+        tokens.append({"token": token, "code_bad": code_bad,
+                       "scale_bad": scale_bad, "aux_bad": aux_bad})
+    if not tokens:
+        raise ContractError("no norm rows to check")
+    summary = {
+        "tokens": len(tokens),
+        "code_bad": sum(row["code_bad"] for row in tokens),
+        "scale_bad": sum(row["scale_bad"] for row in tokens),
+        "aux_bad": sum(row["aux_bad"] for row in tokens),
+        "rows": tokens,
+    }
+    (root / "q8-encode-check.json").write_text(json.dumps(summary, indent=2))
+    lines = ["token\tcode_bad\tscale_bad\taux_bad"]
+    for row in tokens:
+        lines.append(f"{row['token']}\t{row['code_bad']}\t{row['scale_bad']}\t{row['aux_bad']}")
+    (root / "q8-columns.tsv").write_text("\n".join(lines) + "\n")
+    print(json.dumps({key: summary[key] for key in
+                      ("tokens", "code_bad", "scale_bad", "aux_bad")},
+                     sort_keys=True))
+    return 0 if summary["code_bad"] == summary["scale_bad"] == summary["aux_bad"] == 0 else 1
+
+
 def main(argv):
     if len(argv) == 3 and argv[1] == "score":
         report = score_dump(argv[2])
-        protocol = {"D_mul", "D_fma_inner", "D_fma_outer", "D_fma", "encoder"}
-        compiled_only = 0
-        protocol_hits = 0
-        for row in report["cases"]:
-            matched = set(row.get("matched") or [])
-            if matched & protocol:
-                protocol_hits += 1
-            elif matched == {"D_compiled"}:
-                compiled_only += 1
-        print(json.dumps({"all_sequences_finite_and_bounded": report["all_declared"],
-                          "rows": len(report["cases"]),
-                          "protocol_sequence_matches": protocol_hits,
-                          "compiled_q8_only": compiled_only,
-                          "unexplained": sum(1 for row in report["cases"]
-                                             if row["unexplained"])},
-                         sort_keys=True))
+        print(json.dumps({
+            "rows": len(report["cases"]),
+            "original_protocol_pass": report["original_protocol_pass"],
+            "supplemental_explained": report["supplemental_explained"],
+            "unexplained": report["unexplained"],
+        }, sort_keys=True))
         Path(argv[2], "score.json").write_text(json.dumps(report, indent=2,
                                                           sort_keys=True))
-        return 0 if report["all_declared"] else 1
-    raise SystemExit("usage: representation.py score DUMP_DIR")
+        return 0 if report["original_protocol_pass"] else 1
+    if len(argv) == 3 and argv[1] == "encode-check":
+        return encode_check(argv[2])
+    raise SystemExit(
+        "usage: representation.py score DUMP_DIR | encode-check DUMP_DIR")
 
 
 if __name__ == "__main__":
