@@ -46,8 +46,20 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)
-  add_ornith15_test(qkv_downstream "gpu;hip;gfx1151;external-model"
+  add_ornith15_test(b_prefix "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
+  set_tests_properties(ornith15.b_prefix PROPERTIES
+    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+  add_ornith15_test(qkv_downstream "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu_probe gufo_ornith15_reference)
+  target_compile_definitions(ornith15_qkv_downstream_test PRIVATE
+    GUFO_ORNITH15_TEST_PROBE)
   set_tests_properties(ornith15.qkv_downstream PROPERTIES
+    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+  add_ornith15_test(route_audit "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu_probe gufo_ornith15_reference)
+  target_compile_definitions(ornith15_route_audit_test PRIVATE
+    GUFO_ORNITH15_TEST_PROBE)
+  set_tests_properties(ornith15.route_audit PROPERTIES
     TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 endif()

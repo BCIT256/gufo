@@ -207,7 +207,8 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
 }
 
 void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
-                         std::span<float> out) {
+                         std::span<float> out, std::int32_t* route_ids,
+                         float* route_weights) {
   std::vector<float> probs(c_.num_experts);
   cpu::MatVec(l.router, 0, x, probs);
   // Softmax over every expert, top-k of the probabilities, renormalized.
@@ -238,6 +239,10 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
     const std::uint32_t e = order[i];
     const float weight = probs[e] / sum;
+    if (route_ids)
+      route_ids[i] = static_cast<std::int32_t>(e);
+    if (route_weights)
+      route_weights[i] = weight;
     cpu::MatVec(l.ffn_gate_exps, e, x, gate);
     cpu::MatVec(l.ffn_up_exps, e, x, up);
     for (std::uint32_t j = 0; j < c_.expert_ff; ++j) {
@@ -267,7 +272,9 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
 }
 
 bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
-                          std::string* error_msg, LayerTrace* trace) {
+                          std::string* error_msg, LayerTrace* trace,
+                          std::int32_t* route_ids, float* route_weights,
+                          float* moe_in) {
   if (position_ >= max_context_) {
     if (error_msg != nullptr) {
       *error_msg = "reference context is full";
@@ -313,7 +320,14 @@ bool ReferenceModel::Step(std::int32_t token, std::span<float> logits,
     normed = res;
     cpu::RmsNorm(normed, static_cast<const float*>(l.post_attention_norm.data),
                  c_.rms_eps);
-    Moe(l, normed, block_out);
+    if (moe_in)
+      std::copy(normed.begin(), normed.end(),
+                moe_in + static_cast<std::size_t>(il) * hidden);
+    const auto used = c_.num_experts_used;
+    Moe(l, normed, block_out,
+        route_ids ? route_ids + static_cast<std::size_t>(il) * used : nullptr,
+        route_weights ? route_weights + static_cast<std::size_t>(il) * used
+                      : nullptr);
     for (std::uint32_t i = 0; i < hidden; ++i) {
       res[i] += block_out[i];
     }

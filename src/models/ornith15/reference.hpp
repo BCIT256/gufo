@@ -21,10 +21,15 @@ public:
   ReferenceModel(const ModelWeights& weights, std::uint32_t max_context);
 
   /// Runs one token at the next position; `logits` (vocab floats) receives
-  /// the output distribution when non-empty.
+  /// the output distribution when non-empty. `routes`, when set, receives
+  /// the ordered expert ids and the normalized weights this step applied.
+  /// `moe_in`, when set, receives each layer's post-attention RMSNorm input.
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits,
                           std::string* error_msg = nullptr,
-                          LayerTrace* trace = nullptr);
+                          LayerTrace* trace = nullptr,
+                          std::int32_t* route_ids = nullptr,
+                          float* route_weights = nullptr,
+                          float* moe_in = nullptr);
 
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   void Reset();
@@ -45,7 +50,7 @@ private:
                  std::span<const float> x, std::uint32_t pos,
                  std::span<float> out);
   void Moe(const LayerWeights& l, std::span<const float> x,
-           std::span<float> out);
+           std::span<float> out, std::int32_t* route_ids, float* route_weights);
 
   const ModelWeights& w_;
   const Config& c_;

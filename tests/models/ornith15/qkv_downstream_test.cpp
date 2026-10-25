@@ -259,12 +259,72 @@ const char* Direction(double value, double baseline) {
   return "unchanged";
 }
 
+int IdentityCheck(const char* model_path, const char* logits_dir,
+                  const char* dump_path) {
+  std::cout << "mode=identity unprobed_vs_instrumented_vs_reinsert\n";
+  std::string error;
+  const auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
+  Require(reader != nullptr, "open: " + error);
+  const auto weights =
+      orn::ModelWeights::Bind(*reader, orn::BindOptions{}, &error);
+  Require(weights.has_value() && !weights->mtp, "bind trunk: " + error);
+  const auto device = orn::rocm::DeviceModel::Upload(*weights, *reader, &error);
+  Require(device != nullptr, "upload: " + error);
+  const ModelShape shape = ShapeOf(device->config());
+  const auto batch = Load(fs::path(logits_dir) / "code_diff.ologits");
+  std::vector<std::int32_t> tokens(batch.tokens.begin(),
+                                   batch.tokens.begin() + kTokens);
+  std::ifstream in(dump_path, std::ios::binary);
+  std::vector<float> unprobed(std::size_t(kTokens) * shape.vocab);
+  in.read(reinterpret_cast<char*>(unprobed.data()),
+          static_cast<std::streamsize>(unprobed.size() * sizeof(float)));
+  Require(static_cast<bool>(in), "unprobed logits short");
+  std::vector<ArmRow> instrumented, reinsert;
+  RunArm(*device, shape, tokens, "instrumented_baseline", nullptr, nullptr,
+         instrumented);
+  RunArm(*device, shape, tokens, "reinsert", Reinsert, nullptr, reinsert);
+  int bad_instrumented = 0, bad_reinsert = 0;
+  for (int t = 0; t < kTokens; ++t) {
+    const float* base = unprobed.data() + std::size_t(t) * shape.vocab;
+    if (!SameBytes(base, instrumented[t].logits.data(),
+                   shape.vocab * sizeof(float)))
+      ++bad_instrumented;
+    if (!SameBytes(base, reinsert[t].logits.data(),
+                   shape.vocab * sizeof(float)))
+      ++bad_reinsert;
+  }
+  std::cout << "unprobed_vs_instrumented_mismatch_tokens=" << bad_instrumented
+            << " unprobed_vs_reinsert_mismatch_tokens=" << bad_reinsert
+            << std::endl;
+  if (bad_instrumented || bad_reinsert)
+    return 2;
+  std::cout << "identity_byte_identical=1\n";
+  return 0;
+}
+
 }  // namespace
 
 int main() {
   const char* model_path = std::getenv("GUFO_ORNITH15_APEX_MTP_MODEL");
   const char* logits_dir = std::getenv("GUFO_ORNITH15_LLAMA_LOGITS");
   const char* out_env = std::getenv("GUFO_ORNITH15_WP5_DIR");
+  const char* mode = std::getenv("GUFO_ORNITH15_QKV_MODE");
+  if (mode && std::string(mode) == "identity") {
+    const char* dump = std::getenv("GUFO_ORNITH15_UNPROBED_LOGITS");
+    if (!model_path || !logits_dir || !dump || !fs::is_regular_file(model_path) ||
+        !fs::is_directory(logits_dir) || !fs::is_regular_file(dump)) {
+      std::cout << "SKIP: identity mode needs the model, captures and "
+                   "GUFO_ORNITH15_UNPROBED_LOGITS\n";
+      return 77;
+    }
+    try {
+      std::cout << std::setprecision(17);
+      return IdentityCheck(model_path, logits_dir, dump);
+    } catch (const std::exception& ex) {
+      std::cerr << ex.what() << '\n';
+      return 1;
+    }
+  }
   if (!model_path || !logits_dir || !fs::is_regular_file(model_path) ||
       !fs::is_directory(logits_dir)) {
     std::cout << "SKIP: set GUFO_ORNITH15_APEX_MTP_MODEL and "

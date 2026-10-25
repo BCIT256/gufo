@@ -161,13 +161,18 @@ void Session::Quantized(const DeviceTensor& w, const float* x,
     throw std::runtime_error("quantized projection failed");
 }
 
-void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
-                               Layer0Probe* probe) {
+void Session::LinearAttention(const DeviceLayer& l, std::size_t layer
+#ifdef GUFO_ORNITH15_TEST_PROBE
+                               ,
+                               Layer0Probe* probe
+#endif
+) {
   const auto& c = model_->config();
   Dense(l.ssm_qkv, xn_, qkv_);
   Dense(l.ssm_gate, xn_, z_);
   Dense(l.ssm_alpha, xn_, ab_);
   Dense(l.ssm_beta, xn_, ab_ + c.ssm_num_v_heads);
+#ifdef GUFO_ORNITH15_TEST_PROBE
   const bool layer0 = probe && layer == 0;
   if (layer0 && (probe->norm_out || probe->qkv_before || probe->qkv_out ||
                  probe->edit_qkv)) {
@@ -189,6 +194,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
                            hipMemcpyDeviceToHost, stream_),
             "layer0 qkv out");
   }
+#endif
   auto& state = state_[layer];
   fn::GatedDeltaNet(
       qkv_, c.SsmConvChannels(), z_, c.SsmValueDim(), ab_, l.ssm_conv1d.f32(),
@@ -197,6 +203,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
       false, false, c.rms_eps, stream_, nullptr, {}, 0, nullptr,
       fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
+#ifdef GUFO_ORNITH15_TEST_PROBE
   if (layer0 && probe->conv_out)
     Check(hipMemcpyAsync(probe->conv_out, state.conv,
                          (c.ssm_conv_kernel - 1) * c.SsmConvChannels() *
@@ -209,6 +216,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
                              c.ssm_head_dim * sizeof(float),
                          hipMemcpyDeviceToHost, stream_),
           "layer0 state");
+#endif
   Dense(l.ssm_out, gdn_out_, block_out_);
 }
 
@@ -241,11 +249,32 @@ void Session::Attention(const DeviceLayer& l, std::size_t layer) {
                  l.attn_out.rows, l.attn_out.cols, stream_);
 }
 
-void Session::Moe(const DeviceLayer& l, std::size_t layer, Layer0Probe* probe) {
+void Session::Moe(const DeviceLayer& l
+#ifdef GUFO_ORNITH15_TEST_PROBE
+                  ,
+                  std::size_t layer, Layer0Probe* probe
+#endif
+) {
   const auto& c = model_->config();
+#ifdef GUFO_ORNITH15_TEST_PROBE
+  const bool detail = probe && static_cast<int>(layer) == probe->detail_layer;
+  if (detail && probe->detail_moe_in)
+    Check(hipMemcpyAsync(probe->detail_moe_in, xn_,
+                         c.hidden_size * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_),
+          "moe input");
+#endif
   Dense(l.router, xn_, router_);
+#ifdef GUFO_ORNITH15_TEST_PROBE
+  if (detail && probe->detail_router)
+    Check(hipMemcpyAsync(probe->detail_router, router_,
+                         c.num_experts * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_),
+          "router logits");
+#endif
   fn::RouterTopK(router_, c.num_experts, ids_, route_weights_, 1, c.num_experts,
                  c.num_experts_used, stream_);
+#ifdef GUFO_ORNITH15_TEST_PROBE
   if (probe && probe->route_ids && probe->route_weights) {
     const auto k = c.num_experts_used;
     Check(hipMemcpyAsync(probe->route_ids + layer * k, ids_,
@@ -256,6 +285,7 @@ void Session::Moe(const DeviceLayer& l, std::size_t layer, Layer0Probe* probe) {
                          k * sizeof(float), hipMemcpyDeviceToHost, stream_),
           "route weights");
   }
+#endif
   // Dispatch each tensor's format independently; no model-wide expert type.
   Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, 1, c.num_experts_used);
   Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, 1, c.num_experts_used);
@@ -268,16 +298,41 @@ void Session::Moe(const DeviceLayer& l, std::size_t layer, Layer0Probe* probe) {
   fn::Swiglu(shared_gate_, shared_up_, c.shared_expert_ff, stream_);
   Dense(l.shexp_down, shared_gate_, shared_out_);
   Dense(l.shexp_gate_inp, xn_, shared_inp_);
+#ifdef GUFO_ORNITH15_TEST_PROBE
   if (probe && probe->shared_gate)
     Check(hipMemcpyAsync(probe->shared_gate + layer, shared_inp_, sizeof(float),
                          hipMemcpyDeviceToHost, stream_),
           "shared gate");
+  if (detail && probe->detail_expert_down)
+    Check(hipMemcpyAsync(probe->detail_expert_down, expert_down_,
+                         std::size_t(c.num_experts_used) * c.hidden_size *
+                             sizeof(float),
+                         hipMemcpyDeviceToHost, stream_),
+          "expert down");
+  if (detail && probe->detail_shared)
+    Check(hipMemcpyAsync(probe->detail_shared, shared_out_,
+                         c.hidden_size * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_),
+          "shared expert");
+#endif
   fn::MoeEpilogue(expert_down_, route_weights_, shared_out_, shared_inp_, 1,
                   block_out_, 1, c.num_experts_used, c.hidden_size, stream_);
+#ifdef GUFO_ORNITH15_TEST_PROBE
+  if (detail && probe->detail_moe_out)
+    Check(hipMemcpyAsync(probe->detail_moe_out, block_out_,
+                         c.hidden_size * sizeof(float), hipMemcpyDeviceToHost,
+                         stream_),
+          "moe out");
+#endif
 }
 
 bool Session::Step(std::int32_t token, std::span<float> logits,
-                   std::string* error, LayerTrace* trace, Layer0Probe* probe) {
+                   std::string* error, LayerTrace* trace
+#ifdef GUFO_ORNITH15_TEST_PROBE
+                   ,
+                   Layer0Probe* probe
+#endif
+) {
   const auto& c = model_->config();
   // Reject invalid calls before any session state or caller output changes.
   if (failed_ || token < 0 ||
@@ -310,13 +365,23 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
       fn::RmsNormRows(res_, l.attn_norm.f32(), xn_, 1, c.hidden_size, 1,
                       c.rms_eps, stream_);
       if (l.linear)
-        LinearAttention(l, i, probe);
+        LinearAttention(l, i
+#ifdef GUFO_ORNITH15_TEST_PROBE
+                        ,
+                        probe
+#endif
+        );
       else
         Attention(l, i);
       fn::MtpAddEmbedding(block_out_, res_, 1, c.hidden_size, 1, stream_);
       fn::RmsNormRows(res_, l.post_attention_norm.f32(), xn_, 1, c.hidden_size,
                       1, c.rms_eps, stream_);
-      Moe(l, i, probe);
+      Moe(l
+#ifdef GUFO_ORNITH15_TEST_PROBE
+          ,
+          i, probe
+#endif
+      );
       fn::MtpAddEmbedding(block_out_, res_, 1, c.hidden_size, 1, stream_);
       if (trace)
         Check(hipMemcpyAsync((*trace)[i].data(), res_,
