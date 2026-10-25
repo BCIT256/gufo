@@ -1042,3 +1042,58 @@ not correct the failure: the new position-54 confident violation remains,
 and a passing position 75 does not prove an operator defect or qualify
 a new policy. Production stays B. The two tool-history flips and the
 confirmation histories were not run.
+
+The F64-QKV arm is rejected as a correction. The probe that performed it
+is no longer part of the production session. `gufo_ornith15_gpu` is built
+without `GUFO_ORNITH15_TEST_PROBE`. The retained decode binary is still
+`a5358cb088996ee0b69dec483edcedd21789c062535a8bb76e9cb2c5fb7d332d`.
+The new unprobed prefix binary is
+`40a854d89042f515968dbf328cc8c445edea6b7e33237e06db37f09d52b2e044`.
+The rebuilt probe binary is
+`5fbbd2846a29b9d04f2930d1fba8f681262b2e58cc63a653b9aaa4d48bfb3f55`;
+the earlier downstream binary was not hashed before this rebuild.
+On code_diff tokens 0–75, ordinary unprobed B, the instrumented baseline
+and the production-QKV reinsertion are byte-identical in the full
+vocabulary. The log is `artifacts/p4e/wp5-qkv-downstream/identity.log`.
+The earlier F64 measurement and its log remain in that directory.
+
+### Tool position 96 routing audit
+
+Unchanged B replays `tool_two_parameters` tokens 0–96 with each model
+carrying its own state. At position 96 the reference margin is
+1.077628136. Reference, llama batch and llama sequential select token 13.
+The GPU selects token 17. Both native captures agree with the reference,
+so the registered clear flip is reproduced. The log is
+`artifacts/p4e/wp4-tool96-route/run.log`.
+
+At that position the first expert-set mismatch is layer 6, which matches
+the earlier stage record. The GPU slots are 202, 120, 108, 37, 165, 33,
+106, 218 and the scalar slots are the same through 106, then 130. An
+order-only mismatch, same set and different order, occurs earlier at
+layer 3. Across the prefix the first expert-set mismatch is token 0
+layer 36, and the first residual mismatch is token 0 layer 0.
+
+Layer 6 was rerun on its captured GPU post-attention norm. That input
+differs from the scalar norm by at most 0.0517013669. The repeated GPU
+router and top-8 are byte-identical to the captured values. The host
+warp-FMA formula for the F32 router matches the GPU logits byte for byte,
+so G−M is zero. M−F and G−F are at most one binary32 ulp,
+9.536743164e-7. The mathematical top-8 of those GPU logits, breaking
+ties toward the lower index, is the GPU order. There are no ties. The
+8th-to-9th probability margin is 0.0091469986. The same rule on the F64
+logits selects the same eight ids. GPU normalized weights differ from
+that double-softmax renormalization by at most 1.490116119e-8.
+
+The eight expert rows are consumed in selection order. On those frozen
+rows, the shared output and the captured pre-sigmoid gate, a host FMA
+reduction using libm sigmoid differs from the GPU epilogue by at most
+3.725290298e-9. The F64 reduction differs by at most 1.862645149e-9.
+The device sigmoid is `__expf`, so this is not a bit-identical formula
+check. It is not a separate reduction defect.
+
+The layer-6 router, its ordering rule and its weighted reduction satisfy
+the declared arithmetic on the frozen GPU input. The different expert
+set against the scalar trajectory follows the different incoming norm.
+Different routes are not evidence of a router-kernel defect. The
+earliest boundary in this prefix remains the token-0 layer-0 residual.
+No new operation is selected for an intervention. Production stays B.
