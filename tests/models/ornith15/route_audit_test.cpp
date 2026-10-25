@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "src/models/ornith15/cpu_ops.hpp"
+#include "tests/models/ornith15/route_margin.hpp"
 #include "src/models/ornith15/kernels/rocm/executor.hpp"
 #include "src/models/ornith15/reference.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -125,10 +126,11 @@ struct Pick {
   std::vector<std::int32_t> ids;
   std::vector<float> weights;
   int ties{0};
-  double margin{0};
+  double probability_margin{0};
+  double logit_margin{0};
 };
 
-Pick Select(const std::vector<double>& probs, int k) {
+Pick Select(const std::vector<double>& probs, const float* logits, int k) {
   const int n = static_cast<int>(probs.size());
   std::vector<int> order(n);
   std::iota(order.begin(), order.end(), 0);
@@ -155,7 +157,9 @@ Pick Select(const std::vector<double>& probs, int k) {
       if (probs[e] == probs[order[i]])
         ++pick.ties;
   }
-  pick.margin = probs[order[k - 1]] - probs[order[k]];
+  const RankBoundary boundary = RankTop(probs, logits, k);
+  pick.probability_margin = boundary.probability_margin;
+  pick.logit_margin = boundary.logit_margin;
   sum = std::max(sum, static_cast<double>(kFloor));
   for (int i = 0; i < k; ++i)
     pick.weights[i] = static_cast<float>(probs[order[i]] / sum);
@@ -434,8 +438,8 @@ int main() {
 
     const auto g_probs = Softmax(router.data(), experts, true);
     const auto f_probs = Softmax(f64.data(), experts, true);
-    const Pick g_pick = Select(g_probs, used);
-    const Pick f_pick = Select(f_probs, used);
+    const Pick g_pick = Select(g_probs, router.data(), used);
+    const Pick f_pick = Select(f_probs, f64.data(), used);
     std::cout << "gpu_logits_mathematical_top8";
     for (int id : g_pick.ids)
       std::cout << " " << id;
@@ -448,8 +452,10 @@ int main() {
               << " selection_matches_f64_logits="
               << (std::memcmp(f_pick.ids.data(), gpu_ids.data() + off96,
                               used * sizeof(std::int32_t)) == 0)
-              << " gpu_logit_boundary_margin=" << g_pick.margin
-              << " f64_logit_boundary_margin=" << f_pick.margin
+              << " gpu_probability_margin=" << g_pick.probability_margin
+              << " gpu_logit_margin=" << g_pick.logit_margin
+              << " f64_probability_margin=" << f_pick.probability_margin
+              << " f64_logit_margin=" << f_pick.logit_margin
               << " tie_count_gpu_logits=" << g_pick.ties
               << " tie_count_f64_logits=" << f_pick.ties
               << " weight_max_abs_vs_gpu_softmax="

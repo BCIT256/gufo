@@ -13,6 +13,7 @@ function(add_ornith15_test name labels)
 endfunction()
 
 add_ornith15_test(config "cpu")
+add_ornith15_test(route_margin "cpu")
 add_ornith15_test(weights "cpu")
 add_ornith15_test(artifact "cpu;external-model")
 add_ornith15_test(chat_template "cpu")
@@ -46,6 +47,10 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)
+  add_ornith15_test(expert_row_audit "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu gufo_ornith15_reference)
+  set_tests_properties(ornith15.expert_row_audit PROPERTIES
+    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
   add_ornith15_test(b_prefix "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.b_prefix PROPERTIES
