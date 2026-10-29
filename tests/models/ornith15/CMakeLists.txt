@@ -36,4 +36,7 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_snapshot "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu)
   set_tests_properties(ornith15.gpu_snapshot PROPERTIES TIMEOUT 3600)
+  add_ornith15_test(gpu_grid "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu)
+  set_tests_properties(ornith15.gpu_grid PROPERTIES TIMEOUT 3600)
 endif()

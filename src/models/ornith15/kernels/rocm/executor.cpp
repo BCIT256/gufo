@@ -660,6 +660,13 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
   }
 }
 
+bool Session::SetCanonicalGrid(std::uint32_t grid) {
+  if (position_ != 0 || grid > kMaxPrefillChunk)
+    return false;
+  canonical_grid_ = grid;
+  return true;
+}
+
 bool Session::Prefill(std::span<const std::int32_t> tokens,
                       std::span<float> last_logits, std::string* error,
                       std::uint32_t chunk_tokens, std::span<float> all_logits) {
@@ -670,7 +677,8 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
       !tokens.empty() && chunk_tokens > 0 && chunk_tokens <= kMaxPrefillChunk &&
       last_logits.size() == c.vocab_size &&
       (!want_all || all_logits.size() == std::size_t(n) * c.vocab_size) &&
-      static_cast<std::uint64_t>(position_) + n <= max_context_;
+      static_cast<std::uint64_t>(position_) + n <= max_context_ &&
+      (canonical_grid_ == 0 || position_ % canonical_grid_ == 0);
   if (tokens_ok) {
     for (std::int32_t token : tokens) {
       if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
@@ -682,14 +690,19 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
   if (failed_ || !tokens_ok) {
     if (error != nullptr)
       *error =
-          "invalid prefill (failed session, token, context, chunk or logits "
-          "size)";
+          "invalid prefill (failed session, token, context, chunk, grid or "
+          "logits size)";
     return false;
   }
   try {
     std::uint32_t done = 0;
     while (done < n) {
-      const std::uint32_t count = std::min(chunk_tokens, n - done);
+      std::uint32_t count = std::min(chunk_tokens, n - done);
+      if (canonical_grid_ != 0) {
+        const std::uint32_t room =
+            canonical_grid_ - (position_ % canonical_grid_);
+        count = std::min(count, room);
+      }
       const bool last = done + count == n;
       Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),
                            hipMemcpyHostToDevice, stream_),
@@ -724,12 +737,16 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
                              stream_),
               "prefill last logits");
       }
-      Check(hipGetLastError(), "prefill launch");
-      Check(hipStreamSynchronize(stream_), "prefill");
-      if (want_all && last) {
-        const float* row =
-            all_logits.data() + std::size_t(n - 1) * c.vocab_size;
-        std::copy(row, row + c.vocab_size, last_logits.begin());
+      // Grid cells of one call stay ordered on the compute stream. Syncing
+      // each cell would add a host round trip per cell on a long prefill.
+      if (canonical_grid_ == 0 || last) {
+        Check(hipGetLastError(), "prefill launch");
+        Check(hipStreamSynchronize(stream_), "prefill");
+        if (want_all && last) {
+          const float* row =
+              all_logits.data() + std::size_t(n - 1) * c.vocab_size;
+          std::copy(row, row + c.vocab_size, last_logits.begin());
+        }
       }
       position_ += count;
       done += count;

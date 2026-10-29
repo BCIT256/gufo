@@ -8,6 +8,12 @@ re-prefills. Capture queues a private device image at the boundary and copies
 it to the host after that boundary, so a cached turn does not wait for the
 host copy before its first token. A later restore of that image skips KV
 rows that are already the live prefix; a disk payload uploads every region.
+Server prefill uses a canonical 16-token grid: every cell starts at an
+absolute multiple of 16, and a checkpoint is stored only at a grid boundary
+that prefill produced. Decode steps and a partial final cell are not reused;
+the next turn re-prefills them, so a cached prompt runs the same cells as a
+cold prefill. `Session::SetCanonicalGrid` enables that schedule. The direct
+session API leaves it off, so an explicit chunk size is unchanged.
 The host payload is the disk cache when `--cache-disk` is set. There is no
 in-pass checkpoint; prefill yields at snapshot boundaries.
 Vision, YaRN and MTP execution are absent. `--speculative`,

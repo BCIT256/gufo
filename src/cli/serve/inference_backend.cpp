@@ -2897,6 +2897,9 @@ private:
 };
 
 constexpr std::string_view kOrnith15StateAbi = "ornith15-rocm-session-v1";
+/// Prefill cells start at absolute multiples of this width. Checkpoints are
+/// stored only on those boundaries; decode steps are re-prefilled next turn.
+constexpr std::uint32_t kOrnithPrefillGrid = 16;
 
 std::vector<std::uint8_t> OrnithCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::uint32_t max_context) {
@@ -2919,6 +2922,7 @@ std::vector<std::uint8_t> OrnithCompatibilityIdentity(
            << "payload_version="
            << models::ornith15::rocm::Session::kSnapshotPayloadVersion << '\n'
            << "numerics=policy-b-q8_1-f32-attention-oproj\n"
+           << "prefill_grid=" << kOrnithPrefillGrid << '\n'
            << "context_tokens=" << max_context << '\n'
            << "position_policy=absolute-v1\n"
            << "mtp=none\n"
@@ -2960,6 +2964,7 @@ public:
 
   void Invalidate() noexcept override {
     staged_.reset();
+    canonical_.reset();
     have_logits_ = false;
     position_ = 0;
     std::string error;
@@ -2985,16 +2990,35 @@ public:
   void set_staged(
       std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged) const {
     staged_ = std::move(staged);
+    RememberCanonical(staged_);
   }
   [[nodiscard]] std::shared_ptr<models::ornith15::rocm::StagedSnapshot>
   take_staged() const {
     return std::exchange(staged_, nullptr);
+  }
+  void RememberCanonical(
+      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> image) const {
+    if (!image || image->position == 0)
+      return;
+    const auto grid = session_->CanonicalGrid();
+    if (grid <= 1 || image->position % grid == 0)
+      canonical_ = std::move(image);
+  }
+  [[nodiscard]] std::shared_ptr<models::ornith15::rocm::StagedSnapshot>
+  canonical() const {
+    return canonical_;
+  }
+  void ClearCanonical() const {
+    staged_.reset();
+    canonical_.reset();
   }
 
 private:
   std::unique_ptr<models::ornith15::rocm::Session> session_;
   std::vector<float> logits_;
   mutable std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged_;
+  /// Last grid image still reachable after the in-flight staged_ is exported.
+  mutable std::shared_ptr<models::ornith15::rocm::StagedSnapshot> canonical_;
   std::uint32_t position_{0};
   bool have_logits_{false};
   bool reset_failed_{false};
@@ -3020,6 +3044,7 @@ const Ornith15TextRunnerState& RequireOrnithState(
 [[noreturn]] void FailOrnithSession(Ornith15TextRunnerState& state,
                                     const std::string& message) {
   std::string reset_error;
+  state.ClearCanonical();
   state.set_have_logits(false);
   state.set_position(0);
   state.set_reset_failed(!state.session().Reset(&reset_error));
@@ -3111,6 +3136,7 @@ public:
                 .staged_snapshot = true,
                 .partial_prefill_retention = true,
                 .prefill_rollback = false,
+                .prefill_grid = kOrnithPrefillGrid,
             },
         .persistence = persistence_,
     };
@@ -3225,7 +3251,7 @@ public:
     std::string error;
     auto session =
         models::ornith15::rocm::Session::Create(*model_, max_context_, &error);
-    if (!session) {
+    if (!session || !session->SetCanonicalGrid(kOrnithPrefillGrid)) {
       throw std::runtime_error("Ornith session creation failed: " + error);
     }
     return std::make_unique<Ornith15TextRunnerState>(
@@ -3241,6 +3267,7 @@ public:
     }
     if (offset == 0 && ornith.position() != 0) {
       std::string error;
+      ornith.ClearCanonical();
       ornith.set_have_logits(false);
       ornith.set_position(0);
       if (!ornith.session().Reset(&error)) {
@@ -3256,9 +3283,24 @@ public:
       throw std::logic_error("Ornith prefill has no remaining input");
     }
     const std::size_t remaining = prompt.size() - offset;
-    const std::size_t consumed = std::min<std::size_t>(
+    std::size_t consumed = std::min<std::size_t>(
         {max_input_tokens, remaining,
          models::ornith15::rocm::Session::kMaxPrefillChunk});
+    // Stop on a cell boundary unless this call finishes the prompt. A later
+    // call then starts where a cold prefill's cell starts.
+    const auto grid = ornith.session().CanonicalGrid();
+    if (grid > 1) {
+      if (offset % grid != 0) {
+        throw std::logic_error("Ornith prefill is off the canonical grid");
+      }
+      if (consumed < remaining) {
+        consumed -= consumed % grid;
+        if (consumed == 0) {
+          throw std::logic_error(
+              "Ornith prefill budget is below the canonical grid");
+        }
+      }
+    }
     const auto ids = OrnithEngineTokens(prompt.subspan(offset, consumed),
                                         tokenizer_->GetVocabSize());
     std::string error;
@@ -3412,6 +3454,14 @@ public:
     restored.set_position(ornith_snapshot->position);
     restored.set_have_logits(ornith_snapshot->position > 0);
     restored.set_reset_failed(false);
+    restored.ClearCanonical();
+    if (ornith_snapshot->staged) {
+      restored.RememberCanonical(ornith_snapshot->staged);
+    } else {
+      std::string stage_error;
+      restored.RememberCanonical(
+          restored.session().StageSnapshot(&stage_error));
+    }
   }
 
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
@@ -3473,6 +3523,37 @@ public:
     restored.set_position(position);
     restored.set_have_logits(true);
     restored.set_reset_failed(false);
+    restored.ClearCanonical();
+    std::string stage_error;
+    restored.RememberCanonical(restored.session().StageSnapshot(&stage_error));
+  }
+
+  [[nodiscard]] bool RewindToCanonicalPrefix(
+      TextRunnerState& state) const override {
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed())
+      return false;
+    const auto image = ornith.canonical();
+    const auto grid = ornith.session().CanonicalGrid();
+    if (!image || image->position == 0 ||
+        (grid > 1 && image->position % grid != 0)) {
+      ornith.Invalidate();
+      return false;
+    }
+    if (ornith.position() == image->position &&
+        ornith.session().Position() == image->position)
+      return true;
+    std::string error;
+    if (!ornith.session().RestoreStagedSnapshot(*image, ornith.logits(),
+                                                &error) ||
+        ornith.session().Position() != image->position) {
+      ornith.Invalidate();
+      return false;
+    }
+    ornith.set_position(image->position);
+    ornith.set_have_logits(true);
+    ornith.set_reset_failed(false);
+    return true;
   }
 
 private:

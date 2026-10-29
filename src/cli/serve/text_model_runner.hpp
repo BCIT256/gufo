@@ -133,6 +133,10 @@ struct TextRunnerCapabilities {
   /// Interrupted prefill rolls back to its entry frontier without consuming
   /// input, so cancellation need not wait for the whole pass.
   bool prefill_rollback{false};
+  /// Absolute prefill cell size. Zero keeps the caller's chunk sizes.
+  /// Snapshot targets and the published live frontier are rounded down to a
+  /// multiple of this width, so a cached suffix repeats a cold prefill's cells.
+  std::size_t prefill_grid{0};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -465,6 +469,12 @@ public:
   /// Retain a safe executed frontier when cancellation interrupts publication
   /// of a completed speculative block. Called with cancellation checks cleared.
   virtual void PrepareCancellation(TextRunnerState&) const {}
+  /// Restores the last prefill-produced grid frontier, dropping decode steps
+  /// and a partial final cell. False means `state` was invalidated and must
+  /// not be published. Runners without a prefill grid leave state unchanged.
+  [[nodiscard]] virtual bool RewindToCanonicalPrefix(TextRunnerState&) const {
+    return true;
+  }
   enum class DeviceProbeStatus { kUsable, kPending, kLost };
   /// Submit or poll one private device probe without waiting. Called only by
   /// the scheduler between work units. Pending work is reused, never queued

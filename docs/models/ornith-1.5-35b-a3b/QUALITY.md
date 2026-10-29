@@ -189,16 +189,43 @@ held-out both passed that case: exported bytes matched, same-session
 restore skipped KV, foreign restore copied KV, and every continuation
 logit was bit-identical (max abs error 0). Payload sizes were unchanged.
 
-The server reuses that payload. A temperature-0 tool turn whose cached
-frontier was built by prefill plus decode steps can pick a different first
-token than a cold prefill of the same prompt. On the 507-token turn below,
-the two leaders were `I` (id 40) and `<tool_call>` (id 248058). One 512-token
-prefill scored them 20.8312 and 20.4856 (gap 0.3456). The same prefill split
-at token 500, which is the server's stable-prefix cut, scored 20.8926 and
-20.7317 (gap 0.1609) and still chose `I`. Splitting that cold prefill at the
-cached position 477 chose `<tool_call>` by 0.2029. Prefill, 39 teacher-forced
-steps, then the suffix chose `<tool_call>` by 1.2751. Chunks of 64 stayed
-with the single 512-token prefill. Thresholds are unchanged.
+The server reuses that payload only at a canonical 16-token prefill grid.
+`Session::SetCanonicalGrid(16)` makes every cell start at an absolute
+multiple of 16. The direct session API leaves the grid off, so
+`ornith15.gpu_decode` still scores chunks of 16, 48, 64 and 512.
+Checkpoints are stored only at a grid boundary that prefill produced.
+Decode steps and a short final cell are not reused; the next turn
+re-prefills them. A cached suffix therefore runs the same cells as a cold
+prefill of the same prompt.
+
+`ornith15.gpu_grid` checks that schedule on each capture, repeated to 128
+tokens, and on a 128-token prefix of a rendered tool-agent chat. A cold
+prefill is compared with a RAM rewind after four teacher-forced steps, a
+restore into a session that already prefilled other tokens, and a host
+payload round trip. Oracle (4 histories) and held-out (7 histories) were
+bit-identical at every compared logit (max abs error 0). The distribution
+gate is unchanged: oracle `^(ornith15|qwen38_flash_next)\.` was 31/31,
+including `gpu_decode`, `gpu_snapshot` and `gpu_grid`. Held-out
+`gpu_decode` and `gpu_snapshot` passed. Thresholds were not changed.
+
+The same prompt served greedy (temperature 0, seed 41) from RAM, from disk
+after a restart, and with `cache_prompt` false produced the same content,
+tool name, arguments, finish reason and completion-token count on all 7
+turns of the tool-agent replay. The cache suite's `legacy-tool-cancel`,
+`legacy-tool-cancel-disk`, `thinking-tool-cancel`,
+`thinking-tool-cancel-disk`, `disk-spacing` and `disk-spacing-disk` passed.
+`text-cancel` failed: after a discarded assistant the next prompt refilled
+26 tokens (cached 160 of 186). That 160-token hit is the stable message
+prefix, already a multiple of 16. The unstable region is the thinking-off
+generation prompt plus the new user turn, which is longer than the suite's
+16-token budget. The older chunk-split gap is recorded here so the failed
+case stays visible. On a 507-token turn the two leaders were `I` (id 40)
+and `<tool_call>` (id 248058). One 512-token prefill scored them 20.8312
+and 20.4856 (gap 0.3456). The same prefill split at token 500 scored
+20.8926 and 20.7317 (gap 0.1609) and still chose `I`. Splitting at the
+cached position 477 chose `<tool_call>` by 0.2029. Prefill, 39
+teacher-forced steps, then the suffix chose `<tool_call>` by 1.2751.
+Chunks of 64 stayed with the single 512-token prefill.
 
 The width-48 routed prefill tile was scored with those same ratios.
 Oracle `ctest` of `^(ornith15|qwen38_flash_next)\.` was 30/30, including

@@ -859,11 +859,30 @@ struct TextRunnerPool::Request::Impl {
     // immutable fallback and freeze the complete prompt before decoding.
     if (lease.component() && prefill_offset > count)
       count = prompt.size();
+    // A partial cell is not a reusable frontier. Decode steps are not either;
+    // only a grid boundary this prefill produces may be stored.
+    const auto grid = PrefillGrid();
+    if (grid > 1) {
+      count = AlignDown(count, grid);
+      stable_prefix_position = AlignDown(stable_prefix_position, grid);
+      for (auto& boundary : boundaries)
+        boundary = AlignDown(boundary, grid);
+      std::erase_if(boundaries, [&](std::size_t boundary) {
+        return boundary == 0 || boundary <= prefill_offset ||
+               boundary >= prompt.size();
+      });
+      std::ranges::sort(boundaries);
+      boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                       boundaries.end());
+    }
     snapshot_tokens.reserve(prompt.size());
     snapshot_tokens.assign(prompt.begin(), prompt.begin() + count);
     // A live continuation can already be beyond the desired snapshot point.
     // Keep its existing immutable checkpoint; never snapshot mismatched state.
-    prompt_snapshot_attempted = prefill_offset > count;
+    // Position 0 is not a checkpoint: a prompt shorter than one cell is
+    // re-prefilled from the start next turn.
+    prompt_snapshot_attempted =
+        prefill_offset > count || (grid > 1 && count == 0);
     auto& state = dynamic_cast<TextRunnerState&>(lease.state());
     if (lease.cache_hit()) {
       runner->PreparePrefixReuse(
@@ -888,7 +907,8 @@ struct TextRunnerPool::Request::Impl {
       const auto count =
           std::min(grid_points, TextRunnerPool::Impl::kIntermediateCheckpoints);
       for (std::size_t point = 1; point <= count; ++point) {
-        const auto position = grid_points * point / count * interval;
+        const auto position =
+            AlignDown(grid_points * point / count * interval, PrefillGrid());
         if (position > prefill_offset &&
             position - prefill_offset >= interval &&
             prompt.size() - position > tail &&
@@ -931,6 +951,20 @@ struct TextRunnerPool::Request::Impl {
     }
   }
 
+  [[nodiscard]] std::size_t PrefillGrid() const noexcept {
+    try {
+      return runner->Descriptor().capabilities.prefill_grid;
+    } catch (...) {
+      return 0;
+    }
+  }
+
+  static std::size_t AlignDown(std::size_t value, std::size_t grid) noexcept {
+    if (grid <= 1 || value == 0)
+      return value;
+    return value - (value % grid);
+  }
+
   void AdvancePromptTarget() noexcept {
     // Keep both the branching fallback and the complete prompt. The latter
     // is captured after first-token publication, as for ordinary requests.
@@ -951,14 +985,23 @@ struct TextRunnerPool::Request::Impl {
     // Take this turn's stable boundary next, before the complete prompt.
     // The boundary is a prefix of whatever the client sends next, while the
     // complete prompt ends in assistant framing the client may rewrite.
+    std::size_t next = prompt.size();
     if (stable_prefix_position > snapshot_tokens.size() &&
         stable_prefix_position < prompt.size()) {
-      snapshot_tokens.assign(prompt.begin(),
-                             prompt.begin() + stable_prefix_position);
+      next = stable_prefix_position;
       stable_prefix_position = 0;
-    } else {
-      snapshot_tokens = prompt;
     }
+    // The partial tail is not captured. A later turn re-prefills it on the
+    // same grid a cold prompt uses.
+    next = AlignDown(next, PrefillGrid());
+    if (next == 0 || next <= fallback_position) {
+      prompt_snapshot_attempted = true;
+      return;
+    }
+    if (next == prompt.size())
+      snapshot_tokens = prompt;
+    else
+      snapshot_tokens.assign(prompt.begin(), prompt.begin() + next);
     prompt_snapshot_attempted = false;
   }
 
@@ -1766,12 +1809,21 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   impl_->CapturePromptSnapshot();
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetCancellationCheck({});
-  if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
+  const auto capabilities = impl_->runner->Descriptor().capabilities;
+  if (!capabilities.prefix_reuse) {
     impl_->lease.Invalidate();
     impl_.reset();
     return {};
   }
-  const auto capabilities = impl_->runner->Descriptor().capabilities;
+  // Publish the prefill grid, not decode steps or a partial cell. The first
+  // token is already out; this restore is not on the TTFT path.
+  if (capabilities.prefill_grid > 1 &&
+      !impl_->runner->RewindToCanonicalPrefix(state)) {
+    CommitMetrics metrics = impl_->snapshot_metrics;
+    impl_->lease.Invalidate();
+    impl_.reset();
+    return metrics;
+  }
   std::vector<ContinuationToken> checkpoint = impl_->prompt;
   checkpoint.insert(checkpoint.end(), impl_->generated.begin(),
                     impl_->generated.end());
@@ -1832,6 +1884,12 @@ TextRunnerPool::Request::Cancel() noexcept {
           impl_->prefill_offset > impl_->lease.cached_tokens()))) {
       if (impl_->decode_ready)
         impl_->runner->PrepareCancellation(state);
+      if (capabilities.prefill_grid > 1 &&
+          !impl_->runner->RewindToCanonicalPrefix(state)) {
+        CommitMetrics metrics = impl_->snapshot_metrics;
+        Invalidate();
+        return metrics;
+      }
       checkpoint.assign(impl_->prompt.begin(),
                         impl_->prompt.begin() + impl_->prefill_offset);
       if (impl_->decode_ready)

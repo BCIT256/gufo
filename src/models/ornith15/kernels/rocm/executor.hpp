@@ -61,11 +61,23 @@ public:
   /// `all_logits` has one vocabulary row per token, every position is
   /// returned. Conv, recurrent and KV state carry across chunks. Invalid
   /// arguments return false and leave state unchanged.
+  ///
+  /// With a canonical grid, each cell starts at an absolute multiple of that
+  /// width and the call must already sit on a cell boundary. The last cell
+  /// of a call may be shorter. Cells of one call share a stream and sync
+  /// once at the end. A zero grid keeps the caller's chunk size and syncs
+  /// every chunk.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
                              std::span<float> last_logits,
                              std::string* error = nullptr,
                              std::uint32_t chunk_tokens = kMaxPrefillChunk,
                              std::span<float> all_logits = {});
+  /// Enables absolute prefill cells. `grid` 0 disables them. The session
+  /// must still be at position 0, and `grid` cannot exceed kMaxPrefillChunk.
+  [[nodiscard]] bool SetCanonicalGrid(std::uint32_t grid);
+  [[nodiscard]] std::uint32_t CanonicalGrid() const noexcept {
+    return canonical_grid_;
+  }
   [[nodiscard]] bool Reset(std::string* error = nullptr);
   std::uint32_t Position() const noexcept { return position_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
@@ -154,6 +166,7 @@ private:
   mutable hipStream_t copy_stream_{nullptr};
   hipGraphExec_t graph_exec_{nullptr};
   std::uint32_t max_context_{0}, position_{0};
+  std::uint32_t canonical_grid_{0};
   std::uint64_t lineage_{0};
   std::uint32_t kv_high_water_{0};
   bool last_restore_skipped_kv_{false};

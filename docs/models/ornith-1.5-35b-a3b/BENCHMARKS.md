@@ -283,3 +283,45 @@ Suffix prefills of 24–30 tokens took 191–233 ms. Lemonade's earlier
 `prompt_ms` on similar suffixes was 147–227 ms. This run does not put
 those suffix TTFTs under that range. Exact RAM hits are 2.4–3.6 ms.
 Disk restore of the 431-token prefix was 84.9 ms.
+
+## M4 canonical prefill grid
+
+2026-10-29, gfx1151, `result/bin/gufo` (nix package, 16-token grid).
+One session, context 16384, `--cache-disk`. Power at the start of this
+replay: `AC0/online=1`, `BAT0/status=Not charging`. Lemonade's
+llama-server (pid 3363206, state `Sl`, port 8003, MTP) was running and
+was not paused. Temperature 0, seed 41, thinking off, at most 192 new
+tokens, tools `read` and `edit`. The live cache-on conversation was
+recorded, the server restarted, then those message lists ran cache on,
+off, on, off. Every turn matched on content, tool name, arguments,
+finish reason and completion tokens.
+
+A repeated request (`on-b`) re-prefills only the partial cell, 0–12
+tokens here. A new turn also re-prefills tokens produced by decode since
+the previous grid boundary. That tail, not the 16-token cell, is most of
+`prefill_tokens`. `on-a-0` is the disk restore of the 416-token boundary.
+
+| Turn | Prompt | Cached | Prefill tokens | TTFT ms | Snapshot ms | Restore ms | Prefill ms | Cold TTFT ms | Repeat TTFT ms | Repeat prefill |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 438 | 416 | 22 | 342.9 | 33.5 | 93.6 | 206.8 | 2599.1 | 56.1 | 6 |
+| 1 | 507 | 432 | 75 | 478.4 | 3.6 | 0 | 454.1 | 2942.5 | 72.6 | 11 |
+| 2 | 620 | 496 | 124 | 768.6 | 5.3 | 0 | 728.9 | 3687.3 | 81.6 | 12 |
+| 3 | 689 | 608 | 81 | 595.1 | 10.8 | 0 | 523.1 | 4135.4 | 28.5 | 1 |
+| 4 | 759 | 688 | 71 | 498.2 | 5.5 | 0 | 457.4 | 4519.1 | 68.2 | 7 |
+| 5 | 860 | 752 | 108 | 742.0 | 5.7 | 0 | 704.0 | 5176.0 | 84.5 | 12 |
+| 6 | 928 | 848 | 80 | 549.8 | 11.1 | 0 | 512.1 | 5595.2 | 2.8 | 0 |
+
+`On` is the disk-restart pass. Cold TTFT is the first cache-off pass.
+Repeat is the second cache-on pass. Decode on these turns was 35.2–39.9
+tok/s. Disk restore of the 416-token prefix was 93.6 ms. RAM restore on
+the repeat pass was 1.5–2.5 ms.
+
+The same afternoon, one server at a time, the pre-grid `build/release/gufo`
+and this nix package alternated on two fixed prompts (`cache_prompt`
+false, 32 new tokens). These builds are not the same preset. The 4012-token
+gap is much larger than the earlier gpu-test versus release gap.
+
+| Prompt tokens | Order | Pre-grid pp tok/s | Grid-16 pp tok/s | Pre-grid tg tok/s | Grid-16 tg tok/s |
+| ---: | --- | --- | --- | --- | --- |
+| 69 | old, new, old, new | 276.5, 263.9 | 164.4, 166.0 | 48.8, 43.3 | 43.3, 41.5 |
+| 4012 | old, new, old, new | 842.2, 836.1 | 173.9, 169.8 | 38.2, 37.6 | 35.6, 36.8 |
