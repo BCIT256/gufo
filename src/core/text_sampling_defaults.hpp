@@ -8,7 +8,12 @@
 
 namespace gufo::sampling {
 
-enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
+enum class TextModelPreset {
+  kUnspecified,
+  kQwen38,
+  kDeepSeekV4Flash,
+  kOrnith15,
+};
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -31,6 +36,8 @@ struct SamplingOverrides {
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
+  if (config.architecture == "qwen35moe")
+    return TextModelPreset::kOrnith15;
   if (config.architecture == "qwen4exp" ||
       (config.num_layers == 64 && config.hidden_size == 5120 &&
        config.vocab_size == 248320))
@@ -56,6 +63,13 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
       result.top_p = 0.8F;
       result.presence_penalty = 1.5F;
     }
+  }
+  // Ornith's model card, independent of the thinking switch. Effort text is
+  // not part of this preset.
+  if (model == TextModelPreset::kOrnith15) {
+    result.temperature = 0.6F;
+    result.top_k = 20;
+    result.top_p = 0.95F;
   }
   if (supplied.temperature)
     result.temperature = configured.temperature;

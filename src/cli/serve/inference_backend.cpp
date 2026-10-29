@@ -43,10 +43,14 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/ornith15/chat_template.hpp"
+#include "src/models/ornith15/kernels/rocm/device_model.hpp"
+#include "src/models/ornith15/kernels/rocm/executor.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
@@ -2891,6 +2895,308 @@ private:
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
+
+constexpr std::string_view kOrnith15StateAbi = "ornith15-rocm-session-v1";
+
+tokenization::ChatTemplateOptions OrnithChatOptions(const ChatRequest& request,
+                                                    std::uint32_t max_context) {
+  auto options = models::ornith15::ResolveChatOptions(request.reasoning);
+  options.max_output_bytes =
+      tokenization::RenderedPromptBoundBytes(max_context);
+  return options;
+}
+
+std::vector<std::int32_t> OrnithEngineTokens(
+    std::span<const TextRunnerToken> tokens, std::size_t vocab) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max()) ||
+        token >= vocab) {
+      throw std::invalid_argument(
+          "Ornith token is outside the model vocabulary");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class Ornith15TextRunnerState final : public TextRunnerState {
+public:
+  Ornith15TextRunnerState(
+      std::unique_ptr<models::ornith15::rocm::Session> session,
+      std::size_t vocab)
+      : session_(std::move(session)), logits_(vocab) {}
+
+  void Invalidate() noexcept override {
+    have_logits_ = false;
+    position_ = 0;
+    std::string error;
+    reset_failed_ = !session_->Reset(&error);
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->resident_bytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] models::ornith15::rocm::Session& session() { return *session_; }
+  [[nodiscard]] std::span<float> logits() { return logits_; }
+  [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  void set_position(std::uint32_t position) noexcept { position_ = position; }
+  [[nodiscard]] bool have_logits() const noexcept { return have_logits_; }
+  void set_have_logits(bool value) noexcept { have_logits_ = value; }
+  [[nodiscard]] bool reset_failed() const noexcept { return reset_failed_; }
+  void set_reset_failed(bool value) noexcept { reset_failed_ = value; }
+
+private:
+  std::unique_ptr<models::ornith15::rocm::Session> session_;
+  std::vector<float> logits_;
+  std::uint32_t position_{0};
+  bool have_logits_{false};
+  bool reset_failed_{false};
+};
+
+Ornith15TextRunnerState& RequireOrnithState(TextRunnerState& state) {
+  auto* ornith = dynamic_cast<Ornith15TextRunnerState*>(&state);
+  if (ornith == nullptr) {
+    throw std::logic_error("text runner state is not Ornith-1.5");
+  }
+  return *ornith;
+}
+
+[[noreturn]] void FailOrnithSession(Ornith15TextRunnerState& state,
+                                    const std::string& message) {
+  std::string reset_error;
+  state.set_have_logits(false);
+  state.set_position(0);
+  state.set_reset_failed(!state.session().Reset(&reset_error));
+  throw std::runtime_error(message);
+}
+
+// One session per request. History is re-prefilled; nothing is snapshotted.
+class Ornith15TextRunner final : public HipTextModelRunner {
+public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+  Ornith15TextRunner(
+      std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
+      std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+      std::string model_id, std::uint32_t max_context)
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        model_id_(std::move(model_id)),
+        max_context_(max_context) {
+    std::string error;
+    auto probe =
+        models::ornith15::rocm::Session::Create(*model_, max_context_, &error);
+    if (!probe) {
+      throw std::runtime_error("Ornith session probe failed: " + error);
+    }
+    per_request_bytes_ = probe->resident_bytes();
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_id_,
+        .state_abi = std::string(kOrnith15StateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = true,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = false,
+                .batched_multi_token_decode = false,
+                .batched_multi_token_decode_max_width = 0,
+                .prefix_reuse = false,
+                .in_pass_checkpoint = false,
+                .partial_prefill_retention = false,
+                .prefill_rollback = false,
+            },
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    // A stale free-memory reading below one session would reject a load that
+    // CreateState can still satisfy, so leave capacity unset in that case.
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess &&
+        per_request_bytes_ > 0 && free_bytes >= per_request_bytes_) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->resident_bytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = per_request_bytes_,
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = std::nullopt,
+        .retained_snapshot_ceiling_bytes = std::nullopt,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        tokenizer_->GetVocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer_->DecodeTokenCopy(id), tokenizer_->IsStopToken(id)};
+        });
+  }
+  [[nodiscard]] std::uint32_t VocabularySize() const override {
+    return static_cast<std::uint32_t>(tokenizer_->GetVocabSize());
+  }
+  [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
+    return {"<think>", "\n</think>", {"</think>", "<tool_call>"}};
+  }
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    return tokenization::QwenChatTemplate::RenderAndTokenize(
+        *tokenizer_, request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        OrnithChatOptions(request, max_context_));
+  }
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return OrnithChatOptions(request, max_context_).enable_thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    std::string error;
+    auto session =
+        models::ornith15::rocm::Session::Create(*model_, max_context_, &error);
+    if (!session) {
+      throw std::runtime_error("Ornith session creation failed: " + error);
+    }
+    return std::make_unique<Ornith15TextRunnerState>(
+        std::move(session), tokenizer_->GetVocabSize());
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed()) {
+      throw std::runtime_error("Ornith session reset failed");
+    }
+    if (offset == 0 && ornith.position() != 0) {
+      std::string error;
+      ornith.set_have_logits(false);
+      ornith.set_position(0);
+      if (!ornith.session().Reset(&error)) {
+        ornith.set_reset_failed(true);
+        throw std::runtime_error("Ornith session reset failed: " + error);
+      }
+    }
+    if (offset != ornith.position()) {
+      throw std::logic_error(
+          "Ornith prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("Ornith prefill has no remaining input");
+    }
+    const std::size_t remaining = prompt.size() - offset;
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, remaining,
+         models::ornith15::rocm::Session::kMaxPrefillChunk});
+    const auto ids = OrnithEngineTokens(prompt.subspan(offset, consumed),
+                                        tokenizer_->GetVocabSize());
+    std::string error;
+    if (!ornith.session().Prefill(ids, ornith.logits(), &error)) {
+      FailOrnithSession(ornith, "Ornith prefill failed: " + error);
+    }
+    ornith.set_position(ornith.session().Position());
+    ornith.set_have_logits(true);
+    if (ornith.position() != offset + consumed) {
+      FailOrnithSession(ornith, "Ornith prefill position diverged");
+    }
+    return {.consumed_tokens = consumed,
+            .decode_ready = ornith.position() == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed()) {
+      throw std::runtime_error("Ornith session reset failed");
+    }
+    if (ornith.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    if (!ornith.have_logits() ||
+        ornith.logits().size() != model_->config().vocab_size) {
+      throw std::runtime_error("Ornith token selection has no logits");
+    }
+    const auto token = sampler.Sample(ornith.logits());
+    if (token >
+        static_cast<sampling::TokenId>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("Ornith sampled token exceeds engine range");
+    }
+    if (EndsTurn(ornith, *tokenizer_, static_cast<int>(token))) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {.stop = false,
+            .token = token,
+            .piece = tokenizer_->DecodeTokenCopy(token)};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Ornith token ID exceeds engine range");
+    }
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed()) {
+      throw std::runtime_error("Ornith session reset failed");
+    }
+    std::string error;
+    if (!ornith.session().Step(static_cast<std::int32_t>(token),
+                               ornith.logits(), &error)) {
+      FailOrnithSession(ornith, "Ornith decode failed: " + error);
+    }
+    ornith.set_position(ornith.session().Position());
+    ornith.set_have_logits(true);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    const auto* ornith = dynamic_cast<const Ornith15TextRunnerState*>(&state);
+    if (ornith == nullptr) {
+      throw std::logic_error("text runner state is not Ornith-1.5");
+    }
+    return ornith->position();
+  }
+
+private:
+  std::shared_ptr<const models::ornith15::rocm::DeviceModel> model_;
+  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
+  std::string model_id_;
+  std::uint32_t max_context_;
+  std::size_t per_request_bytes_{0};
+};
 #endif
 
 }  // namespace
@@ -3026,7 +3332,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
   if (enable_yarn && architecture != "qwen4exp") {
-    SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
+    SetError(error, architecture == "qwen35moe"
+                        ? "Ornith does not support --enable-yarn"
+                        : "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
@@ -3195,6 +3503,106 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
+  if (architecture == "qwen35moe") {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error, "Ornith does not support --speculative");
+      return false;
+    }
+    if (!vision_model_path.empty()) {
+      SetError(error, "Ornith does not support --mmproj");
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config)) {
+      SetError(error, "Ornith does not support a prefix disk cache");
+      return false;
+    }
+    if (ram_cache_config.capacity_bytes != 0) {
+      SetError(error, "Ornith does not support a prefix RAM cache");
+      return false;
+    }
+    if (session_count == 0) {
+      SetError(error, "HTTP session count must be at least one");
+      return false;
+    }
+    if (!models::ornith15::ValidateEmbeddedTemplate(*reader, &load_error)) {
+      SetError(error, "Unsupported Ornith chat template: " + load_error);
+      return false;
+    }
+    Logger::Info("loader", "event=load_phase phase=ornith_weights " +
+                               Logger::MemoryStatus());
+    auto weights =
+        models::ornith15::ModelWeights::Bind(*reader, {}, &load_error);
+    if (!weights) {
+      SetError(error, "Failed to bind Ornith weights: " + load_error);
+      return false;
+    }
+    if (max_context < 2 || max_context > weights->config.context_length) {
+      SetError(error,
+               "Ornith HTTP context must be between 2 and the model context");
+      return false;
+    }
+    auto uploaded = models::ornith15::rocm::DeviceModel::Upload(
+        *weights, *reader, &load_error);
+    if (!uploaded) {
+      SetError(error, "Failed to upload Ornith weights: " + load_error);
+      return false;
+    }
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &load_error);
+    if (!tokenizer) {
+      SetError(error, "Failed to load Ornith tokenizer: " + load_error);
+      return false;
+    }
+    constexpr std::uint32_t kImEnd = 248046;
+    constexpr std::uint32_t kEndOfText = 248044;
+    const auto im_end = tokenizer->FindSpecialToken(tokenization::kImEnd);
+    const auto end_of_text =
+        tokenizer->FindSpecialToken(tokenization::kEndOfText);
+    if (!im_end || *im_end != kImEnd || !end_of_text ||
+        *end_of_text != kEndOfText || !tokenizer->IsStopToken(kImEnd) ||
+        !tokenizer->IsStopToken(kEndOfText) ||
+        tokenizer->GetEosTokenId() != kImEnd ||
+        tokenizer->GetVocabSize() != weights->config.vocab_size) {
+      SetError(error,
+               "Ornith tokenizer stop tokens are not <|im_end|> (248046) and "
+               "<|endoftext|> (248044)");
+      return false;
+    }
+    weights.reset();
+    try {
+      std::string model_name(
+          reader->GetMetadataString("general.name").value_or(""));
+      if (model_name.empty())
+        model_name = "Ornith-1.5-35B-A3B";
+      auto device = std::shared_ptr<const models::ornith15::rocm::DeviceModel>(
+          std::move(uploaded));
+      auto new_state = std::make_shared<Impl::State>();
+      new_state->sampling_defaults.model = sampling::TextModelPreset::kOrnith15;
+      new_state->sampling_defaults.supplied = {};
+      new_state->supports_images = false;
+      auto runner = std::make_shared<Ornith15TextRunner>(
+          std::move(device),
+          std::shared_ptr<const tokenization::QwenTokenizer>(
+              std::move(tokenizer)),
+          std::move(model_name), max_context);
+      new_state->model_id = runner->Descriptor().model_id;
+      new_state->max_context = max_context;
+      Logger::Info("loader", "event=load_phase phase=ornith_sessions " +
+                                 Logger::MemoryStatus());
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(runner), session_count, std::nullopt, ram_cache_config);
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
+      {
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        impl_->state = std::move(new_state);
+      }
+      return true;
+    } catch (const std::exception& exception) {
+      SetError(error, exception.what());
+      return false;
+    }
+  }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
@@ -3237,6 +3645,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)vision_model_path;
   (void)ram_cache_config;
   (void)enable_yarn;
+  std::string load_error;
+  const auto reader = core::GgufReader::OpenFile(model_path, &load_error);
+  if (reader &&
+      reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    SetError(error, "Ornith-1.5 requires the ROCm backend");
+    return false;
+  }
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif

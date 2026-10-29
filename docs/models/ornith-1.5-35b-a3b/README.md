@@ -1,9 +1,11 @@
 # Ornith 1.5 35B-A3B: GPU AR checkpoint
 
-Experimental `qwen35moe` library support for autoregressive decode and
-chunked prefill on gfx1151. This checkpoint has no CLI/server integration,
-vision, YaRN or MTP execution. `Session::Prefill` runs a prompt in chunks of
-at most 512 tokens. `Session::Step` advances one token. A plain decode step
+`qwen35moe` autoregressive decode and chunked prefill on gfx1151.
+`gufo serve llm --model <gguf>` and `gufo chat --model <gguf>` load this
+architecture on ROCm. Each request prefills its full history; there is no
+prefix cache. Vision, YaRN and MTP execution are absent. `--speculative`,
+`--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
+in chunks of at most 512 tokens. `Session::Step` advances one token. A plain decode step
 may replay a HIP graph. Pass a vocabulary-sized buffer to receive logits, or
 an empty buffer plus a sampled id to take a device argmax without downloading
 logits. Invalid calls leave state untouched. A device execution failure

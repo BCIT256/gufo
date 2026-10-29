@@ -1,13 +1,17 @@
 #include "src/cli/prompt/prompt.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +25,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -28,6 +33,9 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/ornith15/chat_template.hpp"
+#include "src/models/ornith15/kernels/rocm/device_model.hpp"
+#include "src/models/ornith15/kernels/rocm/executor.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -299,6 +307,8 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
     preset = sampling::TextModelPreset::kDeepSeekV4Flash;
   } else if (artifact_architecture == "qwen4exp") {
     preset = sampling::TextModelPreset::kQwen38;
+  } else if (artifact_architecture == "qwen35moe") {
+    preset = sampling::TextModelPreset::kOrnith15;
   } else if (const auto config = reader.ExtractModelConfig()) {
     preset = sampling::TextPreset(*config);
   }
@@ -836,6 +846,242 @@ void GenerateQwenGpuResponse(
   }
 }
 
+struct OrnithCli {
+  std::unique_ptr<models::ornith15::rocm::DeviceModel> device;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer;
+  std::unique_ptr<models::ornith15::rocm::Session> session;
+};
+
+int RejectOrnithOptions(const PromptOptions& opt) {
+  if (opt.force_cpu) {
+    std::cerr << "Ornith-1.5 requires the ROCm backend\n";
+    return 1;
+  }
+  if (!opt.speculative_backend.empty()) {
+    std::cerr << "Ornith does not support --speculative\n";
+    return 1;
+  }
+  if (!opt.vision_model_path.empty()) {
+    std::cerr << "Ornith does not support --mmproj\n";
+    return 1;
+  }
+  if (!opt.image_paths.empty()) {
+    std::cerr << "Ornith does not support image input\n";
+    return 1;
+  }
+  return 0;
+}
+
+std::unique_ptr<OrnithCli> LoadOrnithCli(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  if (const int rejected = RejectOrnithOptions(opt)) {
+    PrintModelLoadTime(load_start, false);
+    (void)rejected;
+    return nullptr;
+  }
+  std::string error;
+  if (opt.use_chat_template &&
+      !models::ornith15::ValidateEmbeddedTemplate(reader, &error)) {
+    std::cerr << "Unsupported Ornith chat template: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  auto weights = models::ornith15::ModelWeights::Bind(reader, {}, &error);
+  if (!weights) {
+    std::cerr << "Failed to bind Ornith weights: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  auto loaded = std::make_unique<OrnithCli>();
+  loaded->device =
+      models::ornith15::rocm::DeviceModel::Upload(*weights, reader, &error);
+  if (!loaded->device) {
+    std::cerr << "Failed to upload Ornith weights: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  loaded->tokenizer =
+      tokenization::QwenTokenizer::CreateFromGguf(reader, &error);
+  if (!loaded->tokenizer) {
+    std::cerr << "Failed to load Ornith tokenizer: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  constexpr tokenization::TokenId kImEnd = 248046;
+  constexpr tokenization::TokenId kEndOfText = 248044;
+  const auto im_end = loaded->tokenizer->FindSpecialToken(tokenization::kImEnd);
+  const auto end_of_text =
+      loaded->tokenizer->FindSpecialToken(tokenization::kEndOfText);
+  if (!im_end || *im_end != kImEnd || !end_of_text ||
+      *end_of_text != kEndOfText || !loaded->tokenizer->IsStopToken(kImEnd) ||
+      !loaded->tokenizer->IsStopToken(kEndOfText) ||
+      loaded->tokenizer->GetVocabSize() !=
+          loaded->device->config().vocab_size) {
+    std::cerr << "Ornith tokenizer stop tokens are not <|im_end|> (248046) "
+                 "and <|endoftext|> (248044)\n";
+    PrintModelLoadTime(load_start, false);
+    return nullptr;
+  }
+  loaded->session = models::ornith15::rocm::Session::Create(
+      *loaded->device, kDefaultContext, &error);
+  PrintModelLoadTime(load_start, loaded->session != nullptr);
+  if (!loaded->session) {
+    std::cerr << "Ornith session failed: " << error << '\n';
+    return nullptr;
+  }
+  return loaded;
+}
+
+int GenerateOrnithResponse(const PromptOptions& opt, OrnithCli& loaded,
+                           std::span<const tokenization::TokenId> prompt,
+                           std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= kDefaultContext ||
+      opt.max_tokens > kDefaultContext - prompt.size()) {
+    std::cerr << "Ornith prompt and output exceed the 4096-token CLI context\n";
+    return 1;
+  }
+  std::string error;
+  if (!loaded.session->Reset(&error)) {
+    std::cerr << "Ornith reset failed: " << error << '\n';
+    return 1;
+  }
+  std::vector<std::int32_t> ids;
+  ids.reserve(prompt.size());
+  for (const auto token : prompt) {
+    if (token > static_cast<tokenization::TokenId>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      std::cerr << "Ornith token ID exceeds engine range\n";
+      return 1;
+    }
+    ids.push_back(static_cast<std::int32_t>(token));
+  }
+  std::vector<float> logits(loaded.device->config().vocab_size);
+  if (!loaded.session->Prefill(ids, logits, &error)) {
+    std::cerr << "Ornith prefill failed: " << error << '\n';
+    return 1;
+  }
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens &&
+         loaded.session->Position() < kDefaultContext) {
+    const auto token = sampler.Sample(logits);
+    if (loaded.tokenizer->IsStopToken(token))
+      break;
+    sampler.Accept(token);
+    const auto piece = loaded.tokenizer->DecodeTokenCopy(token);
+    std::cout << piece << std::flush;
+    if (reply)
+      reply->append(piece);
+    generated.push_back(token);
+    if (!loaded.session->Step(static_cast<std::int32_t>(token), logits,
+                              &error)) {
+      std::cerr << "Ornith decode failed: " << error << '\n';
+      return 1;
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose && !generated.empty()) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
+std::optional<std::vector<tokenization::TokenId>> RenderOrnithPrompt(
+    const OrnithCli& loaded,
+    std::span<const tokenization::ChatMessage> messages,
+    const PromptOptions& opt) {
+  auto options =
+      models::ornith15::ResolveChatOptions(PromptReasoningOptions(opt));
+  options.max_output_bytes =
+      tokenization::RenderedPromptBoundBytes(kDefaultContext);
+  return tokenization::QwenChatTemplate::RenderAndTokenize(
+      *loaded.tokenizer, messages, {}, options);
+}
+
+int RunOrnithPrompt(const PromptOptions& opt, const core::GgufReader& reader,
+                    std::chrono::steady_clock::time_point load_start) {
+  auto loaded = LoadOrnithCli(opt, reader, load_start);
+  if (!loaded)
+    return 1;
+  std::vector<tokenization::TokenId> prompt;
+  if (opt.use_chat_template) {
+    std::vector<tokenization::ChatMessage> messages;
+    if (!opt.system_prompt.empty()) {
+      messages.push_back(
+          {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
+    }
+    messages.push_back(
+        {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
+    auto rendered = RenderOrnithPrompt(*loaded, messages, opt);
+    if (!rendered) {
+      std::cerr << "Error formatting chat template.\n";
+      return 1;
+    }
+    prompt = std::move(*rendered);
+  } else {
+    prompt = loaded->tokenizer->Encode(opt.prompt_text);
+  }
+  return GenerateOrnithResponse(opt, *loaded, prompt);
+}
+
+int RunOrnithChat(const PromptOptions& opt, const core::GgufReader& reader,
+                  std::chrono::steady_clock::time_point load_start) {
+  if (!opt.use_chat_template) {
+    std::cerr << "Ornith interactive chat requires chat framing; use prompt "
+                 "--raw for raw text\n";
+    return 1;
+  }
+  auto loaded = LoadOrnithCli(opt, reader, load_start);
+  if (!loaded)
+    return 1;
+  const auto options =
+      models::ornith15::ResolveChatOptions(PromptReasoningOptions(opt));
+  std::cout << "=== Gufo Interactive Chat (Ornith-1.5) ===\n"
+            << "Type 'exit' or Ctrl+D to quit.\n\n";
+  std::vector<tokenization::ChatMessage> history;
+  if (!opt.system_prompt.empty()) {
+    history.push_back(
+        {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
+  }
+  for (std::string input;;) {
+    std::cout << ">>> User: " << std::flush;
+    if (!std::getline(std::cin, input) || input == "exit" || input == "quit")
+      break;
+    if (input.empty())
+      continue;
+    history.push_back({tokenization::ChatRole::kUser, input, "", ""});
+    auto prompt = RenderOrnithPrompt(*loaded, history, opt);
+    if (!prompt) {
+      std::cerr << "Error formatting chat template.\n";
+      return 1;
+    }
+    std::cout << "<<< Assistant: ";
+    std::string reply;
+    if (GenerateOrnithResponse(opt, *loaded, *prompt, &reply) != 0)
+      return 1;
+    tokenization::ChatMessage response{tokenization::ChatRole::kAssistant, ""};
+    if (options.enable_thinking) {
+      constexpr std::string_view end = "</think>";
+      const auto boundary = reply.find(end);
+      response.thought = reply.substr(0, boundary);
+      if (boundary != std::string::npos)
+        response.content = reply.substr(boundary + end.size());
+    } else {
+      response.content = std::move(reply);
+    }
+    history.push_back(std::move(response));
+    std::cout << '\n';
+  }
+  return 0;
+}
+
 #endif
 
 }  // namespace
@@ -1014,9 +1260,17 @@ int RunPrompt(std::span<const char* const> args) {
     }
     return RunDeepSeekPrompt(opt, *reader, model_load_start);
   }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    return RunOrnithPrompt(opt, *reader, model_load_start);
+  }
 #else
   if (IsDeepSeekV4Flash(*reader)) {
     std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    std::cerr << "Ornith-1.5 requires the ROCm backend\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
@@ -1237,9 +1491,16 @@ int RunChat(std::span<const char* const> args) {
     }
     return RunDeepSeekChat(opt, *reader, model_load_start);
   }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    return RunOrnithChat(opt, *reader, model_load_start);
+  }
 #else
   if (IsDeepSeekV4Flash(*reader)) {
     std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
+    return 1;
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen35moe") {
+    std::cerr << "Ornith-1.5 requires the ROCm backend\n";
     return 1;
   }
 #endif
