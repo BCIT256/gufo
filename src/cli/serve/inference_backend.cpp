@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -2899,9 +2900,10 @@ private:
 };
 
 constexpr std::string_view kOrnith15StateAbi = "ornith15-rocm-session-v1";
-/// Prefill cells start at absolute multiples of this width. Checkpoints are
-/// stored only on those boundaries; decode steps are re-prefilled next turn.
-constexpr std::uint32_t kOrnithPrefillGrid = 16;
+/// Ornith prefill gives the same bits at any split, so every boundary is a
+/// cell. Checkpoints still come only from prefill: decode steps use other
+/// kernels and are re-prefilled next turn.
+constexpr std::uint32_t kOrnithPrefillGrid = 1;
 
 std::vector<std::uint8_t> OrnithCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::uint32_t max_context) {
@@ -3072,8 +3074,30 @@ public:
         position(position),
         staged(std::move(staged)) {}
 
+  /// The host payload is copied from `staged` in the background. Restores
+  /// read the device image; persistence waits for the copy.
+  Ornith15TextRunnerSnapshot(
+      std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
+      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged)
+      : model(std::move(model)),
+        position(staged->position),
+        staged(std::move(staged)),
+        pending_bytes(this->staged->bytes),
+        pending(std::async(std::launch::async, [image = this->staged] {
+                  std::vector<std::uint8_t> bytes;
+                  std::string error;
+                  if (!models::ornith15::rocm::ExportStagedImage(*image, &bytes,
+                                                                 &error))
+                    throw std::runtime_error("Ornith staged export failed: " +
+                                             error);
+                  return bytes;
+                }).share()) {}
+
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return payload.size();
+    return pending.valid() ? pending_bytes : payload.size();
+  }
+  [[nodiscard]] const std::vector<std::uint8_t>& Payload() const {
+    return pending.valid() ? pending.get() : payload;
   }
   /// Same-history device restore skips KV that is already resident.
   [[nodiscard]] bool PrefersState(
@@ -3091,6 +3115,8 @@ public:
   std::vector<std::uint8_t> payload;
   std::uint32_t position{0};
   std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged;
+  std::size_t pending_bytes{0};
+  std::shared_future<std::vector<std::uint8_t>> pending;
 };
 
 [[nodiscard]] std::int32_t ArgmaxToken(std::span<const float> logits) {
@@ -3179,7 +3205,7 @@ public:
                 // Snapshot v1 has no NextN cache. MTP refuses the prefix
                 // cache at load and does not publish a restorable frontier.
                 .prefix_reuse = !use_mtp_,
-                .in_pass_checkpoint = false,
+                .in_pass_checkpoint = !use_mtp_,
                 .staged_snapshot = !use_mtp_,
                 .partial_prefill_retention = !use_mtp_,
                 .prefill_rollback = false,
@@ -3371,6 +3397,67 @@ public:
             .decode_ready = ornith.position() == prompt.size()};
   }
 
+  // One launch prefills past the cache boundary and freezes the boundary in
+  // a private image, so the boundary costs no second forward pass.
+  [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::size_t boundary) const override {
+    const auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed() || offset != ornith.position() ||
+        offset >= prompt.size())
+      return std::nullopt;
+    const auto consumed = std::min<std::size_t>(
+        {budget, prompt.size() - offset,
+         models::ornith15::rocm::Session::kMaxPrefillChunk});
+    if (boundary <= offset || boundary >= offset + consumed)
+      return std::nullopt;
+    return ornith.session().SnapshotPayloadBytes(
+        static_cast<std::uint32_t>(boundary));
+  }
+
+  [[nodiscard]] TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget, std::size_t boundary,
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+      const std::function<std::unique_ptr<TextRunnerSnapshot>()>&)
+      const override {
+    auto& ornith = RequireOrnithState(state);
+    if (checkpoint == nullptr || ornith.reset_failed() ||
+        offset != ornith.position() || offset >= prompt.size())
+      throw std::logic_error("invalid Ornith in-pass checkpoint request");
+    const auto consumed = std::min<std::size_t>(
+        {budget, prompt.size() - offset,
+         models::ornith15::rocm::Session::kMaxPrefillChunk});
+    if (boundary <= offset || boundary >= offset + consumed)
+      throw std::logic_error("Ornith in-pass boundary is outside the chunk");
+    const auto ids = OrnithEngineTokens(prompt.subspan(offset, consumed),
+                                        tokenizer_->GetVocabSize());
+    std::string error;
+    std::shared_ptr<models::ornith15::rocm::StagedSnapshot> image;
+    if (!ornith.session().PrefillThrough(ids, ornith.logits(),
+                                         static_cast<std::uint32_t>(boundary),
+                                         &image, &error)) {
+      FailOrnithSession(ornith, "Ornith in-pass prefill failed: " + error);
+    }
+    ornith.set_position(ornith.session().Position());
+    ornith.set_have_logits(true);
+    if (ornith.position() != offset + consumed) {
+      FailOrnithSession(ornith, "Ornith prefill position diverged");
+    }
+    // The host copy runs in the background; the first token does not wait.
+    const auto started = std::chrono::steady_clock::now();
+    ornith.RememberCanonical(image);
+    *checkpoint =
+        std::make_unique<Ornith15TextRunnerSnapshot>(model_, std::move(image));
+    const double capture_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+    return {.consumed_tokens = consumed,
+            .decode_ready = ornith.position() == prompt.size(),
+            .checkpoint_ms = capture_ms};
+  }
+
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& ornith = RequireOrnithState(state);
@@ -3522,7 +3609,7 @@ public:
         dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
     if (ornith_snapshot == nullptr ||
         ornith_snapshot->model.get() != model_.get() ||
-        ornith_snapshot->payload.empty()) {
+        (!ornith_snapshot->staged && ornith_snapshot->Payload().empty())) {
       throw std::invalid_argument(
           "Ornith snapshot does not belong to this model");
     }
@@ -3532,7 +3619,7 @@ public:
         ornith_snapshot->staged
             ? restored.session().RestoreStagedSnapshot(
                   *ornith_snapshot->staged, restored.logits(), &error)
-            : restored.session().RestoreSnapshot(ornith_snapshot->payload,
+            : restored.session().RestoreSnapshot(ornith_snapshot->Payload(),
                                                  restored.logits(), &error);
     if (!restored_ok ||
         restored.session().Position() != ornith_snapshot->position) {
@@ -3557,7 +3644,7 @@ public:
         dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
     if (ornith_snapshot == nullptr ||
         ornith_snapshot->model.get() != model_.get() ||
-        ornith_snapshot->payload.empty()) {
+        ornith_snapshot->PayloadBytes() == 0) {
       throw std::invalid_argument(
           "Ornith persistent snapshot does not belong to this model");
     }
@@ -3571,12 +3658,14 @@ public:
         dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
     if (ornith_snapshot == nullptr ||
         ornith_snapshot->model.get() != model_.get() ||
-        destination.size() != ornith_snapshot->payload.size()) {
+        destination.size() != ornith_snapshot->PayloadBytes()) {
       throw std::invalid_argument(
           "Ornith persistent snapshot serialization failed");
     }
-    std::memcpy(destination.data(), ornith_snapshot->payload.data(),
-                destination.size());
+    const auto& payload = ornith_snapshot->Payload();
+    if (payload.size() != destination.size())
+      throw std::runtime_error("Ornith persistent snapshot size diverged");
+    std::memcpy(destination.data(), payload.data(), destination.size());
     return destination.size();
   }
 
@@ -3589,7 +3678,7 @@ public:
       throw std::invalid_argument(
           "Ornith persistent snapshot does not belong to this model");
     }
-    sink(ornith_snapshot->payload);
+    sink(ornith_snapshot->Payload());
   }
 
   void RestorePersistentSnapshot(

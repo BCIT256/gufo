@@ -1815,9 +1815,9 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
     impl_.reset();
     return {};
   }
-  // Publish the prefill grid, not decode steps or a partial cell. The first
-  // token is already out; this restore is not on the TTFT path.
-  if (capabilities.prefill_grid > 1 &&
+  // Publish a prefill-produced frontier, not decode steps or a partial cell.
+  // The first token is already out; this restore is not on the TTFT path.
+  if (capabilities.prefill_grid > 0 &&
       !impl_->runner->RewindToCanonicalPrefix(state)) {
     CommitMetrics metrics = impl_->snapshot_metrics;
     impl_->lease.Invalidate();
@@ -1884,7 +1884,7 @@ TextRunnerPool::Request::Cancel() noexcept {
           impl_->prefill_offset > impl_->lease.cached_tokens()))) {
       if (impl_->decode_ready)
         impl_->runner->PrepareCancellation(state);
-      if (capabilities.prefill_grid > 1 &&
+      if (capabilities.prefill_grid > 0 &&
           !impl_->runner->RewindToCanonicalPrefix(state)) {
         CommitMetrics metrics = impl_->snapshot_metrics;
         Invalidate();

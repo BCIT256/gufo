@@ -133,9 +133,10 @@ struct TextRunnerCapabilities {
   /// Interrupted prefill rolls back to its entry frontier without consuming
   /// input, so cancellation need not wait for the whole pass.
   bool prefill_rollback{false};
-  /// Absolute prefill cell size. Zero keeps the caller's chunk sizes.
-  /// Snapshot targets and the published live frontier are rounded down to a
-  /// multiple of this width, so a cached suffix repeats a cold prefill's cells.
+  /// Absolute prefill cell size. Zero keeps the caller's chunk sizes and
+  /// publishes decoded frontiers. Any nonzero width publishes only frontiers
+  /// that prefill produced, so a cached suffix repeats a cold prefill; above
+  /// one, snapshot targets are also rounded down to a multiple of the width.
   std::size_t prefill_grid{0};
 };
 
