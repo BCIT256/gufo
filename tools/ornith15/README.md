@@ -78,56 +78,6 @@ set. A failing CTest run repeats its output; count each history once.
 The GPU test completes every history and reports criterion failures separately
 from ordinary top-1 disagreement. A missing-model/capture skip is not a pass.
 
-## Offline capture comparison
-
-`compare_logits.cpp` is a host-only comparator for two ORNL captures with the
-same token IDs. It prints JSON metrics and does not decide the GPU acceptance
-gates. `first_margin_flips` does not apply the paired-llama corroboration used
-by `gpu_decode`. The shared formatter walks `src/` and `tests/` only, so format
-this file explicitly:
-
-```sh
-clang-format --dry-run --Werror tools/ornith15/compare_logits.cpp
-python3 tests/models/ornith15/logit_tools_test.py
-```
-
-## Diagnostic precision-control builds
-
-`build_precision_reference.py` writes an isolated llama.cpp tree from the
-pinned source archive. It checks the archive digest, refuses the existing
-native oracle directories, and records a manifest. `--quantized` keeps the
-original dots. The default patches Q8_0, Q5_K, Q6_K and IQ4_XS to F32
-activations with F64 accumulation and can also build the unfused F32 K/V
-dumper. It never runs inference. Use a new directory:
-
-```sh
-python3 tools/ornith15/build_precision_reference.py \
-  /path/to/llama.cpp-68d9053afd4f4d0752ced6187585f862355a40be.tar.gz \
-  /path/to/new-control-directory --prepare-only
-```
-
-## Policy B representation evaluator
-
-`representation.py` is the host side of B-eval. It rounds with its own
-binary32 and binary16 operations and does not call the GPU quantizer, the
-GPU dot, or the host dequantizer. `M` is the consumed packed formula in
-real arithmetic, then rounded to binary32. `F` is the F64 dot of the
-original binary32 activations with dyadic weights, then rounded to
-binary32. `D_mul`, `D_fma_inner` and `D_fma_outer` are the left-associated
-sequences named by the P4e protocol. Q8_0 also reports `D_compiled`, the
-`fma(RN(d_w * dot), d_a, acc)` order written beside
-`mul_mat_vec_q8_ahead`. A compiled-only match is supplemental. It does not
-make `original_protocol_pass` true. o-F32 declares `D_mul` and `D_fma` only.
-
-`representation_gpu_test` launches `qfn_mmq_quantize_q8_1`,
-`qfn_mmq_moe_vec` and `DenseMatVecF32`, writes a dump, and does not score
-it. Missing device or dump directory skips. Score with:
-
-```sh
-python3 tests/models/ornith15/representation_test.py
-python3 tools/ornith15/representation.py score /path/to/dump
-```
-
 # Ornith chat-template goldens
 
 `chat_goldens.py` regenerates `tests/fixtures/ornith15_chat_goldens.json`: the

@@ -30,22 +30,6 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_ornith15_gpu PUBLIC
     gufo_ornith15 gufo_qwen38_flash_next gufo_qwen38_flash_next_mmq hip::host)
 
-  # Test-only session. The production archive is built without
-  # GUFO_ORNITH15_TEST_PROBE, so its Step cannot replace QKV.
-  add_library(gufo_ornith15_gpu_probe STATIC EXCLUDE_FROM_ALL
-    kernels/rocm/device_model.cpp
-    kernels/rocm/executor.cpp
-    kernels/rocm/kernels.hip.cpp)
-  set_source_files_properties(kernels/rocm/kernels.hip.cpp
-    TARGET_DIRECTORY gufo_ornith15_gpu_probe PROPERTIES LANGUAGE HIP)
-  target_compile_definitions(gufo_ornith15_gpu_probe PRIVATE
-    GUFO_ORNITH15_TEST_PROBE)
-  target_compile_options(gufo_ornith15_gpu_probe PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O2>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3>)
-  target_link_libraries(gufo_ornith15_gpu_probe PUBLIC
-    gufo_ornith15 gufo_qwen38_flash_next gufo_qwen38_flash_next_mmq hip::host)
-
   add_executable(ornith15_bench EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/tools/ornith15/bench.cpp)
   target_link_libraries(ornith15_bench PRIVATE gufo_ornith15_gpu)

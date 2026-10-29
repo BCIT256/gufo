@@ -266,12 +266,7 @@ void Session::MoeRaw(const DeviceTensor& w, const float* x,
 }
 
 void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
-                              std::uint32_t n
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                              ,
-                              Layer0Probe* probe
-#endif
-) {
+                              std::uint32_t n) {
   const auto& c = model_->config();
   Project(l.ssm_qkv, xn_, qkv_, n);
   Project(l.ssm_gate, xn_, z_, n);
@@ -283,31 +278,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
     Project(l.ssm_beta, xn_, beta_, n);
     PackAlphaBeta(alpha_, beta_, ab_, n, c.ssm_num_v_heads, stream_);
   }
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  const bool layer0 = n == 1 && probe != nullptr && layer == 0;
-  if (layer0 && (probe->norm_out != nullptr || probe->qkv_before != nullptr ||
-                 probe->qkv_out != nullptr || probe->edit_qkv != nullptr)) {
-    if (probe->norm_out != nullptr)
-      Check(hipMemcpyAsync(probe->norm_out, xn_, c.hidden_size * sizeof(float),
-                           hipMemcpyDeviceToHost, stream_),
-            "layer0 norm");
-    if (probe->qkv_before != nullptr)
-      Check(hipMemcpyAsync(probe->qkv_before, qkv_,
-                           c.SsmConvChannels() * sizeof(float),
-                           hipMemcpyDeviceToHost, stream_),
-            "layer0 qkv before");
-    if (probe->edit_qkv != nullptr)
-      probe->edit_qkv(probe->edit_ctx, qkv_, xn_, c.SsmConvChannels(),
-                      c.hidden_size, stream_);
-    if (probe->qkv_out != nullptr)
-      Check(hipMemcpyAsync(probe->qkv_out, qkv_,
-                           c.SsmConvChannels() * sizeof(float),
-                           hipMemcpyDeviceToHost, stream_),
-            "layer0 qkv out");
-  }
-#else
   (void)layer;
-#endif
   auto& state = state_[layer];
   fn::GatedDeltaNet(
       qkv_, c.SsmConvChannels(), z_, c.SsmValueDim(), ab_, l.ssm_conv1d.f32(),
@@ -316,20 +287,6 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
       false, false, c.rms_eps, stream_, nullptr, {}, 0, nullptr,
       fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  if (layer0 && probe->conv_out != nullptr)
-    Check(hipMemcpyAsync(
-              probe->conv_out, state.conv,
-              (c.ssm_conv_kernel - 1) * c.SsmConvChannels() * sizeof(float),
-              hipMemcpyDeviceToHost, stream_),
-          "layer0 conv");
-  if (layer0 && probe->state_out != nullptr)
-    Check(hipMemcpyAsync(probe->state_out, state.recurrent,
-                         std::size_t(c.ssm_num_v_heads) * c.ssm_head_dim *
-                             c.ssm_head_dim * sizeof(float),
-                         hipMemcpyDeviceToHost, stream_),
-          "layer0 state");
-#endif
   Project(l.ssm_out, gdn_out_, block_out_, n);
 }
 
@@ -367,45 +324,11 @@ void Session::Attention(const DeviceLayer& l, std::size_t layer,
   }
 }
 
-void Session::Moe(const DeviceLayer& l, std::uint32_t n
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                  ,
-                  std::size_t layer, Layer0Probe* probe
-#endif
-) {
+void Session::Moe(const DeviceLayer& l, std::uint32_t n) {
   const auto& c = model_->config();
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  const bool detail = n == 1 && probe != nullptr &&
-                      static_cast<int>(layer) == probe->detail_layer;
-  if (detail && probe->detail_moe_in != nullptr)
-    Check(
-        hipMemcpyAsync(probe->detail_moe_in, xn_, c.hidden_size * sizeof(float),
-                       hipMemcpyDeviceToHost, stream_),
-        "moe input");
-#endif
   Project(l.router, xn_, router_, n);
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  if (detail && probe->detail_router != nullptr)
-    Check(hipMemcpyAsync(probe->detail_router, router_,
-                         c.num_experts * sizeof(float), hipMemcpyDeviceToHost,
-                         stream_),
-          "router logits");
-#endif
   fn::RouterTopK(router_, c.num_experts, ids_, route_weights_, n, c.num_experts,
                  c.num_experts_used, stream_);
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  if (n == 1 && probe != nullptr && probe->route_ids != nullptr &&
-      probe->route_weights != nullptr) {
-    const auto k = c.num_experts_used;
-    Check(hipMemcpyAsync(probe->route_ids + layer * k, ids_,
-                         k * sizeof(std::int32_t), hipMemcpyDeviceToHost,
-                         stream_),
-          "route ids");
-    Check(hipMemcpyAsync(probe->route_weights + layer * k, route_weights_,
-                         k * sizeof(float), hipMemcpyDeviceToHost, stream_),
-          "route weights");
-  }
-#endif
   if (n == 1) {
     Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, 1, c.num_experts_used);
     Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, 1, c.num_experts_used);
@@ -428,40 +351,11 @@ void Session::Moe(const DeviceLayer& l, std::uint32_t n
              stream_);
   Project(l.shexp_down, shared_gate_, shared_out_, n);
   Project(l.shexp_gate_inp, xn_, shared_inp_, n);
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  if (n == 1 && probe != nullptr && probe->shared_gate != nullptr)
-    Check(hipMemcpyAsync(probe->shared_gate + layer, shared_inp_, sizeof(float),
-                         hipMemcpyDeviceToHost, stream_),
-          "shared gate");
-  if (detail && probe->detail_expert_down != nullptr)
-    Check(hipMemcpyAsync(
-              probe->detail_expert_down, expert_down_,
-              std::size_t(c.num_experts_used) * c.hidden_size * sizeof(float),
-              hipMemcpyDeviceToHost, stream_),
-          "expert down");
-  if (detail && probe->detail_shared != nullptr)
-    Check(hipMemcpyAsync(probe->detail_shared, shared_out_,
-                         c.hidden_size * sizeof(float), hipMemcpyDeviceToHost,
-                         stream_),
-          "shared expert");
-#endif
   fn::MoeEpilogue(expert_down_, route_weights_, shared_out_, shared_inp_, 1,
                   block_out_, n, c.num_experts_used, c.hidden_size, stream_);
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  if (detail && probe->detail_moe_out != nullptr)
-    Check(hipMemcpyAsync(probe->detail_moe_out, block_out_,
-                         c.hidden_size * sizeof(float), hipMemcpyDeviceToHost,
-                         stream_),
-          "moe out");
-#endif
 }
 
-void Session::RunChunk(std::uint32_t n, LayerTrace* trace
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                       ,
-                       Layer0Probe* probe
-#endif
-) {
+void Session::RunChunk(std::uint32_t n, LayerTrace* trace) {
   const auto& c = model_->config();
   if (n == 0 || n > kMaxPrefillChunk)
     throw std::runtime_error("invalid chunk width");
@@ -479,23 +373,13 @@ void Session::RunChunk(std::uint32_t n, LayerTrace* trace
     fn::RmsNormRows(res_, l.attn_norm.f32(), xn_, n, c.hidden_size, 1,
                     c.rms_eps, stream_);
     if (l.linear)
-      LinearAttention(l, i, n
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                      ,
-                      probe
-#endif
-      );
+      LinearAttention(l, i, n);
     else
       Attention(l, i, n);
     fn::MtpAddEmbedding(block_out_, res_, n, c.hidden_size, 1, stream_);
     fn::RmsNormRows(res_, l.post_attention_norm.f32(), xn_, n, c.hidden_size, 1,
                     c.rms_eps, stream_);
-    Moe(l, n
-#ifdef GUFO_ORNITH15_TEST_PROBE
-        ,
-        i, probe
-#endif
-    );
+    Moe(l, n);
     fn::MtpAddEmbedding(block_out_, res_, n, c.hidden_size, 1, stream_);
     if (trace != nullptr && n == 1)
       Check(hipMemcpyAsync((*trace)[i].data(), res_,
@@ -522,18 +406,8 @@ void Session::ProjectAllLogits(std::uint32_t n) {
   MoeRaw(model_->output(), xn_, zero_ids_, logits_batch_, n, 1);
 }
 
-void Session::DecodeBody(LayerTrace* trace
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                         ,
-                         Layer0Probe* probe
-#endif
-) {
-  RunChunk(1, trace
-#ifdef GUFO_ORNITH15_TEST_PROBE
-           ,
-           probe
-#endif
-  );
+void Session::DecodeBody(LayerTrace* trace) {
+  RunChunk(1, trace);
   ProjectLastLogits(1);
 }
 
@@ -554,12 +428,7 @@ void Session::TryCapture() {
     }
   }
   try {
-    DecodeBody(nullptr
-#ifdef GUFO_ORNITH15_TEST_PROBE
-               ,
-               nullptr
-#endif
-    );
+    DecodeBody(nullptr);
     Check(hipGetLastError(), "graph record");
     const hipError_t end = hipStreamEndCapture(stream_, &captured);
     if (end != hipSuccess || captured == nullptr)
@@ -587,12 +456,7 @@ void Session::TryCapture() {
 }
 
 bool Session::Step(std::int32_t token, std::span<float> logits,
-                   std::string* error, LayerTrace* trace
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                   ,
-                   Layer0Probe* probe
-#endif
-                   ,
+                   std::string* error, LayerTrace* trace,
                    std::int32_t* sampled) {
   const auto& c = model_->config();
   const bool want_logits = logits.size() == c.vocab_size;
@@ -606,11 +470,7 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
           "invalid AR step (failed session, token, context or logits size)";
     return false;
   }
-#ifdef GUFO_ORNITH15_TEST_PROBE
-  const bool plain = trace == nullptr && probe == nullptr;
-#else
   const bool plain = trace == nullptr;
-#endif
   try {
     Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),
                          hipMemcpyHostToDevice, stream_),
@@ -621,12 +481,7 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
     if (plain && graph_exec_ != nullptr) {
       Check(hipGraphLaunch(graph_exec_, stream_), "graph launch");
     } else {
-      DecodeBody(trace
-#ifdef GUFO_ORNITH15_TEST_PROBE
-                 ,
-                 probe
-#endif
-      );
+      DecodeBody(trace);
       Check(hipGetLastError(), "AR launch");
       if (plain) {
         const bool capture =
@@ -697,12 +552,7 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
                            std::size_t(count) * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, stream_),
             "token upload");
-      RunChunk(count, nullptr
-#ifdef GUFO_ORNITH15_TEST_PROBE
-               ,
-               nullptr
-#endif
-      );
+      RunChunk(count, nullptr);
       if (want_all) {
         ProjectAllLogits(count);
         Check(

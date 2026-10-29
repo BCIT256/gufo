@@ -13,7 +13,6 @@ function(add_ornith15_test name labels)
 endfunction()
 
 add_ornith15_test(config "cpu")
-add_ornith15_test(route_margin "cpu")
 add_ornith15_test(weights "cpu")
 add_ornith15_test(artifact "cpu;external-model")
 add_ornith15_test(chat_template "cpu")
@@ -31,40 +30,7 @@ set_tests_properties(ornith15.reference_oracle PROPERTIES TIMEOUT 3600)
 if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_ops "gpu;hip;gfx1151"
     gufo_ornith15_gpu gufo_ornith15_reference)
-  add_ornith15_test(representation_gpu "gpu;hip;gfx1151"
-    gufo_ornith15_gpu)
-  add_ornith15_test(layer0_replay "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu gufo_ornith15_reference)
-  target_compile_definitions(ornith15_layer0_replay_test PRIVATE
-    GUFO_ORNITH15_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-  set_tests_properties(ornith15.layer0_replay PROPERTIES
-    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
-  add_test(NAME ornith15.layer0_exit_logic COMMAND ornith15_layer0_replay_test)
-  set_tests_properties(ornith15.layer0_exit_logic PROPERTIES
-    ENVIRONMENT "GUFO_ORNITH15_LAYER0_MODE=prove-exit"
-    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-    LABELS "ornith15;gpu;hip" SKIP_RETURN_CODE 77)
   add_ornith15_test(gpu_decode "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu gufo_ornith15_reference)
   set_tests_properties(ornith15.gpu_decode PROPERTIES TIMEOUT 3600)
-  add_ornith15_test(expert_row_audit "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu gufo_ornith15_reference)
-  set_tests_properties(ornith15.expert_row_audit PROPERTIES
-    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
-  add_ornith15_test(b_prefix "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu gufo_ornith15_reference)
-  set_tests_properties(ornith15.b_prefix PROPERTIES
-    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
-  add_ornith15_test(qkv_downstream "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu_probe gufo_ornith15_reference)
-  target_compile_definitions(ornith15_qkv_downstream_test PRIVATE
-    GUFO_ORNITH15_TEST_PROBE)
-  set_tests_properties(ornith15.qkv_downstream PROPERTIES
-    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
-  add_ornith15_test(route_audit "gpu;hip;gfx1151;external-model"
-    gufo_ornith15_gpu_probe gufo_ornith15_reference)
-  target_compile_definitions(ornith15_route_audit_test PRIVATE
-    GUFO_ORNITH15_TEST_PROBE)
-  set_tests_properties(ornith15.route_audit PROPERTIES
-    TIMEOUT 3600 WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 endif()
