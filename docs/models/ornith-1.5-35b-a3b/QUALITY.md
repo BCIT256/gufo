@@ -247,3 +247,30 @@ Oracle `ctest` of `^(ornith15|qwen38_flash_next)\.` was 30/30, including
 `ornith15.gpu_decode`, `ornith15.gpu_ops` and `ornith15.gpu_snapshot`.
 Held-out `ornith15.gpu_decode` passed. Chunk sizes stayed 16, 48, 64 and
 512. Thresholds were not changed.
+
+## MTP
+
+`--speculative mtp` drafts with the bundled NextN block and commits each
+kept token with one decode-dot step, the same graph as autoregressive
+`Step`. The draft runs on its own stream and scratch. A rejected draft
+stops the chain. Other speculative backends are rejected. A different
+`--mtp-model` is rejected. `--cache-disk` and a RAM cache capacity are
+rejected with `Ornith MTP does not support the prefix cache`. The load
+line is `event=ornith_mtp draft_tokens=N cache=off`.
+
+Sampled acceptance is the Flash-Next rule. `ornith15.gpu_mtp` passed on
+this tree: trunk logits with the NextN consume stayed at max abs 0
+against a session that did not draft (threshold 1e-4). A 4-token
+`VerifyForward` differed from four single steps by max abs 0.85989475.
+Greedy argmax still agreed 12/12 on that synthetic chain and 24/24 on an
+81-token sentence (9 of 41 drafts accepted). Synthetic token ids accepted
+0 of 30. The server does not sample the batch row, so that gap is not the
+continuation it emits.
+
+`ornith15-functional-v1` was scored unchanged against this server, card
+and greedy. Both reports were 5/5. Tool calls parsed. All 8 greedy
+answers matched an autoregressive server: content, reasoning, tool name
+and arguments, finish reason, and completion-token count. The full
+`^(ornith15|qwen38_flash_next)\.` oracle was not re-run after the
+decode-step path. `RunChunk` with prefix rollback off is unchanged.
+Thresholds were not changed.

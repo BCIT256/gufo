@@ -449,3 +449,41 @@ draft-mtp`, 64 new tokens, cache off, same interleave. Acceptance is
 On these prompts llama.cpp MTP decode is slower than the same process
 shape's autoregressive decode above (about 45 and 39 tok/s). This run
 does not reproduce an earlier ~46 tok/s MTP figure from the agent replay.
+
+## Gufo MTP
+
+2026-10-29T13:33:51-05:00, gfx1151. Power: `AC0/online=1`,
+`BAT0/status=Not charging`. Lemonade's llama-server (pid 3363206, state
+`Sl`, port 8003, MTP) stayed up. Binary `build/release-mtp/gufo`. Fresh
+process per sample, two cycles, order Gufo autoregressive, Gufo
+`--speculative mtp --draft-tokens 7`, llama.cpp `--spec-type draft-mtp`.
+No prefix cache. Temperature 0, seed 41, thinking off, 64 new tokens.
+Prompts are the same 262- and 2052-token sentences. llama.cpp startup
+logged `ROCm0 : AMD Radeon 8060S Graphics`, `offloaded 42/42 layers to
+GPU`, `ROCm0 model buffer size = 22211.31 MiB`,
+`ROCm_Host model buffer size = 397.85 MiB`.
+
+```
+build/release-mtp/gufo serve --host 127.0.0.1 --port PORT llm --model Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --context 16384 --sessions 1 --served-model-name ornith-m4 --speculative mtp --draft-tokens 7
+```
+
+llama.cpp adds `--spec-type draft-mtp` to the command in the section
+above. Rates are `timings.prompt_per_second` and
+`timings.predicted_per_second`. Acceptance is
+`draft_n_accepted/draft_n`.
+
+| Prompt | Gufo AR pp | Gufo MTP pp | llama.cpp MTP pp | Gufo AR tg | Gufo MTP tg | llama.cpp MTP tg | Gufo accepted | llama.cpp accepted |
+| ---: | --- | --- | --- | --- | --- | --- | --- | --- |
+| 262 | 512.8, 520.4 | 508.9, 511.6 | 581.3, 584.2 | 41.12, 40.72 | 35.84, 36.18 | 40.06, 38.44 | 30/63, 30/63 | 28/101, 28/101 |
+| 2052 | 860.3, 856.1 | 836.9, 830.2 | 990.9, 982.9 | 38.40, 38.17 | 33.61, 33.94 | 35.80, 35.92 | 30/63, 30/63 | 29/99, 29/99 |
+
+Gufo MTP means are 36.01 and 33.77 tok/s. llama.cpp MTP means are 39.25
+and 35.86 tok/s. Gufo MTP did not beat llama.cpp on either prompt, and
+this run does not reproduce ~46 tok/s. Greedy text matched Gufo
+autoregressive on all four samples. A width-8 verification batch was
+slower (about 14 tok/s with a second forward, about 22 tok/s after a
+DeltaNet prefix rollback) and is not the server path.
+
+The same binary's agent replay, at most 8 new tokens and cache off,
+matched autoregressive output on all 7 turns. No tool call was emitted;
+the budget ends first, and turn 6 stopped after one token.
