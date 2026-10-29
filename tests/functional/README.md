@@ -93,6 +93,13 @@ text and finish reason. This executes the reviewed generated Python on the
 development host. The requests and measurement scope are recorded in the
 [Qwen27B quality notes](../../docs/models/qwen3.8-27b/QUALITY.md#october-21-coding-and-prose-follow-up).
 
+`ornith15_suite.py` is `ornith15-functional-v1`, five fixed English tasks
+against `gufo serve llm` for an Ornith APEX GGUF. It checks generated Python,
+a tool-call round trip, a two-turn edit, and one streamed exact answer. It
+records time-to-first-token and decode tok/s per request. It stays outside
+`--suite all`. `--base-url` scores an already running OpenAI server. Write
+its output outside the repository.
+
 `prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
 after a long source archive against an already running Flash-Next MTP server:
 
