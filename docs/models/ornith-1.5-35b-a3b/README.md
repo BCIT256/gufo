@@ -2,8 +2,11 @@
 
 `qwen35moe` autoregressive decode and chunked prefill on gfx1151.
 `gufo serve llm --model <gguf>` and `gufo chat --model <gguf>` load this
-architecture on ROCm. Each request prefills its full history; there is no
-prefix cache. Vision, YaRN and MTP execution are absent. `--speculative`,
+architecture on ROCm. The server keeps a host snapshot of each session
+frontier and reuses it when a later prompt has the same prefix. A miss
+re-prefills. That payload is also the disk cache when `--cache-disk` is set.
+There is no in-pass checkpoint; prefill yields at snapshot boundaries.
+Vision, YaRN and MTP execution are absent. `--speculative`,
 `--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
 in chunks of at most 512 tokens. `Session::Step` advances one token. A plain decode step
 may replay a HIP graph. Pass a vocabulary-sized buffer to receive logits, or

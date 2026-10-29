@@ -2898,6 +2898,35 @@ private:
 
 constexpr std::string_view kOrnith15StateAbi = "ornith15-rocm-session-v1";
 
+std::vector<std::uint8_t> OrnithCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Ornith disk cache requires an artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=ornith15\n"
+           << "architecture=qwen35moe\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=" << models::ornith15::kTemplateId << '\n'
+           << "chat_template_reference_sha256="
+           << models::ornith15::kReferenceTemplateSha256 << '\n'
+           << "state_abi=" << kOrnith15StateAbi << '\n'
+           << "payload_layout=ornith15-rocm-session-v1\n"
+           << "payload_version="
+           << models::ornith15::rocm::Session::kSnapshotPayloadVersion << '\n'
+           << "numerics=policy-b-q8_1-f32-attention-oproj\n"
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "mtp=none\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
 tokenization::ChatTemplateOptions OrnithChatOptions(const ChatRequest& request,
                                                     std::uint32_t max_context) {
   auto options = models::ornith15::ResolveChatOptions(request.reasoning);
@@ -2942,6 +2971,9 @@ public:
   }
 
   [[nodiscard]] models::ornith15::rocm::Session& session() { return *session_; }
+  [[nodiscard]] const models::ornith15::rocm::Session& session() const {
+    return *session_;
+  }
   [[nodiscard]] std::span<float> logits() { return logits_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   void set_position(std::uint32_t position) noexcept { position_ = position; }
@@ -2966,6 +2998,15 @@ Ornith15TextRunnerState& RequireOrnithState(TextRunnerState& state) {
   return *ornith;
 }
 
+const Ornith15TextRunnerState& RequireOrnithState(
+    const TextRunnerState& state) {
+  const auto* ornith = dynamic_cast<const Ornith15TextRunnerState*>(&state);
+  if (ornith == nullptr) {
+    throw std::logic_error("text runner state is not Ornith-1.5");
+  }
+  return *ornith;
+}
+
 [[noreturn]] void FailOrnithSession(Ornith15TextRunnerState& state,
                                     const std::string& message) {
   std::string reset_error;
@@ -2975,7 +3016,26 @@ Ornith15TextRunnerState& RequireOrnithState(TextRunnerState& state) {
   throw std::runtime_error(message);
 }
 
-// One session per request. History is re-prefilled; nothing is snapshotted.
+class Ornith15TextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  Ornith15TextRunnerSnapshot(
+      std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
+      std::vector<std::uint8_t> payload, std::uint32_t position)
+      : model(std::move(model)),
+        payload(std::move(payload)),
+        position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return payload.size();
+  }
+
+  std::shared_ptr<const models::ornith15::rocm::DeviceModel> model;
+  std::vector<std::uint8_t> payload;
+  std::uint32_t position{0};
+};
+
+// One session per request. A host snapshot is the prefix cache; a miss
+// re-prefills from the start of the prompt.
 class Ornith15TextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
@@ -2984,7 +3044,8 @@ public:
   Ornith15TextRunner(
       std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
       std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-      std::string model_id, std::uint32_t max_context)
+      std::string model_id, std::uint32_t max_context,
+      std::string artifact_fingerprint = {})
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         model_id_(std::move(model_id)),
@@ -2996,6 +3057,14 @@ public:
       throw std::runtime_error("Ornith session probe failed: " + error);
     }
     per_request_bytes_ = probe->resident_bytes();
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity =
+              OrnithCompatibilityIdentity(artifact_fingerprint, max_context_),
+          .payload_version =
+              models::ornith15::rocm::Session::kSnapshotPayloadVersion,
+      };
+    }
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -3006,19 +3075,19 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = false,
-                .fork = false,
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = true,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = false,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0,
-                .prefix_reuse = false,
+                .prefix_reuse = true,
                 .in_pass_checkpoint = false,
-                .partial_prefill_retention = false,
+                .partial_prefill_retention = true,
                 .prefill_rollback = false,
             },
-        .persistence = std::nullopt,
+        .persistence = persistence_,
     };
   }
 
@@ -3032,13 +3101,21 @@ public:
         per_request_bytes_ > 0 && free_bytes >= per_request_bytes_) {
       capacity = free_bytes;
     }
+    // Snapshots are host bytes. On this APU they share DRAM with device
+    // allocations, and HIP's free figure does not see later host pressure.
+    std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
+    std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
+    if (capacity.has_value()) {
+      snapshot_capacity = std::min(snapshot_capacity, *capacity);
+      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
+    }
     return {
         .resident_weights_bytes = model_->resident_bytes(),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = per_request_bytes_,
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = std::nullopt,
-        .retained_snapshot_ceiling_bytes = std::nullopt,
+        .retained_snapshot_capacity_bytes = snapshot_capacity,
+        .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
     };
   }
@@ -3079,6 +3156,41 @@ public:
     return OrnithChatOptions(request, max_context_).enable_thinking
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
+  }
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    if (!prepared)
+      return std::nullopt;
+    std::vector<tokenization::ContentSpan> spans;
+    std::size_t stable_bytes = 0;
+    std::string error;
+    const auto tools =
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools};
+    const auto rendered = tokenization::QwenChatTemplate::Render(
+        request.messages, tools, OrnithChatOptions(request, max_context_),
+        &error, nullptr, &stable_bytes, &spans);
+    if (!rendered) {
+      throw std::invalid_argument(error.empty() ? "Ornith prompt render failed"
+                                                : error);
+    }
+    tokenization::TokenizerOptions tok_options;
+    tok_options.add_bos = false;
+    tok_options.add_eos = false;
+    tok_options.parse_special_tokens = true;
+    const auto suffix = tokenization::QwenChatTemplate::EncodeRendered(
+        *tokenizer_, *rendered, stable_bytes, rendered->size(), spans,
+        tok_options);
+    if (suffix.size() > prepared->tokens.size() ||
+        !std::equal(suffix.begin(), suffix.end(),
+                    prepared->tokens.end() -
+                        static_cast<std::ptrdiff_t>(suffix.size()))) {
+      throw std::logic_error("Ornith stable prefix is not a token boundary");
+    }
+    prepared->cache_prefix_tokens = prepared->tokens.size() - suffix.size();
+    return prepared;
   }
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
@@ -3190,12 +3302,133 @@ public:
     return ornith->position();
   }
 
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed())
+      throw std::runtime_error("Ornith session reset failed");
+    if (ornith.position() != prefix.size()) {
+      throw std::logic_error("Ornith reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    const auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed())
+      throw std::runtime_error("Ornith session reset failed");
+    const auto bytes = ornith.session().SnapshotPayloadBytes();
+    if (bytes == 0)
+      throw std::overflow_error("Ornith snapshot size is unavailable");
+    return bytes;
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed())
+      throw std::runtime_error("Ornith session reset failed");
+    std::string error;
+    std::vector<std::uint8_t> payload;
+    if (!ornith.session().SaveSnapshot(&payload, &error) ||
+        payload.size() != ornith.session().SnapshotPayloadBytes()) {
+      throw std::runtime_error("Ornith snapshot failed: " + error);
+    }
+    return std::make_unique<Ornith15TextRunnerSnapshot>(
+        model_, std::move(payload), ornith.position());
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* ornith_snapshot =
+        dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
+    if (ornith_snapshot == nullptr ||
+        ornith_snapshot->model.get() != model_.get() ||
+        ornith_snapshot->payload.empty()) {
+      throw std::invalid_argument(
+          "Ornith snapshot does not belong to this model");
+    }
+    auto& restored = RequireOrnithState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(ornith_snapshot->payload,
+                                            restored.logits(), &error) ||
+        restored.session().Position() != ornith_snapshot->position) {
+      FailOrnithSession(restored, "Ornith snapshot restore failed: " + error);
+    }
+    restored.set_position(ornith_snapshot->position);
+    restored.set_have_logits(ornith_snapshot->position > 0);
+    restored.set_reset_failed(false);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* ornith_snapshot =
+        dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
+    if (ornith_snapshot == nullptr ||
+        ornith_snapshot->model.get() != model_.get() ||
+        ornith_snapshot->payload.empty()) {
+      throw std::invalid_argument(
+          "Ornith persistent snapshot does not belong to this model");
+    }
+    return ornith_snapshot->PayloadBytes();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* ornith_snapshot =
+        dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
+    if (ornith_snapshot == nullptr ||
+        ornith_snapshot->model.get() != model_.get() ||
+        destination.size() != ornith_snapshot->payload.size()) {
+      throw std::invalid_argument(
+          "Ornith persistent snapshot serialization failed");
+    }
+    std::memcpy(destination.data(), ornith_snapshot->payload.data(),
+                destination.size());
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    const auto* ornith_snapshot =
+        dynamic_cast<const Ornith15TextRunnerSnapshot*>(&snapshot);
+    if (ornith_snapshot == nullptr ||
+        ornith_snapshot->model.get() != model_.get()) {
+      throw std::invalid_argument(
+          "Ornith persistent snapshot does not belong to this model");
+    }
+    sink(ornith_snapshot->payload);
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireOrnithState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, restored.logits(),
+                                            &error)) {
+      FailOrnithSession(restored,
+                        "Ornith persistent snapshot restore failed: " + error);
+    }
+    const auto position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      FailOrnithSession(
+          restored, "Ornith persistent snapshot restored an invalid position");
+    }
+    restored.set_position(position);
+    restored.set_have_logits(true);
+    restored.set_reset_failed(false);
+  }
+
 private:
   std::shared_ptr<const models::ornith15::rocm::DeviceModel> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::string model_id_;
   std::uint32_t max_context_;
   std::size_t per_request_bytes_{0};
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
 
@@ -3513,12 +3746,22 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config)) {
-      SetError(error, "Ornith does not support a prefix disk cache");
-      return false;
-    }
-    if (ram_cache_config.capacity_bytes != 0) {
-      SetError(error, "Ornith does not support a prefix RAM cache");
-      return false;
+      if (resolved_disk_cache_config.capacity_bytes == 0) {
+        SetError(error,
+                 "Ornith persistent disk cache configuration is invalid");
+        return false;
+      }
+      if (resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+          !FingerprintArtifact(
+              "Ornith", *reader,
+              &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+        return false;
+      }
+      if (!IsSha256Hex(resolved_disk_cache_config.model_artifact_fingerprint)) {
+        SetError(error,
+                 "Ornith persistent disk cache configuration is invalid");
+        return false;
+      }
     }
     if (session_count == 0) {
       SetError(error, "HTTP session count must be at least one");
@@ -3584,13 +3827,24 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
           std::move(device),
           std::shared_ptr<const tokenization::QwenTokenizer>(
               std::move(tokenizer)),
-          std::move(model_name), max_context);
+          std::move(model_name), max_context,
+          resolved_disk_cache_config.model_artifact_fingerprint);
       new_state->model_id = runner->Descriptor().model_id;
       new_state->max_context = max_context;
+      std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+      if (DiskCacheEnabled(resolved_disk_cache_config)) {
+        runner_disk_cache = TextRunnerDiskCacheOptions{
+            .directory = std::move(resolved_disk_cache_config.directory),
+            .capacity_bytes = resolved_disk_cache_config.capacity_bytes,
+            .staging_capacity_bytes =
+                resolved_disk_cache_config.staging_capacity_bytes,
+        };
+      }
       Logger::Info("loader", "event=load_phase phase=ornith_sessions " +
                                  Logger::MemoryStatus());
       auto runner_pool = std::make_shared<TextRunnerPool>(
-          std::move(runner), session_count, std::nullopt, ram_cache_config);
+          std::move(runner), session_count, std::move(runner_disk_cache),
+          ram_cache_config);
       new_state->scheduler = std::make_shared<TextGenerationScheduler>(
           std::move(runner_pool), prefill_policy, scheduler_policy);
       {

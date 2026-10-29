@@ -177,4 +177,4 @@ recurrent region. Restored full sequences passed M1 on every frontier.
 
 Payload bytes depend only on position: 66877504 at P=1, 67000384 at P=7,
 67205184 at P=17, and 67840064 at P=48. Each additional token adds 20480
-bytes, ten F16 K/V layers. The server still has no prefix cache.
+bytes, ten F16 K/V layers.
