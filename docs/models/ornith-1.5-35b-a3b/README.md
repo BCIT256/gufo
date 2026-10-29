@@ -16,7 +16,10 @@ cold prefill. `Session::SetCanonicalGrid` enables that schedule. The direct
 session API leaves it off, so an explicit chunk size is unchanged.
 The host payload is the disk cache when `--cache-disk` is set. There is no
 in-pass checkpoint; prefill yields at snapshot boundaries.
-Vision, YaRN and MTP execution are absent. `--speculative`,
+`--speculative mtp` drafts with the bundled NextN block and keeps
+autoregressive output; it is slower than autoregressive decode on the
+measured prompts and cannot be combined with the prefix cache (see
+BENCHMARKS.md). Vision and YaRN are absent. Other `--speculative` backends,
 `--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
 in chunks of at most 512 tokens. `Session::Step` advances one token. A plain decode step
 may replay a HIP graph. Pass a vocabulary-sized buffer to receive logits, or
