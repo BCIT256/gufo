@@ -156,3 +156,4 @@ Clear flips and confident-position KL are diagnostics. They are computed only
 when `GUFO_ORNITH15_SCALAR_REFERENCE=1`. The scalar reference and
 `ornith15.reference_oracle` are unchanged. The GPU test leaves the reference
 off unless that variable is set. Thresholds are not tuned from results.
+Chunked prefill is scored at 16, 48, 64 and 512 tokens.

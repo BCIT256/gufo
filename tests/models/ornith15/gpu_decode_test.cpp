@@ -373,7 +373,7 @@ int main() {
 
       const auto tail = std::min<std::uint32_t>(8, n - 1);
       const auto prefix = n - tail;
-      for (const std::uint32_t chunk : {64u, 512u}) {
+      for (const std::uint32_t chunk : {16u, 48u, 64u, 512u}) {
         Require(chunk <= orn::rocm::Session::kMaxPrefillChunk, "chunk limit");
         auto session = orn::rocm::Session::Create(*device, n, &error);
         Require(session != nullptr, "prefill session: " + error);
