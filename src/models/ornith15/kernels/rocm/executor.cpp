@@ -7,6 +7,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/ornith15/kernels/rocm/kernels.hpp"
@@ -133,6 +134,10 @@ StagedSnapshot::~StagedSnapshot() {
 }
 
 Session::~Session() {
+  if (mtp_stream_ != nullptr) {
+    (void)hipStreamSynchronize(mtp_stream_);
+    qfn_mmq_release_stream(mtp_stream_);
+  }
   if (stream_ != nullptr) {
     (void)hipStreamSynchronize(stream_);
     qfn_mmq_release_stream(stream_);
@@ -141,8 +146,14 @@ Session::~Session() {
     (void)hipStreamSynchronize(copy_stream_);
   if (graph_exec_ != nullptr)
     (void)hipGraphExecDestroy(graph_exec_);
+  for (hipGraphExec_t exec : verify_graph_) {
+    if (exec != nullptr)
+      (void)hipGraphExecDestroy(exec);
+  }
   for (void* p : allocations_)
     (void)hipFree(p);
+  if (mtp_stream_ != nullptr)
+    (void)hipStreamDestroy(mtp_stream_);
   if (copy_stream_ != nullptr)
     (void)hipStreamDestroy(copy_stream_);
   if (stream_ != nullptr)
@@ -265,6 +276,9 @@ std::unique_ptr<Session> Session::Create(const DeviceModel& model,
 
 bool Session::Reset(std::string* error) {
   try {
+    if (mtp_stream_ != nullptr)
+      Check(hipStreamSynchronize(mtp_stream_), "reset mtp drain");
+    mtp_draft_inflight_ = false;
     Check(hipStreamSynchronize(stream_), "reset drain");
     const auto& c = model_->config();
     for (auto& s : state_) {
@@ -282,8 +296,16 @@ bool Session::Reset(std::string* error) {
       }
       // KV beyond Position() is never read; it is overwritten before use.
     }
+    if (mtp_enabled_) {
+      Check(
+          hipMemsetAsync(h_carry_, 0,
+                         model_->config().hidden_size * sizeof(float), stream_),
+          "mtp carry reset");
+    }
     Check(hipStreamSynchronize(stream_), "reset");
     position_ = 0;
+    mtp_position_ = 0;
+    mtp_chain_ = false;
     lineage_ = NextLineage();
     kv_high_water_ = 0;
     failed_ = false;
@@ -444,18 +466,26 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
   }
   (void)layer;
   auto& state = state_[layer];
+  fn::RollbackRows state_snaps{};
+  fn::RollbackRows conv_snaps{};
+  if (gdn_rollback_ && n > 1 && n <= 8 && layer < gdn_saved_.size()) {
+    const auto& saved = gdn_saved_[layer];
+    for (int row = 0; row < 7; ++row) {
+      state_snaps.rows[row] = saved.state[row];
+      conv_snaps.rows[row] = saved.conv[row];
+    }
+  }
   fn::GatedDeltaNet(
       qkv_, c.SsmConvChannels(), z_, c.SsmValueDim(), ab_, l.ssm_conv1d.f32(),
       l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), state.conv, conv_, qn_,
-      kn_, raw_, state.recurrent, gdn_out_, nullptr, {}, {}, n,
+      kn_, raw_, state.recurrent, gdn_out_, nullptr, state_snaps, conv_snaps, n,
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
       false, false, c.rms_eps, stream_, nullptr, {}, 0, nullptr,
       fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
   Project(l.ssm_out, gdn_out_, block_out_, n);
 }
 
-void Session::Attention(const DeviceLayer& l, std::size_t layer,
-                        std::uint32_t n) {
+void Session::Attention(const DeviceLayer& l, State& state, std::uint32_t n) {
   const auto& c = model_->config();
   Project(l.attn_q, xn_, qg_, n);
   Project(l.attn_k, xn_, k_, n);
@@ -470,7 +500,6 @@ void Session::Attention(const DeviceLayer& l, std::size_t layer,
            c.rope_theta, stream_);
   fn::Rope(k_, n, c.num_kv_heads, c.head_dim, c.rotary_dim, device_pos_,
            c.rope_theta, stream_);
-  auto& state = state_[layer];
   fn::StoreKv(k_, state.k, n, c.AttentionKvDim(), device_pos_, stream_);
   fn::StoreKv(v_, state.v, n, c.AttentionKvDim(), device_pos_, stream_);
   fn::Attention(q_, state.k, state.v, nullptr, 0, ctx_, nullptr, 1, n,
@@ -539,7 +568,7 @@ void Session::RunChunk(std::uint32_t n, LayerTrace* trace) {
     if (l.linear)
       LinearAttention(l, i, n);
     else
-      Attention(l, i, n);
+      Attention(l, state_[i], n);
     fn::MtpAddEmbedding(block_out_, res_, n, c.hidden_size, 1, stream_);
     fn::RmsNormRows(res_, l.post_attention_norm.f32(), xn_, n, c.hidden_size, 1,
                     c.rms_eps, stream_);
@@ -619,6 +648,45 @@ void Session::TryCapture() {
   }
 }
 
+void Session::TryCaptureVerify(std::uint32_t n) {
+  if (n >= 9 || verify_graph_[n] != nullptr || verify_graph_failed_[n])
+    return;
+  hipGraph_t captured = nullptr;
+  auto begin = hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal);
+  if (begin != hipSuccess) {
+    (void)hipGetLastError();
+    verify_graph_failed_[n] = true;
+    return;
+  }
+  try {
+    RunChunk(n, nullptr);
+    ProjectAllLogits(n);
+    Check(hipGetLastError(), "verify graph record");
+    const hipError_t end = hipStreamEndCapture(stream_, &captured);
+    if (end != hipSuccess || captured == nullptr)
+      throw std::runtime_error("verify graph capture end");
+    hipGraphExec_t exec = nullptr;
+    const hipError_t inst =
+        hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0);
+    (void)hipGraphDestroy(captured);
+    captured = nullptr;
+    if (inst != hipSuccess || exec == nullptr)
+      throw std::runtime_error("verify graph instantiate");
+    verify_graph_[n] = exec;
+  } catch (...) {
+    if (captured != nullptr) {
+      (void)hipGraphDestroy(captured);
+    } else {
+      hipGraph_t junk = nullptr;
+      (void)hipStreamEndCapture(stream_, &junk);
+      if (junk != nullptr)
+        (void)hipGraphDestroy(junk);
+    }
+    (void)hipGetLastError();
+    verify_graph_failed_[n] = true;
+  }
+}
+
 bool Session::Step(std::int32_t token, std::span<float> logits,
                    std::string* error, LayerTrace* trace,
                    std::int32_t* sampled) {
@@ -642,12 +710,12 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
     Check(hipMemcpyAsync(token_ids_, &token, sizeof(token),
                          hipMemcpyHostToDevice, stream_),
           "token upload");
-    if (plain && graph_exec_ != nullptr) {
+    if (plain && !mtp_enabled_ && graph_exec_ != nullptr) {
       Check(hipGraphLaunch(graph_exec_, stream_), "graph launch");
     } else {
       DecodeBody(trace);
       Check(hipGetLastError(), "AR launch");
-      if (plain) {
+      if (plain && !mtp_enabled_) {
         const bool capture =
             warmed_ && graph_exec_ == nullptr && !graph_failed_;
         warmed_ = true;
@@ -655,6 +723,8 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
           TryCapture();
       }
     }
+    if (mtp_enabled_ && !mtp_suspend_ && mtp_position_ == position_)
+      MtpConsume(1);
     if (want_sample) {
       fn::Argmax(logits_, static_cast<fn::ArgmaxCandidate*>(argmax_scratch_),
                  sampled_dev_, 1, c.vocab_size, stream_);
@@ -757,6 +827,8 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
                              stream_),
               "prefill last logits");
       }
+      if (mtp_enabled_ && !mtp_suspend_ && mtp_position_ == position_)
+        MtpConsume(count);
       // Grid cells of one call stay ordered on the compute stream. Syncing
       // each cell would add a host round trip per cell on a long prefill.
       if (canonical_grid_ == 0 || last) {
@@ -1073,6 +1145,454 @@ bool Session::SnapshotRecurrentRegion(std::span<const std::uint8_t> payload,
   *offset = cursor + conv_bytes;
   *bytes = recurrent_bytes;
   return cursor + conv_bytes + recurrent_bytes <= payload.size();
+}
+
+bool Session::EnableMtp(std::string* error) {
+  if (failed_ || model_ == nullptr || position_ != 0 || mtp_enabled_ ||
+      !model_->has_mtp()) {
+    if (error != nullptr)
+      *error = "MTP requires a fresh session and the bundled NextN block";
+    return false;
+  }
+  const auto& block = model_->mtp();
+  if (block.nextn_eh_proj.empty() || block.nextn_enorm.empty() ||
+      block.nextn_hnorm.empty() || block.nextn_shared_head_norm.empty() ||
+      block.attn_q.empty()) {
+    if (error != nullptr)
+      *error = "NextN block is missing a projection";
+    return false;
+  }
+  try {
+    const auto& c = model_->config();
+    const std::uint32_t n = kMaxPrefillChunk;
+    const std::uint32_t hidden = c.hidden_size;
+    h_rows_ = Floats(std::size_t(n) * hidden);
+    h_in_ = Floats(std::size_t(n) * hidden);
+    h_carry_ = Floats(hidden);
+    h_carry_saved_ = Floats(hidden);
+    chain_h_ = Floats(hidden);
+    e_buf_ = Floats(std::size_t(n) * hidden);
+    e_norm_ = Floats(std::size_t(n) * hidden);
+    h_norm_ = Floats(std::size_t(n) * hidden);
+    concat_ = Floats(std::size_t(n) * 2 * hidden);
+    // The drafter shares no buffer with the captured decode graph. Its
+    // quantized dots take a pool keyed by this stream, not the trunk's.
+    Check(hipStreamCreateWithFlags(&mtp_stream_, hipStreamNonBlocking),
+          "mtp stream");
+    const auto used = c.num_experts_used;
+    mtp_token_ = static_cast<std::int32_t*>(Allocate(sizeof(std::int32_t)));
+    mtp_pos_ = static_cast<std::uint32_t*>(Allocate(sizeof(std::uint32_t)));
+    mtp_res_ = Floats(hidden);
+    mtp_xn_ = Floats(hidden);
+    mtp_block_ = Floats(hidden);
+    mtp_logits_ = Floats(c.vocab_size);
+    mtp_hidden_ = Floats(hidden);
+    mtp_qg_ = Floats(2 * c.AttentionQDim());
+    mtp_q_ = Floats(c.AttentionQDim());
+    mtp_gate_ = Floats(c.AttentionQDim());
+    mtp_k_ = Floats(c.AttentionKvDim());
+    mtp_v_ = Floats(c.AttentionKvDim());
+    mtp_ctx_ = Floats(c.AttentionQDim());
+    mtp_router_ = Floats(c.num_experts);
+    mtp_route_w_ = Floats(used);
+    mtp_ids_ = static_cast<std::int32_t*>(
+        Allocate(std::size_t(used) * sizeof(std::int32_t)));
+    mtp_expert_gate_ = Floats(std::size_t(used) * c.expert_ff);
+    mtp_expert_up_ = Floats(std::size_t(used) * c.expert_ff);
+    mtp_expert_down_ = Floats(std::size_t(used) * hidden);
+    mtp_shared_gate_ = Floats(c.shared_expert_ff);
+    mtp_shared_up_ = Floats(c.shared_expert_ff);
+    mtp_shared_out_ = Floats(hidden);
+    mtp_shared_inp_ = Floats(1);
+    const auto bytes =
+        std::size_t(max_context_) * c.AttentionKvDim() * sizeof(__half);
+    mtp_state_.k = static_cast<__half*>(Allocate(bytes));
+    mtp_state_.v = static_cast<__half*>(Allocate(bytes));
+    Check(hipMemset(h_carry_, 0, hidden * sizeof(float)), "mtp carry");
+    // Prefix images exist only for the 128-wide, 4-tap DeltaNet this model
+    // uses. A wider verification batch keeps the full-trunk snapshot path.
+    if (c.ssm_head_dim == 128 && c.ssm_conv_kernel == 4) {
+      gdn_saved_.assign(c.num_layers, {});
+      const auto channels = c.SsmConvChannels();
+      const auto hist = std::size_t(c.ssm_conv_kernel - 1) * channels;
+      for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+        if (!c.IsLinearLayer(layer))
+          continue;
+        for (std::uint32_t row = 0; row < 7; ++row) {
+          const auto floats = fn::GdnRollbackRowFloats(
+              row, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
+          gdn_saved_[layer].state[row] = Floats(floats);
+          gdn_saved_[layer].conv[row] = Floats(hist);
+        }
+      }
+      gdn_rollback_ready_ = true;
+    }
+    mtp_enabled_ = true;
+    mtp_position_ = 0;
+    mtp_chain_ = false;
+    return true;
+  } catch (const std::exception& e) {
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+void Session::CaptureTrunkHidden(std::uint32_t n) {
+  const auto& c = model_->config();
+  fn::RmsNormRows(res_, model_->output_norm().f32(), h_rows_, n, c.hidden_size,
+                  1, c.rms_eps, stream_);
+  Check(hipMemcpyAsync(h_carry_, h_rows_ + std::size_t(n - 1) * c.hidden_size,
+                       c.hidden_size * sizeof(float), hipMemcpyDeviceToDevice,
+                       stream_),
+        "mtp carry");
+}
+
+void Session::MtpRun(std::uint32_t n, std::uint32_t start_pos,
+                     const float* hidden, bool write_head) {
+  const auto& c = model_->config();
+  const auto& l = model_->mtp();
+  Check(hipMemcpyAsync(device_pos_, &start_pos, sizeof(start_pos),
+                       hipMemcpyHostToDevice, stream_),
+        "mtp position");
+  if (model_->token_embd().type == GgmlType::kQ6_K) {
+    EmbedQ6Rows(model_->token_embd().data, token_ids_, e_buf_, n, c.hidden_size,
+                stream_);
+  } else {
+    fn::EmbedTokens(model_->token_embd().data, fn::WeightType::kQ8_0,
+                    token_ids_, e_buf_, n, c.hidden_size, 1, stream_);
+  }
+  fn::RmsNormRows(e_buf_, l.nextn_enorm.f32(), e_norm_, n, c.hidden_size, 1,
+                  c.rms_eps, stream_);
+  fn::RmsNormRows(hidden, l.nextn_hnorm.f32(), h_norm_, n, c.hidden_size, 1,
+                  c.rms_eps, stream_);
+  ConcatRows(e_norm_, h_norm_, concat_, n, c.hidden_size, stream_);
+  Project(l.nextn_eh_proj, concat_, res_, n);
+  fn::RmsNormRows(res_, l.attn_norm.f32(), xn_, n, c.hidden_size, 1, c.rms_eps,
+                  stream_);
+  Attention(l, mtp_state_, n);
+  fn::MtpAddEmbedding(block_out_, res_, n, c.hidden_size, 1, stream_);
+  fn::RmsNormRows(res_, l.post_attention_norm.f32(), xn_, n, c.hidden_size, 1,
+                  c.rms_eps, stream_);
+  Moe(l, n);
+  fn::MtpAddEmbedding(block_out_, res_, n, c.hidden_size, 1, stream_);
+  if (!write_head)
+    return;
+  fn::RmsNormRows(res_ + std::size_t(n - 1) * c.hidden_size,
+                  l.nextn_shared_head_norm.f32(), chain_h_, 1, c.hidden_size, 1,
+                  c.rms_eps, stream_);
+  Dense(model_->output(), chain_h_, logits_);
+}
+
+void Session::MtpConsume(std::uint32_t n) {
+  const auto& c = model_->config();
+  fn::RmsNormRows(res_, model_->output_norm().f32(), h_rows_, n, c.hidden_size,
+                  1, c.rms_eps, stream_);
+  ShiftHidden(h_rows_, h_carry_, h_in_, n, c.hidden_size, stream_);
+  MtpRun(n, mtp_position_, h_in_, false);
+  Check(hipMemcpyAsync(h_carry_, h_rows_ + std::size_t(n - 1) * c.hidden_size,
+                       c.hidden_size * sizeof(float), hipMemcpyDeviceToDevice,
+                       stream_),
+        "mtp carry");
+  mtp_position_ += n;
+  mtp_chain_ = false;
+}
+
+void Session::SwapDraftScratch() noexcept {
+  std::swap(stream_, mtp_stream_);
+  std::swap(token_ids_, mtp_token_);
+  std::swap(device_pos_, mtp_pos_);
+  std::swap(res_, mtp_res_);
+  std::swap(xn_, mtp_xn_);
+  std::swap(block_out_, mtp_block_);
+  std::swap(logits_, mtp_logits_);
+  std::swap(qg_, mtp_qg_);
+  std::swap(q_, mtp_q_);
+  std::swap(gate_, mtp_gate_);
+  std::swap(k_, mtp_k_);
+  std::swap(v_, mtp_v_);
+  std::swap(ctx_, mtp_ctx_);
+  std::swap(router_, mtp_router_);
+  std::swap(route_weights_, mtp_route_w_);
+  std::swap(ids_, mtp_ids_);
+  std::swap(expert_gate_, mtp_expert_gate_);
+  std::swap(expert_up_, mtp_expert_up_);
+  std::swap(expert_down_, mtp_expert_down_);
+  std::swap(shared_gate_, mtp_shared_gate_);
+  std::swap(shared_up_, mtp_shared_up_);
+  std::swap(shared_out_, mtp_shared_out_);
+  std::swap(shared_inp_, mtp_shared_inp_);
+}
+
+bool Session::BeginDraft(std::int32_t token, std::string* error) {
+  const auto& c = model_->config();
+  if (!mtp_enabled_ || failed_ || mtp_draft_inflight_ || token < 0 ||
+      static_cast<std::uint32_t>(token) >= c.vocab_size ||
+      mtp_position_ >= max_context_ || mtp_stream_ == nullptr) {
+    if (error != nullptr)
+      *error = "invalid MTP draft";
+    return false;
+  }
+  try {
+    const float* hidden = mtp_chain_ ? chain_h_ : h_carry_;
+    // Copy before the trunk's CaptureTrunkHidden overwrites h_carry_.
+    Check(hipMemcpyAsync(mtp_hidden_, hidden, c.hidden_size * sizeof(float),
+                         hipMemcpyDeviceToDevice, mtp_stream_),
+          "mtp hidden");
+    Check(hipStreamSynchronize(mtp_stream_), "mtp hidden");
+    SwapDraftScratch();
+    try {
+      Check(hipMemcpyAsync(token_ids_, &token, sizeof(token),
+                           hipMemcpyHostToDevice, stream_),
+            "mtp token");
+      MtpRun(1, mtp_position_, mtp_hidden_, true);
+      Check(hipGetLastError(), "mtp draft launch");
+    } catch (...) {
+      SwapDraftScratch();
+      throw;
+    }
+    SwapDraftScratch();
+    ++mtp_position_;
+    mtp_chain_ = true;
+    mtp_draft_inflight_ = true;
+    return true;
+  } catch (const std::exception& e) {
+    mtp_draft_inflight_ = false;
+    (void)hipStreamSynchronize(mtp_stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+bool Session::FinishDraft(std::span<float> logits, std::string* error) {
+  if (!mtp_enabled_ || !mtp_draft_inflight_ || mtp_stream_ == nullptr) {
+    if (error != nullptr)
+      *error = "invalid MTP draft";
+    return false;
+  }
+  const auto& c = model_->config();
+  try {
+    if (logits.size() != c.vocab_size)
+      throw std::runtime_error("invalid MTP draft");
+    Check(hipMemcpyAsync(logits.data(), mtp_logits_, logits.size_bytes(),
+                         hipMemcpyDeviceToHost, mtp_stream_),
+          "mtp logits");
+    Check(hipStreamSynchronize(mtp_stream_), "mtp draft");
+    mtp_draft_inflight_ = false;
+    if (failed_)
+      throw std::runtime_error("MTP draft after a failed session");
+    return true;
+  } catch (const std::exception& e) {
+    mtp_draft_inflight_ = false;
+    (void)hipStreamSynchronize(mtp_stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+bool Session::DraftToken(std::int32_t token, std::span<float> logits,
+                         std::string* error) {
+  const auto& c = model_->config();
+  if (logits.size() != c.vocab_size) {
+    if (error != nullptr)
+      *error = "invalid MTP draft";
+    return false;
+  }
+  if (!BeginDraft(token, error))
+    return false;
+  return FinishDraft(logits, error);
+}
+
+bool Session::VerifyForward(std::span<const std::int32_t> tokens,
+                            std::span<float> all_logits, std::string* error) {
+  const auto& c = model_->config();
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  bool tokens_ok = mtp_enabled_ && !failed_ && n > 0 && n <= kMaxPrefillChunk &&
+                   all_logits.size() == std::size_t(n) * c.vocab_size &&
+                   static_cast<std::uint64_t>(position_) + n <= max_context_;
+  if (tokens_ok) {
+    for (std::int32_t token : tokens) {
+      if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
+        tokens_ok = false;
+        break;
+      }
+    }
+  }
+  if (!tokens_ok) {
+    if (error != nullptr)
+      *error = "invalid MTP verification batch";
+    return false;
+  }
+  mtp_suspend_ = true;
+  mtp_batch_tokens_ = 0;
+  const bool snap = gdn_rollback_ready_ && n > 1 && n <= 8;
+  gdn_rollback_ = snap;
+  try {
+    Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),
+                         hipMemcpyHostToDevice, stream_),
+          "verify position");
+    Check(hipMemcpyAsync(token_ids_, tokens.data(),
+                         std::size_t(n) * sizeof(std::int32_t),
+                         hipMemcpyHostToDevice, stream_),
+          "verify tokens");
+    if (snap && verify_graph_[n] != nullptr) {
+      Check(hipGraphLaunch(verify_graph_[n], stream_), "verify graph");
+    } else {
+      RunChunk(n, nullptr);
+      ProjectAllLogits(n);
+      if (snap && verify_warmed_[n] && !verify_graph_failed_[n])
+        TryCaptureVerify(n);
+      if (snap)
+        verify_warmed_[n] = true;
+    }
+    gdn_rollback_ = false;
+    Check(hipMemcpyAsync(logits_,
+                         logits_batch_ + std::size_t(n - 1) * c.vocab_size,
+                         std::size_t(c.vocab_size) * sizeof(float),
+                         hipMemcpyDeviceToDevice, stream_),
+          "verify frontier");
+    Check(
+        hipMemcpyAsync(all_logits.data(), logits_batch_,
+                       all_logits.size_bytes(), hipMemcpyDeviceToHost, stream_),
+        "verify logits");
+    CaptureTrunkHidden(n);
+    Check(hipGetLastError(), "verify launch");
+    Check(hipStreamSynchronize(stream_), "verify");
+    position_ += n;
+    kv_high_water_ = std::max(kv_high_water_, position_);
+    mtp_batch_tokens_ = snap ? n : 0;
+    mtp_suspend_ = false;
+    gdn_rollback_ = false;
+    return true;
+  } catch (const std::exception& e) {
+    mtp_suspend_ = false;
+    gdn_rollback_ = false;
+    (void)hipStreamSynchronize(stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+bool Session::VerifyDecode(std::int32_t token, std::span<float> logits,
+                           std::string* error) {
+  const auto& c = model_->config();
+  if (!mtp_enabled_ || failed_ || token < 0 ||
+      static_cast<std::uint32_t>(token) >= c.vocab_size ||
+      position_ >= max_context_ || logits.size() != c.vocab_size) {
+    if (error != nullptr)
+      *error = "invalid MTP verify step";
+    return false;
+  }
+  mtp_suspend_ = true;
+  try {
+    Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),
+                         hipMemcpyHostToDevice, stream_),
+          "verify position");
+    Check(hipMemcpyAsync(token_ids_, &token, sizeof(token),
+                         hipMemcpyHostToDevice, stream_),
+          "verify token");
+    if (graph_exec_ != nullptr) {
+      Check(hipGraphLaunch(graph_exec_, stream_), "verify decode graph");
+    } else {
+      DecodeBody(nullptr);
+      Check(hipGetLastError(), "verify decode");
+      const bool capture = warmed_ && !graph_failed_;
+      warmed_ = true;
+      if (capture)
+        TryCapture();
+    }
+    CaptureTrunkHidden(1);
+    Check(hipMemcpyAsync(logits.data(), logits_, logits.size_bytes(),
+                         hipMemcpyDeviceToHost, stream_),
+          "verify decode logits");
+    Check(hipStreamSynchronize(stream_), "verify decode");
+    ++position_;
+    kv_high_water_ = std::max(kv_high_water_, position_);
+    mtp_suspend_ = false;
+    return true;
+  } catch (const std::exception& e) {
+    mtp_suspend_ = false;
+    (void)hipStreamSynchronize(stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+bool Session::RollbackMtpBatch(std::uint32_t keep, std::string* error) {
+  if (!mtp_enabled_ || failed_ || mtp_batch_tokens_ < 2 || keep == 0 ||
+      keep > mtp_batch_tokens_ || !gdn_rollback_ready_) {
+    if (error != nullptr)
+      *error = "invalid MTP prefix rollback";
+    return false;
+  }
+  if (keep == mtp_batch_tokens_) {
+    mtp_batch_tokens_ = 0;
+    return true;
+  }
+  const auto& c = model_->config();
+  const auto conv_bytes =
+      std::size_t(c.ssm_conv_kernel - 1) * c.SsmConvChannels() * sizeof(float);
+  const auto slot = keep - 1;
+  try {
+    for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+      if (!c.IsLinearLayer(layer))
+        continue;
+      const auto& saved = gdn_saved_[layer];
+      fn::RollbackRows state_snaps{};
+      for (int row = 0; row < 7; ++row)
+        state_snaps.rows[row] = saved.state[row];
+      fn::RestoreGdnState(state_[layer].recurrent, state_snaps, keep,
+                          c.ssm_num_k_heads, c.ssm_num_v_heads, stream_);
+      Check(hipMemcpyAsync(state_[layer].conv, saved.conv[slot], conv_bytes,
+                           hipMemcpyDeviceToDevice, stream_),
+            "mtp conv rollback");
+    }
+    Check(hipMemcpyAsync(h_carry_, h_rows_ + std::size_t(slot) * c.hidden_size,
+                         c.hidden_size * sizeof(float), hipMemcpyDeviceToDevice,
+                         stream_),
+          "mtp hidden rollback");
+    position_ = position_ - mtp_batch_tokens_ + keep;
+    kv_high_water_ = position_;
+    mtp_batch_tokens_ = 0;
+    return true;
+  } catch (const std::exception& e) {
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
+void Session::RewindMtp(std::uint32_t position) noexcept {
+  mtp_position_ = position;
+  mtp_chain_ = false;
+}
+
+void Session::SaveMtpCarry() {
+  if (!mtp_enabled_)
+    return;
+  const auto bytes = model_->config().hidden_size * sizeof(float);
+  Check(hipMemcpyAsync(h_carry_saved_, h_carry_, bytes, hipMemcpyDeviceToDevice,
+                       stream_),
+        "save mtp carry");
+}
+
+void Session::RestoreMtpCarry() {
+  if (!mtp_enabled_)
+    return;
+  const auto bytes = model_->config().hidden_size * sizeof(float);
+  Check(hipMemcpyAsync(h_carry_, h_carry_saved_, bytes, hipMemcpyDeviceToDevice,
+                       stream_),
+        "restore mtp carry");
 }
 
 }  // namespace gufo::models::ornith15::rocm

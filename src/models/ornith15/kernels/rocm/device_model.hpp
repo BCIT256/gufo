@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,10 +22,13 @@ struct DeviceLayer {
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm;
   DeviceTensor router, ffn_gate_exps, ffn_up_exps, ffn_down_exps,
       shexp_gate_inp, shexp_gate, shexp_up, shexp_down;
+  // NextN block only. Empty on trunk layers.
+  DeviceTensor nextn_enorm, nextn_hnorm, nextn_eh_proj, nextn_shared_head_norm;
 };
 
-/// Trunk weights only, retaining their original GGUF encodings and F32
-/// norms/router. No narrowing, repacking, draft head or shared mutable state.
+/// Trunk weights, plus the bundled NextN block when the bind requested it.
+/// Encodings stay the GGUF originals. No narrowing, repacking, or shared
+/// mutable state. An autoregressive bind uploads the trunk alone.
 class DeviceModel {
 public:
   ~DeviceModel();
@@ -39,6 +43,8 @@ public:
   const DeviceTensor& output_norm() const noexcept { return output_norm_; }
   const DeviceTensor& output() const noexcept { return output_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
+  [[nodiscard]] bool has_mtp() const noexcept { return mtp_.has_value(); }
+  const DeviceLayer& mtp() const { return *mtp_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
 
 private:
@@ -46,6 +52,7 @@ private:
   Config config_;
   DeviceTensor token_embd_, output_norm_, output_;
   std::vector<DeviceLayer> layers_;
+  std::optional<DeviceLayer> mtp_;
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
 };

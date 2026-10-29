@@ -28,6 +28,15 @@ void DenseMatVecF32(core::GgmlType type, const void* weights, const float* x,
                     float* out, std::uint32_t rows, std::uint32_t cols,
                     hipStream_t stream);
 
+/// `dst[0] = carry`, `dst[t] = rows[t - 1]` for `t > 0`. Rows are `width`
+/// floats. Used to pair each MTP token with the previous trunk hidden.
+void ShiftHidden(const float* rows, const float* carry, float* dst,
+                 std::uint32_t n, std::uint32_t width, hipStream_t stream);
+
+/// `out[t] = concat(a[t], b[t])` along the hidden axis.
+void ConcatRows(const float* a, const float* b, float* out, std::uint32_t n,
+                std::uint32_t width, hipStream_t stream);
+
 }  // namespace gufo::models::ornith15::rocm
 
 #endif

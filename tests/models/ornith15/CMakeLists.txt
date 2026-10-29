@@ -16,6 +16,7 @@ add_ornith15_test(config "cpu")
 add_ornith15_test(weights "cpu")
 add_ornith15_test(artifact "cpu;external-model")
 add_ornith15_test(chat_template "cpu")
+add_ornith15_test(mtp_accept "cpu")
 add_ornith15_test(chat_tokens "cpu;external-model;tokenization")
 foreach(name IN ITEMS chat_template chat_tokens)
   target_compile_definitions(ornith15_${name}_test PRIVATE
@@ -42,4 +43,7 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_chunk "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu)
   set_tests_properties(ornith15.gpu_chunk PROPERTIES TIMEOUT 3600)
+  add_ornith15_test(gpu_mtp "gpu;hip;gfx1151;external-model"
+    gufo_ornith15_gpu)
+  set_tests_properties(ornith15.gpu_mtp PROPERTIES TIMEOUT 3600)
 endif()

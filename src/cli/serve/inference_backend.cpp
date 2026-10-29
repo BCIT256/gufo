@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -53,6 +54,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #endif
 
 namespace gufo::server {
@@ -3012,6 +3014,11 @@ public:
     staged_.reset();
     canonical_.reset();
   }
+  [[nodiscard]] std::vector<float>& draft_row() { return draft_row_; }
+  [[nodiscard]] std::vector<float>& verify_rows() { return verify_rows_; }
+  [[nodiscard]] std::vector<std::pair<float, std::uint32_t>>& rank() {
+    return rank_;
+  }
 
 private:
   std::unique_ptr<models::ornith15::rocm::Session> session_;
@@ -3022,6 +3029,9 @@ private:
   std::uint32_t position_{0};
   bool have_logits_{false};
   bool reset_failed_{false};
+  std::vector<float> draft_row_;
+  std::vector<float> verify_rows_;
+  std::vector<std::pair<float, std::uint32_t>> rank_;
 };
 
 Ornith15TextRunnerState& RequireOrnithState(TextRunnerState& state) {
@@ -3083,6 +3093,29 @@ public:
   std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged;
 };
 
+[[nodiscard]] std::int32_t ArgmaxToken(std::span<const float> logits) {
+  if (logits.empty()) {
+    throw std::runtime_error("logit distribution is empty");
+  }
+  std::size_t best = 0;
+  float best_value = -std::numeric_limits<float>::infinity();
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    const float value = logits[i];
+    if (!std::isfinite(value))
+      continue;
+    if (value > best_value) {
+      best = i;
+      best_value = value;
+    }
+  }
+  if (!std::isfinite(best_value) ||
+      best >
+          static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+    throw std::runtime_error("logit distribution contains no finite values");
+  }
+  return static_cast<std::int32_t>(best);
+}
+
 // One session per request. A host snapshot is the prefix cache; a miss
 // re-prefills from the start of the prompt.
 class Ornith15TextRunner final : public HipTextModelRunner {
@@ -3094,16 +3127,28 @@ public:
       std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
       std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
       std::string model_id, std::uint32_t max_context,
-      std::string artifact_fingerprint = {})
+      std::string artifact_fingerprint = {}, bool use_mtp = false,
+      std::uint32_t max_draft_tokens = 0)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
         model_id_(std::move(model_id)),
-        max_context_(max_context) {
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        max_draft_tokens_(max_draft_tokens) {
     std::string error;
     auto probe =
         models::ornith15::rocm::Session::Create(*model_, max_context_, &error);
     if (!probe) {
       throw std::runtime_error("Ornith session probe failed: " + error);
+    }
+    if (use_mtp_) {
+      if (max_draft_tokens_ == 0 || !model_->has_mtp()) {
+        throw std::invalid_argument(
+            "Ornith MTP requires the bundled NextN block and a draft limit");
+      }
+      if (!probe->EnableMtp(&error)) {
+        throw std::runtime_error("Ornith MTP session probe failed: " + error);
+      }
     }
     per_request_bytes_ = probe->resident_bytes();
     if (!artifact_fingerprint.empty()) {
@@ -3124,17 +3169,19 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .snapshot = !use_mtp_,
+                .fork = !use_mtp_,
                 .final_token_advance_required = true,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0,
-                .prefix_reuse = true,
+                // Snapshot v1 has no NextN cache. MTP refuses the prefix
+                // cache at load and does not publish a restorable frontier.
+                .prefix_reuse = !use_mtp_,
                 .in_pass_checkpoint = false,
-                .staged_snapshot = true,
-                .partial_prefill_retention = true,
+                .staged_snapshot = !use_mtp_,
+                .partial_prefill_retention = !use_mtp_,
                 .prefill_rollback = false,
                 .prefill_grid = kOrnithPrefillGrid,
             },
@@ -3251,7 +3298,15 @@ public:
     std::string error;
     auto session =
         models::ornith15::rocm::Session::Create(*model_, max_context_, &error);
-    if (!session || !session->SetCanonicalGrid(kOrnithPrefillGrid)) {
+    if (!session) {
+      throw std::runtime_error("Ornith session creation failed: " + error);
+    }
+    // Both calls require position 0. The NextN cache is allocated before
+    // the grid so a failed MTP session never becomes a trunk session.
+    if (use_mtp_ && !session->EnableMtp(&error)) {
+      throw std::runtime_error("Ornith MTP session failed: " + error);
+    }
+    if (!session->SetCanonicalGrid(kOrnithPrefillGrid)) {
       throw std::runtime_error("Ornith session creation failed: " + error);
     }
     return std::make_unique<Ornith15TextRunnerState>(
@@ -3358,6 +3413,38 @@ public:
     }
     ornith.set_position(ornith.session().Position());
     ornith.set_have_logits(true);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    // Autoregressive serving does not preview. MTP publishes the anchor
+    // before the prompt snapshot; DecodeStep samples that same draw.
+    if (!use_mtp_)
+      return std::nullopt;
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (!use_mtp_ || max_tokens <= 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed()) {
+      throw std::runtime_error("Ornith session reset failed");
+    }
+    if (ornith.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    const std::size_t room = max_context_ - ornith.position();
+    const std::size_t drafts = std::min<std::size_t>(
+        {max_draft_tokens_, max_tokens - 1, room - 1,
+         models::ornith15::rocm::Session::kMaxPrefillChunk - 1});
+    if (drafts == 0 || room < 2) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    return DecodeMtp(ornith, max_tokens, drafts, sampler);
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -3528,6 +3615,160 @@ public:
     restored.RememberCanonical(restored.session().StageSnapshot(&stage_error));
   }
 
+  // One MTP round. The anchor is always kept. Drafts are accepted against
+  // the trunk verification batch. A rejection restores the trunk and
+  // replays only the kept prefix; the draft already wrote the NextN cache.
+  [[nodiscard]] TextDecodeStep DecodeMtp(
+      Ornith15TextRunnerState& ornith, std::size_t /*max_tokens*/,
+      std::size_t drafts, sampling::SamplerState& sampler) const {
+    namespace qfn = models::qwen38_flash_next;
+    if (!ornith.have_logits() ||
+        ornith.logits().size() != model_->config().vocab_size) {
+      throw std::runtime_error("Ornith MTP decode has no logits");
+    }
+    const auto vocab = model_->config().vocab_size;
+    sampling::SamplerState working = sampler;
+    const auto anchor_id = working.Sample(ornith.logits());
+    if (anchor_id >
+        static_cast<sampling::TokenId>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("Ornith sampled token exceeds engine range");
+    }
+    const auto anchor = static_cast<std::int32_t>(anchor_id);
+    const auto is_stop = [&](std::int32_t token) {
+      return EndsTurn(ornith, *tokenizer_, token);
+    };
+    if (is_stop(anchor)) {
+      sampler.CopyDrawStateFrom(working);
+      return {.selections = {}, .stop = true};
+    }
+    const bool sampled = working.config().uses_random_sampling();
+    auto draft_rng = sampled ? sampling::NextRandom(working.mutable_rng_state())
+                             : std::uint64_t{0};
+    auto draft_sampler = working.WithoutConstraint();
+    draft_sampler.Accept(anchor_id);
+    std::vector<std::int32_t> chain;
+    chain.reserve(drafts + 1);
+    chain.push_back(anchor);
+    auto& draft_row = ornith.draft_row();
+    draft_row.resize(vocab);
+    std::string error;
+    // Draft one token on its own stream while a decode-dot step checks the
+    // token it was drafted from. Deeper drafts are almost never kept, and a
+    // short prefill batch costs more than the decode graph. Rejection stops
+    // the chain, so the trunk never applies a token it did not accept.
+    working.Accept(anchor_id);
+    bool stop = false;
+    std::optional<sampling::TokenId> correction;
+    std::size_t proposed = 0;
+    const auto base = ornith.session().Position();
+    const auto logits = ornith.logits();
+    auto overlapped = [&](std::int32_t token) {
+      if (!ornith.session().BeginDraft(token, &error)) {
+        FailOrnithSession(ornith, "Ornith MTP draft failed: " + error);
+      }
+      if (!ornith.session().VerifyDecode(token, logits, &error)) {
+        std::string ignored;
+        (void)ornith.session().FinishDraft(draft_row, &ignored);
+        FailOrnithSession(ornith, "Ornith MTP verify failed: " + error);
+      }
+      if (!ornith.session().FinishDraft(draft_row, &error)) {
+        FailOrnithSession(ornith, "Ornith MTP draft failed: " + error);
+      }
+    };
+    for (std::size_t drafted = 0; drafted < drafts && !stop; ++drafted) {
+      overlapped(chain.back());
+      std::int32_t proposal_token = 0;
+      std::optional<qfn::MtpProposal> proposal;
+      if (sampled) {
+        auto& rank = ornith.rank();
+        rank.resize(vocab);
+        for (std::uint32_t id = 0; id < vocab; ++id)
+          rank[id] = {draft_row[id], id};
+        const auto shortlist =
+            std::min<std::size_t>(vocab, qfn::kMtpCandidates);
+        std::partial_sort(rank.begin(),
+                          rank.begin() + static_cast<std::ptrdiff_t>(shortlist),
+                          rank.end(), [](const auto& left, const auto& right) {
+                            if (left.first != right.first)
+                              return left.first > right.first;
+                            return left.second < right.second;
+                          });
+        qfn::MtpCandidateLogits candidates;
+        candidates.size = shortlist;
+        for (std::size_t i = 0; i < shortlist; ++i) {
+          candidates.ids[i] = rank[i].second;
+          candidates.logits[i] = rank[i].first;
+          if (!std::isfinite(candidates.logits[i])) {
+            FailOrnithSession(ornith, "Ornith MTP draft logits are not finite");
+          }
+        }
+        proposal =
+            qfn::SampleMtpProposal(candidates, draft_sampler, &draft_rng);
+        proposal_token = static_cast<std::int32_t>(proposal->token);
+      } else {
+        proposal_token = ArgmaxToken(draft_row);
+      }
+      ++proposed;
+      if (sampled) {
+        const auto verified =
+            qfn::VerifyMtpProposal(logits, *proposal, working);
+        const auto token = static_cast<std::int32_t>(verified.token);
+        if (is_stop(token)) {
+          stop = true;
+          break;
+        }
+        if (!verified.accepted) {
+          correction = verified.token;
+          break;
+        }
+        working.Accept(verified.token);
+        draft_sampler.Accept(verified.token);
+      } else {
+        const auto decision =
+            qfn::VerifyDraft(logits, proposal_token, working, is_stop);
+        if (decision != qfn::DraftDecision::kAccept) {
+          stop = decision == qfn::DraftDecision::kStop;
+          break;
+        }
+      }
+      chain.push_back(proposal_token);
+    }
+    // The loop commits the token it drafts from. A chain that accepted every
+    // draft still has to commit the last one, and the NextN cache has to
+    // consume it before the next round.
+    if (chain.size() == drafts + 1)
+      overlapped(chain.back());
+    const auto keep = static_cast<std::uint32_t>(chain.size());
+    ornith.session().RewindMtp(base + keep);
+    for (float value : logits) {
+      if (!std::isfinite(value)) {
+        FailOrnithSession(ornith,
+                          "Ornith MTP verification logits are not finite");
+      }
+    }
+    if (correction)
+      working.DeferSample(*correction);
+    sampler.CopyDrawStateFrom(working);
+    if (ornith.session().Position() != base + keep) {
+      FailOrnithSession(ornith, "Ornith MTP position diverged");
+    }
+    ornith.set_position(ornith.session().Position());
+    ornith.set_have_logits(true);
+    TextDecodeStep step;
+    step.selections.reserve(keep);
+    for (std::uint32_t i = 0; i < keep; ++i) {
+      const auto token = static_cast<sampling::TokenId>(chain[i]);
+      step.selections.push_back({.stop = false,
+                                 .token = token,
+                                 .piece = tokenizer_->DecodeTokenCopy(token)});
+    }
+    step.draft_rounds = 1;
+    step.draft_tokens = proposed;
+    step.draft_accepted_tokens = static_cast<std::size_t>(keep - 1);
+    step.stop = stop;
+    return step;
+  }
+
   [[nodiscard]] bool RewindToCanonicalPrefix(
       TextRunnerState& state) const override {
     auto& ornith = RequireOrnithState(state);
@@ -3561,6 +3802,8 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::string model_id_;
   std::uint32_t max_context_;
+  bool use_mtp_{false};
+  std::uint32_t max_draft_tokens_{0};
   std::size_t per_request_bytes_{0};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
@@ -3871,8 +4114,35 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (architecture == "qwen35moe") {
-    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
-      SetError(error, "Ornith does not support --speculative");
+    const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        !mtp) {
+      SetError(error, "Ornith supports only --speculative mtp");
+      return false;
+    }
+    if (mtp && (speculative_config.max_draft_tokens == 0 ||
+                speculative_config.min_draft_tokens != 1 ||
+                speculative_config.min_draft_tokens >
+                    speculative_config.max_draft_tokens)) {
+      SetError(error,
+               "Ornith MTP requires --min-draft-tokens 1 and a positive "
+               "--draft-tokens limit");
+      return false;
+    }
+    if (mtp && !speculative_config.draft_model_path.empty()) {
+      std::error_code same_error;
+      const bool same_file = std::filesystem::equivalent(
+          speculative_config.draft_model_path, model_path, same_error);
+      if (same_error || !same_file) {
+        SetError(error,
+                 "Ornith MTP uses the bundled NextN block; omit --mtp-model "
+                 "or pass this same file");
+        return false;
+      }
+    }
+    if (mtp && (DiskCacheEnabled(resolved_disk_cache_config) ||
+                ram_cache_config.capacity_bytes > 0)) {
+      SetError(error, "Ornith MTP does not support the prefix cache");
       return false;
     }
     if (!vision_model_path.empty()) {
@@ -3907,8 +4177,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     Logger::Info("loader", "event=load_phase phase=ornith_weights " +
                                Logger::MemoryStatus());
-    auto weights =
-        models::ornith15::ModelWeights::Bind(*reader, {}, &load_error);
+    auto weights = models::ornith15::ModelWeights::Bind(
+        *reader, models::ornith15::BindOptions{.mtp = mtp}, &load_error);
     if (!weights) {
       SetError(error, "Failed to bind Ornith weights: " + load_error);
       return false;
@@ -3957,12 +4227,19 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       new_state->sampling_defaults.model = sampling::TextModelPreset::kOrnith15;
       new_state->sampling_defaults.supplied = {};
       new_state->supports_images = false;
+      if (mtp) {
+        Logger::Info("loader",
+                     "event=ornith_mtp draft_tokens=" +
+                         std::to_string(speculative_config.max_draft_tokens) +
+                         " cache=off");
+      }
       auto runner = std::make_shared<Ornith15TextRunner>(
           std::move(device),
           std::shared_ptr<const tokenization::QwenTokenizer>(
               std::move(tokenizer)),
           std::move(model_name), max_context,
-          resolved_disk_cache_config.model_artifact_fingerprint);
+          resolved_disk_cache_config.model_artifact_fingerprint, mtp,
+          mtp ? speculative_config.max_draft_tokens : 0);
       new_state->model_id = runner->Descriptor().model_id;
       new_state->max_context = max_context;
       std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

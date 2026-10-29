@@ -23,8 +23,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& weights,
   // remain linked, not copied. BindOptions{} leaves blk.40 untouched.
   auto model = std::unique_ptr<DeviceModel>(new DeviceModel);
   try {
-    if (weights.mtp || weights.layers.size() != weights.config.num_layers)
-      throw std::runtime_error("GPU AR upload requires a bound trunk only");
+    if (weights.layers.size() != weights.config.num_layers)
+      throw std::runtime_error("GPU upload requires one trunk layer per block");
+    if (weights.mtp && weights.mtp->linear)
+      throw std::runtime_error("the NextN block is a full-attention layer");
     if (qfn_mmq_init(0))
       throw std::runtime_error("HIP/MMQ initialization failed");
     model->config_ = weights.config;
@@ -66,7 +68,40 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(const ModelWeights& weights,
               {&w.shexp_gate_inp, &d.shexp_gate_inp},
               {&w.shexp_gate, &d.shexp_gate},
               {&w.shexp_up, &d.shexp_up},
-              {&w.shexp_down, &d.shexp_down}})
+              {&w.shexp_down, &d.shexp_down},
+              {&w.nextn_enorm, &d.nextn_enorm},
+              {&w.nextn_hnorm, &d.nextn_hnorm},
+              {&w.nextn_eh_proj, &d.nextn_eh_proj},
+              {&w.nextn_shared_head_norm, &d.nextn_shared_head_norm}})
+          if (!src->empty())
+            copy(*src, *dst);
+      }
+      if (weights.mtp) {
+        model->mtp_ = DeviceLayer{};
+        model->mtp_->linear = false;
+        const auto& w = *weights.mtp;
+        auto& d = *model->mtp_;
+        for (const auto& [src, dst] :
+             {std::pair{&w.attn_norm, &d.attn_norm},
+              {&w.post_attention_norm, &d.post_attention_norm},
+              {&w.attn_q, &d.attn_q},
+              {&w.attn_k, &d.attn_k},
+              {&w.attn_v, &d.attn_v},
+              {&w.attn_out, &d.attn_out},
+              {&w.attn_q_norm, &d.attn_q_norm},
+              {&w.attn_k_norm, &d.attn_k_norm},
+              {&w.router, &d.router},
+              {&w.ffn_gate_exps, &d.ffn_gate_exps},
+              {&w.ffn_up_exps, &d.ffn_up_exps},
+              {&w.ffn_down_exps, &d.ffn_down_exps},
+              {&w.shexp_gate_inp, &d.shexp_gate_inp},
+              {&w.shexp_gate, &d.shexp_gate},
+              {&w.shexp_up, &d.shexp_up},
+              {&w.shexp_down, &d.shexp_down},
+              {&w.nextn_enorm, &d.nextn_enorm},
+              {&w.nextn_hnorm, &d.nextn_hnorm},
+              {&w.nextn_eh_proj, &d.nextn_eh_proj},
+              {&w.nextn_shared_head_norm, &d.nextn_shared_head_norm}})
           if (!src->empty())
             copy(*src, *dst);
       }

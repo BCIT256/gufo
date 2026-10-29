@@ -103,6 +103,38 @@ __global__ void PackAlphaBetaKernel(const float* alpha, const float* beta,
   out[t * (2 * v) + v + h] = beta[i];
 }
 
+__global__ void ShiftHiddenKernel(const float* rows, const float* carry,
+                                  float* dst, std::uint32_t n,
+                                  std::uint32_t width) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t total = static_cast<std::size_t>(n) * width;
+  if (i >= total)
+    return;
+  const std::uint32_t t = static_cast<std::uint32_t>(i / width);
+  const std::uint32_t col =
+      static_cast<std::uint32_t>(i - std::size_t(t) * width);
+  const float* src =
+      t == 0 ? carry : rows + static_cast<std::size_t>(t - 1) * width;
+  dst[i] = src[col];
+}
+
+__global__ void ConcatRowsKernel(const float* a, const float* b, float* out,
+                                 std::uint32_t n, std::uint32_t width) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t stride = static_cast<std::size_t>(width) * 2;
+  const std::size_t total = static_cast<std::size_t>(n) * stride;
+  if (i >= total)
+    return;
+  const std::uint32_t t = static_cast<std::uint32_t>(i / stride);
+  const std::uint32_t col =
+      static_cast<std::uint32_t>(i - std::size_t(t) * stride);
+  const float* src = col < width ? a : b;
+  const std::uint32_t src_col = col < width ? col : col - width;
+  out[i] = src[static_cast<std::size_t>(t) * width + src_col];
+}
+
 }  // namespace
 
 void EmbedQ6(const void* table, std::uint32_t token, float* out,
@@ -145,6 +177,24 @@ void DenseMatVecF32(core::GgmlType type, const void* weights, const float* x,
     default:
       throw std::invalid_argument("unsupported F32-input dense weight format");
   }
+}
+
+void ShiftHidden(const float* rows, const float* carry, float* dst,
+                 std::uint32_t n, std::uint32_t width, hipStream_t stream) {
+  const auto count = static_cast<std::uint32_t>(std::size_t(n) * width);
+  if (count == 0)
+    return;
+  ShiftHiddenKernel<<<(count + 255) / 256, 256, 0, stream>>>(rows, carry, dst,
+                                                             n, width);
+}
+
+void ConcatRows(const float* a, const float* b, float* out, std::uint32_t n,
+                std::uint32_t width, hipStream_t stream) {
+  const auto count = static_cast<std::uint32_t>(std::size_t(n) * width * 2);
+  if (count == 0)
+    return;
+  ConcatRowsKernel<<<(count + 255) / 256, 256, 0, stream>>>(a, b, out, n,
+                                                            width);
 }
 
 }  // namespace gufo::models::ornith15::rocm

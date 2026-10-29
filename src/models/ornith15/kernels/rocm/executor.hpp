@@ -85,6 +85,49 @@ public:
   void SetChunkDependentReductionForTest(bool enable) {
     chunk_dependent_reduction_ = enable;
   }
+  /// Allocates the NextN cache. The model must have been uploaded with the
+  /// bundled block, and the session must still be at position 0. Autoregressive
+  /// sessions never call this.
+  [[nodiscard]] bool EnableMtp(std::string* error = nullptr);
+  [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
+  /// One MTP step at the draft frontier. `token` is the token just chosen;
+  /// the hidden paired with it is the trunk post-norm when the chain is cold
+  /// and the previous MTP head-norm when it is not. Writes draft logits.
+  [[nodiscard]] bool DraftToken(std::int32_t token, std::span<float> logits,
+                                std::string* error = nullptr);
+  /// Queues that step on a private stream and scratch so a trunk decode can
+  /// run beside it. FinishDraft downloads the logits. DraftToken is both.
+  [[nodiscard]] bool BeginDraft(std::int32_t token,
+                                std::string* error = nullptr);
+  [[nodiscard]] bool FinishDraft(std::span<float> logits,
+                                 std::string* error = nullptr);
+  /// Trunk forward of a decode-time verification batch. Not grid-aligned.
+  /// Does not write the NextN cache (the draft already did). Updates the
+  /// carried trunk hidden from the last token. A batch of 2 to 8 tokens
+  /// also stores DeltaNet prefixes for RollbackMtpBatch.
+  [[nodiscard]] bool VerifyForward(std::span<const std::int32_t> tokens,
+                                   std::span<float> all_logits,
+                                   std::string* error = nullptr);
+  /// One decode-dot trunk step. Same numerics as Step, including its captured
+  /// graph. Refreshes the carried trunk hidden and does not run NextN.
+  [[nodiscard]] bool VerifyDecode(std::int32_t token, std::span<float> logits,
+                                  std::string* error = nullptr);
+  /// DeltaNet prefixes are available for a rejected batch of at most 8 tokens.
+  [[nodiscard]] bool mtp_prefix_rollback() const noexcept {
+    return gdn_rollback_ready_;
+  }
+  /// Restores DeltaNet, the convolution window, and the carried trunk hidden
+  /// to the first `keep` tokens of the verification batch just run. KV above
+  /// the rewound position is left in place and is not read.
+  [[nodiscard]] bool RollbackMtpBatch(std::uint32_t keep,
+                                      std::string* error = nullptr);
+  /// Drops speculative NextN positions above `position` and the draft chain.
+  /// Trunk state is unchanged. `position` is the trunk length to keep.
+  void RewindMtp(std::uint32_t position) noexcept;
+  /// Device copy of the carried trunk hidden, so a rejected batch can replay
+  /// from the same seed the draft used.
+  void SaveMtpCarry();
+  void RestoreMtpCarry();
   [[nodiscard]] bool Reset(std::string* error = nullptr);
   std::uint32_t Position() const noexcept { return position_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
@@ -140,6 +183,19 @@ public:
       std::size_t* offset, std::size_t* bytes);
 
 private:
+  struct State {
+    float* conv{nullptr};
+    float* recurrent{nullptr};
+    __half* k{nullptr};
+    __half* v{nullptr};
+  };
+  // Per-prefix DeltaNet images for a verification batch of at most 8 tokens.
+  // Row t is the state after token t. Only linear layers are allocated.
+  struct GdnRollback {
+    float* state[7]{};
+    float* conv[7]{};
+  };
+
   Session() = default;
   void Dense(const DeviceTensor& w, const float* x, float* out);
   void Project(const DeviceTensor& w, const float* x, float* out,
@@ -150,14 +206,24 @@ private:
               float* out, std::uint32_t n_tokens, std::uint32_t used);
   void LinearAttention(const DeviceLayer& l, std::size_t layer,
                        std::uint32_t n);
-  void Attention(const DeviceLayer& l, std::size_t layer, std::uint32_t n);
+  void Attention(const DeviceLayer& l, State& state, std::uint32_t n);
+  /// Post-norm trunk rows into `h_rows_`, then one NextN launch. `token_ids_`
+  /// already holds the tokens. Requires `mtp_position_ == position_`.
+  void MtpConsume(std::uint32_t n);
+  void MtpRun(std::uint32_t n, std::uint32_t start_pos, const float* hidden,
+              bool write_head);
+  void CaptureTrunkHidden(std::uint32_t n);
   void Moe(const DeviceLayer& l, std::uint32_t n);
   void RunChunk(std::uint32_t n, LayerTrace* trace);
   void DecodeBody(LayerTrace* trace);
   void ProjectLastLogits(std::uint32_t n);
   void ProjectAllLogits(std::uint32_t n);
   void TryCapture();
+  void TryCaptureVerify(std::uint32_t n);
   void NoteGraphFailure();
+  /// Points the drafter at its private scratch, then swaps back. The decode
+  /// graph keeps the addresses it captured, so the two must not share them.
+  void SwapDraftScratch() noexcept;
   void EnsureLogitsBatch();
   void* Allocate(std::size_t bytes);
   float* Floats(std::size_t count);
@@ -172,6 +238,10 @@ private:
   hipStream_t stream_{nullptr};
   mutable hipStream_t copy_stream_{nullptr};
   hipGraphExec_t graph_exec_{nullptr};
+  // One captured trunk forward per verification width. Index 0 is unused.
+  hipGraphExec_t verify_graph_[9]{};
+  bool verify_warmed_[9]{};
+  bool verify_graph_failed_[9]{};
   std::uint32_t max_context_{0}, position_{0};
   std::uint32_t canonical_grid_{0};
   bool chunk_dependent_reduction_{false};
@@ -184,12 +254,6 @@ private:
   bool graph_noted_{false};
   std::size_t bytes_{0};
   std::vector<void*> allocations_;
-  struct State {
-    float* conv{nullptr};
-    float* recurrent{nullptr};
-    __half* k{nullptr};
-    __half* v{nullptr};
-  };
   std::vector<State> state_;
   // Scratch is sized for kMaxPrefillChunk. Decode uses the first row.
   std::int32_t* zero_ids_{nullptr};
@@ -209,6 +273,34 @@ private:
   std::int32_t* ids_{nullptr};
   void* argmax_scratch_{nullptr};
   std::int32_t* sampled_dev_{nullptr};
+  bool mtp_enabled_{false};
+  bool mtp_suspend_{false};
+  bool mtp_chain_{false};
+  bool gdn_rollback_ready_{false};
+  bool gdn_rollback_{false};
+  std::uint32_t mtp_position_{0};
+  std::uint32_t mtp_batch_tokens_{0};
+  std::vector<GdnRollback> gdn_saved_;
+  State mtp_state_{};
+  float *h_rows_{nullptr}, *h_in_{nullptr}, *h_carry_{nullptr},
+      *h_carry_saved_{nullptr}, *chain_h_{nullptr};
+  float *e_buf_{nullptr}, *e_norm_{nullptr}, *h_norm_{nullptr},
+      *concat_{nullptr};
+  // Private n=1 scratch. The decode graph owns the shared buffers above.
+  hipStream_t mtp_stream_{nullptr};
+  bool mtp_draft_inflight_{false};
+  std::int32_t* mtp_token_{nullptr};
+  std::uint32_t* mtp_pos_{nullptr};
+  float *mtp_res_{nullptr}, *mtp_xn_{nullptr}, *mtp_block_{nullptr},
+      *mtp_logits_{nullptr}, *mtp_hidden_{nullptr};
+  float *mtp_qg_{nullptr}, *mtp_q_{nullptr}, *mtp_gate_{nullptr},
+      *mtp_k_{nullptr}, *mtp_v_{nullptr}, *mtp_ctx_{nullptr};
+  float *mtp_router_{nullptr}, *mtp_route_w_{nullptr};
+  std::int32_t* mtp_ids_{nullptr};
+  float *mtp_expert_gate_{nullptr}, *mtp_expert_up_{nullptr},
+      *mtp_expert_down_{nullptr}, *mtp_shared_gate_{nullptr},
+      *mtp_shared_up_{nullptr}, *mtp_shared_out_{nullptr},
+      *mtp_shared_inp_{nullptr};
 };
 
 }  // namespace gufo::models::ornith15::rocm
