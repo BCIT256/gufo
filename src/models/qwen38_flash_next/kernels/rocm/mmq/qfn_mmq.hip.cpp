@@ -10,6 +10,7 @@ namespace qfn_mmq {
 #include "mmid.hpp"
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
+static int g_explicit_contract = 0;
 static int prepare_decode_kernels();
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
@@ -38,6 +39,10 @@ extern "C" void qfn_mmq_set_routed_max_expert_rows(int rows) {
 
 extern "C" void qfn_mmq_set_routed_tile_cols(int cols) {
     g_routed_tile_cols = cols > 0 ? cols : 0;
+}
+
+extern "C" void qfn_mmq_set_explicit_contract(int enable) {
+    g_explicit_contract = enable ? 1 : 0;
 }
 
 extern "C" int qfn_mmq_routed_tile_cols_for_counts(
@@ -174,6 +179,7 @@ int qfn_mmq_dense_impl(
     const bool inline_sanitize =
         type == GGML_TYPE_Q8_0 && !use_stream_k;
     args.sanitize_output = inline_sanitize;
+    args.explicit_contract = g_explicit_contract != 0;
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
@@ -338,6 +344,7 @@ int qfn_mmq_moe_impl(
             ? (int64_t)g_routed_max_expert_rows
             : 0;
     args.mmq_x_request = g_routed_tile_cols;
+    args.explicit_contract = g_explicit_contract != 0;
 
     mul_mat_q_case<type>(*ctx, args, stream);
     if (W_b) {

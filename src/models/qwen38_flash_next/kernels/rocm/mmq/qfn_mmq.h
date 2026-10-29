@@ -13,6 +13,11 @@ void qfn_mmq_set_routed_max_expert_rows(int rows);
 
 void qfn_mmq_set_routed_tile_cols(int cols);
 
+// Q6_K and Q5_K WMMA dots use a fixed product order so a row's result does not
+// depend on its tile column or the batch width. Zero keeps the historic
+// contraction. Cleared by the caller before return.
+void qfn_mmq_set_explicit_contract(int enable);
+
 int qfn_mmq_routed_tile_cols_for_counts(const unsigned int *counts,
                                         int n_experts);
 

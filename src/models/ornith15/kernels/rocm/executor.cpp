@@ -343,6 +343,24 @@ void Session::Quantized(const DeviceTensor& w, const float* x,
     throw std::runtime_error("quantized projection failed");
 }
 
+// Q6_K and Q5_K otherwise pair a four-factor product differently on
+// adjacent tile columns, so a token's result depended on how many rows
+// the call had placed ahead of it. The explicit order does not. Cleared
+// on return. Decode stays on the vector dots and does not set this.
+struct ExplicitContract {
+  bool armed = false;
+  explicit ExplicitContract(bool enable) : armed(enable) {
+    if (armed)
+      qfn_mmq_set_explicit_contract(1);
+  }
+  ~ExplicitContract() {
+    if (armed)
+      qfn_mmq_set_explicit_contract(0);
+  }
+  ExplicitContract(const ExplicitContract&) = delete;
+  ExplicitContract& operator=(const ExplicitContract&) = delete;
+};
+
 // Routed prefill only. Width 48 beat the default 80-column tile at 20,
 // 261 and 2048 tokens on gfx1151. The column grid is capped at the
 // token count passed in: gate and up pass the chunk, so tiles past that
@@ -376,6 +394,7 @@ void Session::MoeRaw(const DeviceTensor& w, const float* x,
   const int n = static_cast<int>(n_tokens);
   const int experts = static_cast<int>(w.experts);
   const int slots = static_cast<int>(used);
+  const ExplicitContract contract(!chunk_dependent_reduction_);
   const RoutedTileHint tile(n, experts, slots);
   int rc = -1;
   switch (w.type) {
@@ -698,10 +717,11 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
     std::uint32_t done = 0;
     while (done < n) {
       std::uint32_t count = std::min(chunk_tokens, n - done);
-      if (canonical_grid_ != 0) {
-        const std::uint32_t room =
-            canonical_grid_ - (position_ % canonical_grid_);
-        count = std::min(count, room);
+      if (canonical_grid_ != 0 && count > canonical_grid_) {
+        // Whole cells are one launch. The short final cell stays its own
+        // launch: length 1 uses the decode dots, and a 2–15 cell uses the
+        // same convolution and attention entry a lone cell uses.
+        count -= count % canonical_grid_;
       }
       const bool last = done + count == n;
       Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),

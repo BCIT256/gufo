@@ -1052,6 +1052,15 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_dp4a(
     }
 }
 
+// -ffast-math reassociates an unrolled FMA chain differently for each tile
+// width. A volatile asm is required: without it the move is deleted and a
+// wide tile diverges. Callers issue every column's FMA first, then hold, so
+// the barrier does not sit between those independent columns.
+static __device__ __forceinline__ float mmq_hold(float v) {
+    asm volatile("" : "+v"(v));
+    return v;
+}
+
 template <int mmq_x, int mmq_y, mmq_q8_1_ds_layout ds_layout>
 static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -1236,7 +1245,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_dp4a(
     }
 }
 
-template <int mmq_x, int mmq_y>
+template <int mmq_x, int mmq_y, bool explicit_contract = false>
 static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1293,8 +1302,34 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     float2 dmA = __half22float2(x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + k0/QI8_1]);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    if constexpr (explicit_contract) {
+                        // One rounding per factor. The fast product below
+                        // pairs differently on adjacent tile columns, and an
+                        // unrolled wider tile reassociates the chain again.
+                        const int acc_i = ((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l;
+                        float acc = sum[acc_i];
+                        acc = __fmaf_rn(__fmul_rn(dmA.x, dsB.x), float(C.x[l]), acc);
+                        acc = __fadd_rn(acc, __fmul_rn(dmA.y, dsB.y));
+                        sum[acc_i] = acc;
+                    } else {
+                        sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
+                        sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    }
+                }
+            }
+        }
+        if constexpr (explicit_contract) {
+            // After every column in this K step, so the holds do not order
+            // those FMAs against each other.
+#pragma unroll
+            for (int j0 = cgroup*ntx*tile_C::J; j0 < mmq_x; j0 += j_stride) {
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int acc_i = ((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l;
+                        sum[acc_i] = mmq_hold(sum[acc_i]);
+                    }
                 }
             }
         }
@@ -2351,7 +2386,7 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_dp4a(
     }
 }
 
-template <int mmq_x, int mmq_y>
+template <int mmq_x, int mmq_y, bool explicit_contract = false>
 static __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -2409,7 +2444,32 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
                     const int8_t * sc = (const int8_t *) (x_sc + i*MMQ_MMA_TILE_X_K_Q6_K + k00/16);
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*MMQ_MMA_TILE_X_K_Q6_K] * dB;
+                    if constexpr (explicit_contract) {
+                        // One rounding per factor, left to right. The fast
+                        // product below pairs differently on adjacent columns,
+                        // and an unrolled wider tile reassociates it again.
+                        const int acc_i = ((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l;
+                        const float term = __fmul_rn(
+                            __fmul_rn(float(C.x[l]), float(sc[k01/4])),
+                            x_df[i*MMQ_MMA_TILE_X_K_Q6_K]);
+                        float acc = __fmaf_rn(term, dB, sum[acc_i]);
+                        sum[acc_i] = acc;
+                    } else {
+                        sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*MMQ_MMA_TILE_X_K_Q6_K] * dB;
+                    }
+                }
+            }
+        }
+        if constexpr (explicit_contract) {
+#pragma unroll
+            for (int j0 = cgroup*ntx*tile_C::J; j0 < mmq_x; j0 += j_stride) {
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        const int acc_i = ((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l;
+                        sum[acc_i] = mmq_hold(sum[acc_i]);
+                    }
                 }
             }
         }
@@ -3398,7 +3458,8 @@ template <
     bool need_check,
     bool fixup,
     bool sanitize_output,
-    bool iq2_raw_stride16 = false>
+    bool iq2_raw_stride16 = false,
+    bool explicit_contract = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3420,7 +3481,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+    // The historic function pointer stays the default instantiation. Q6_K and
+    // Q5_K opt into a column-independent product only when asked.
+    constexpr vec_dot_mmq_t    vec_dot    = []() -> vec_dot_mmq_t {
+        if constexpr (explicit_contract && type == GGML_TYPE_Q6_K) {
+            return vec_dot_q6_K_q8_1_mma<mmq_x, mmq_y, true>;
+        } else if constexpr (explicit_contract && type == GGML_TYPE_Q5_K) {
+            return vec_dot_q8_1_q8_1_mma<mmq_x, mmq_y, true>;
+        } else {
+            return mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+        }
+    }();
     constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check, sanitize_output>;
 #else
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
@@ -3507,7 +3578,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check, bool sanitize_output, bool iq2_raw_stride16 = false>
+template <ggml_type type, int mmq_x, bool need_check, bool sanitize_output, bool iq2_raw_stride16 = false, bool explicit_contract = false>
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_hip_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
@@ -3626,7 +3697,7 @@ static __global__ void mul_mat_q(
             const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
             constexpr bool fixup = false;
-            mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
+            mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16, explicit_contract>
                 (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
                  tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
                  epilogue_gate ? epilogue_gate + offset_dst : nullptr,
@@ -3718,7 +3789,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16, explicit_contract>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
              epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -3789,7 +3860,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16, explicit_contract>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
          epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -3973,6 +4044,9 @@ struct mmq_args {
     // rows and an 80-column tile spends most of its matrix-core issue on
     // padding. Zero keeps the default rule. See qfn_mmq_set_routed_tile_cols.
     int mmq_x_request;
+    // Q6_K / Q5_K only. Selects the column-independent product. Other types
+    // ignore it. Zero keeps their historic contraction.
+    bool explicit_contract = false;
 };
 
 template<ggml_type type>
@@ -3995,8 +4069,15 @@ static size_t mmq_get_nbytes_shared(
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
-template <ggml_type type, int mmq_x>
+template <ggml_type type, int mmq_x, bool explicit_contract = false>
 static void launch_mul_mat_q(ggml_backend_hip_context & ctx, const mmq_args & args, hipStream_t stream) {
+    if constexpr (!explicit_contract) {
+        if (args.explicit_contract &&
+            (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K)) {
+            launch_mul_mat_q<type, mmq_x, true>(ctx, args, stream);
+            return;
+        }
+    }
     const int id = ggml_hip_get_device();
     const int cc = ggml_hip_info().devices[id].cc;
     const int nsm = ggml_hip_info().devices[id].nsm;
@@ -4014,6 +4095,10 @@ static void launch_mul_mat_q(ggml_backend_hip_context & ctx, const mmq_args & ar
     if constexpr (type == GGML_TYPE_Q8_0) {
         HIP_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true>), nbytes_shared);
         HIP_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true>), nbytes_shared);
+    }
+    if constexpr (explicit_contract) {
+        HIP_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false, false, true>), nbytes_shared);
+        HIP_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false, false, true>), nbytes_shared);
     }
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
@@ -4078,7 +4163,7 @@ static void launch_mul_mat_q(ggml_backend_hip_context & ctx, const mmq_args & ar
             constexpr bool sanitize_output = decltype(sanitize_tag)::value;
             if (args.nrows_x % mmq_y == 0) {
                 constexpr bool need_check = false;
-                mul_mat_q<type, mmq_x, need_check, sanitize_output>
+                mul_mat_q<type, mmq_x, need_check, sanitize_output, false, explicit_contract>
                     <<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>(
                         args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x,
@@ -4091,7 +4176,7 @@ static void launch_mul_mat_q(ggml_backend_hip_context & ctx, const mmq_args & ar
                         args.epilogue_clamp);
             } else {
                 constexpr bool need_check = true;
-                mul_mat_q<type, mmq_x, need_check, sanitize_output>
+                mul_mat_q<type, mmq_x, need_check, sanitize_output, false, explicit_contract>
                     <<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>(
                         args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
                         blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x,

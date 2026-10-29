@@ -62,11 +62,12 @@ public:
   /// returned. Conv, recurrent and KV state carry across chunks. Invalid
   /// arguments return false and leave state unchanged.
   ///
-  /// With a canonical grid, each cell starts at an absolute multiple of that
-  /// width and the call must already sit on a cell boundary. The last cell
-  /// of a call may be shorter. Cells of one call share a stream and sync
-  /// once at the end. A zero grid keeps the caller's chunk size and syncs
-  /// every chunk.
+  /// With a canonical grid, the call must already sit on a cell boundary.
+  /// Whole cells in the call are one launch. A short final cell is a second
+  /// launch on the same stream, and the call syncs once at the end. A zero
+  /// grid keeps the caller's chunk size and syncs every chunk. A token's
+  /// result follows the state at the start of its absolute cell, that cell's
+  /// tokens, and earlier KV.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
                              std::span<float> last_logits,
                              std::string* error = nullptr,
@@ -77,6 +78,12 @@ public:
   [[nodiscard]] bool SetCanonicalGrid(std::uint32_t grid);
   [[nodiscard]] std::uint32_t CanonicalGrid() const noexcept {
     return canonical_grid_;
+  }
+  /// Test hook. When set, batched Q6_K and Q5_K use the historic
+  /// column-dependent product, so a wide call no longer matches 16-token
+  /// cells. Production leaves this off. Not a runtime option.
+  void SetChunkDependentReductionForTest(bool enable) {
+    chunk_dependent_reduction_ = enable;
   }
   [[nodiscard]] bool Reset(std::string* error = nullptr);
   std::uint32_t Position() const noexcept { return position_; }
@@ -167,6 +174,7 @@ private:
   hipGraphExec_t graph_exec_{nullptr};
   std::uint32_t max_context_{0}, position_{0};
   std::uint32_t canonical_grid_{0};
+  bool chunk_dependent_reduction_{false};
   std::uint64_t lineage_{0};
   std::uint32_t kv_high_water_{0};
   bool last_restore_skipped_kv_{false};
