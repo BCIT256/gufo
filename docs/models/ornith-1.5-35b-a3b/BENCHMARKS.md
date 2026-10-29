@@ -2,6 +2,7 @@
 
 Historical P4/P4b evidence is retained below; the P4c section records the
 policy choice. The M1 section records the later prefill and decode rates.
+The M2 section records the same protocol on the release preset.
 
 October 23, 2026; gfx1151, pinned Nix RelWithDebInfo correctness build with
 assertions. These are informational measurements from eager single-token
@@ -94,3 +95,29 @@ Five Gufo-Ornith samples, in run order:
 | ---: | --- | --- |
 | 2048 | 750.5527, 717.5176, 715.8051, 716.3496, 717.2346 | 38.9878, 38.4167, 38.1848, 38.7807, 38.4011 |
 | 261 | 547.5602, 544.2966, 543.6358, 545.5704, 544.8397 | 42.1052, 41.1675, 40.1747, 40.6073, 40.3313 |
+
+## M2 release preset
+
+2026-10-28, gfx1151, same protocol as the M1 section: one session, context
+4096, prefill chunks of 512, median of five after one prefill plus 16 untimed
+device-argmax steps. `ornith15_bench` is the `release` preset: Nix
+RelWithDebInfo, assertions off (`NDEBUG`), glibc-isolated `build/release`.
+Power at the start: `AC0/online=1`, `BAT0/status=Charging`. The prompts and
+the builds differ from the gpu-test run and from Lemonade. Each row is that
+run's own measurement.
+
+| | Prompt tokens | pp tok/s | tg tok/s |
+| --- | ---: | ---: | ---: |
+| Gufo-Ornith release median | 2048 | 740.8327 | 41.8353 |
+| Gufo-Ornith gpu-test median | 2048 | 717.2346 | 38.4167 |
+| Lemonade, 2026-10-26 | 2033 | ~995 | ~35.4 |
+| Gufo-Ornith release median | 261 | 555.4992 | 44.3460 |
+| Gufo-Ornith gpu-test median | 261 | 544.8397 | 40.6073 |
+| Lemonade, 2026-10-26 | 261 | ~626 | ~38.7 |
+
+Five release samples, in run order:
+
+| Prompt tokens | pp tok/s | tg tok/s |
+| ---: | --- | --- |
+| 2048 | 766.1910, 745.4238, 740.8327, 732.2343, 730.5918 | 42.5953, 41.5434, 41.8353, 41.5521, 42.1505 |
+| 261 | 559.0735, 555.4992, 555.5898, 554.0824, 554.2501 | 44.5930, 44.7125, 44.2346, 44.3460, 44.3132 |
