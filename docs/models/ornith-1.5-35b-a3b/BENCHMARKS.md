@@ -2,7 +2,8 @@
 
 Historical P4/P4b evidence is retained below; the P4c section records the
 policy choice. The M1 section records the later prefill and decode rates.
-The M2 section records the same protocol on the release preset.
+The M2 section records the same protocol on the release preset. The functional
+section records the HTTP suite.
 
 October 23, 2026; gfx1151, pinned Nix RelWithDebInfo correctness build with
 assertions. These are informational measurements from eager single-token
@@ -121,3 +122,27 @@ Five release samples, in run order:
 | ---: | --- | --- |
 | 2048 | 766.1910, 745.4238, 740.8327, 732.2343, 730.5918 | 42.5953, 41.5434, 41.8353, 41.5521, 42.1505 |
 | 261 | 559.0735, 555.4992, 555.5898, 554.0824, 554.2501 | 44.5930, 44.7125, 44.2346, 44.3460, 44.3132 |
+
+## M2 functional suite
+
+2026-10-28, gfx1151, `ornith15-functional-v1` through `gufo serve llm` on the
+gpu-test binary. One session, context 8192, max 2048 new tokens, thinking on.
+Card sampling is temperature 0.6, top_p 0.95, top_k 20, seed 20261028. Greedy
+changes only the temperature to 0. All ten task runs passed. TTFT is
+`usage.gufo.ttft_ms`. Decode tok/s is `completion_tokens_per_second`. A task
+with several requests lists them in order. The streamed area task's client
+time to the first content or reasoning delta was 179.6 ms (card) and 187.8 ms
+(greedy).
+
+| Task | Sampling | TTFT ms | Decode tok/s |
+| --- | --- | --- | --- |
+| write_merge | card | 314.1 | 44.9519 |
+| fix_median | card | 438.4 | 43.4110 |
+| tool_round_trip | card | 587.0, 725.1, 814.8 | 40.1898, 41.1109, 41.9194 |
+| two_turn_clamp | card | 216.2, 406.0 | 43.2767, 45.0550 |
+| rectangle_area | card | 178.6 | 43.4831 |
+| write_merge | greedy | 301.7 | 44.0265 |
+| fix_median | greedy | 451.9 | 43.6082 |
+| tool_round_trip | greedy | 594.7, 732.8, 823.9 | 39.9973, 41.1557, 40.7600 |
+| two_turn_clamp | greedy | 212.2, 484.8 | 44.2586, 43.2330 |
+| rectangle_area | greedy | 187.0 | 44.7972 |
