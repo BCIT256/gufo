@@ -146,3 +146,64 @@ time to the first content or reasoning delta was 179.6 ms (card) and 187.8 ms
 | tool_round_trip | greedy | 594.7, 732.8, 823.9 | 39.9973, 41.1557, 40.7600 |
 | two_turn_clamp | greedy | 212.2, 484.8 | 44.2586, 43.2330 |
 | rectangle_area | greedy | 187.0 | 44.7972 |
+
+## M3 prefix cache
+
+2026-10-28, gfx1151, release preset `build/release/gufo`, one session, context
+16384. The replay is the committed `tool-agent-loop` prompt (read/edit of
+`calc0.py` and `calc1.py`, temperature 0, seed 41, thinking off, at most 192
+new tokens). Cache-off is the same prompts with `cache_prompt` false. Both
+files ended as `return a + b`. Tool name and arguments matched on every turn.
+Turns 1 and 3 differed in assistant prose around the same call; the logit gap
+is in QUALITY.md. Decode tok/s is `completion_tokens_per_second`. TTFT is
+`usage.gufo.ttft_ms`.
+
+| Turn | Prompt | Cached | Prefill | TTFT ms | Decode tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 on | 438 | 0 | 438 | 741.9 | 39.4 |
+| 0 off | 438 | 0 | 438 | 757.6 | 41.8 |
+| 1 on | 507 | 477 | 30 | 246.9 | 40.1 |
+| 1 off | 507 | 0 | 507 | 824.1 | 39.2 |
+| 2 on | 593 | 569 | 24 | 245.1 | 41.3 |
+| 2 off | 593 | 0 | 593 | 1157.3 | 43.3 |
+| 3 on | 648 | 618 | 30 | 253.1 | 43.6 |
+| 3 off | 648 | 0 | 648 | 1205.8 | 42.2 |
+| 4 on | 712 | 682 | 30 | 248.3 | 38.7 |
+| 4 off | 712 | 0 | 712 | 1301.1 | 36.6 |
+| 5 on | 798 | 774 | 24 | 275.8 | 40.1 |
+| 5 off | 798 | 0 | 798 | 1381.4 | 40.2 |
+| 6 on | 853 | 823 | 30 | 288.6 | 44.4 |
+| 6 off | 853 | 0 | 853 | 1419.2 | 42.3 |
+
+Lemonade was already running: llama-server b11580-4413a1924, same GGUF,
+context 32768, `--spec-type draft-mtp` (MTP on), `--parallel 1`, no
+`cache_prompt` flag. The replay omitted `cache_prompt`, and the responses
+reported a prompt cache. `prompt_ms` is llama's prefill time for `prompt_n`
+uncached tokens, not Gufo's TTFT. Decode tok/s is `predicted_n / predicted_ms`.
+
+| Turn | Prompt | Cached | Uncached | prompt_ms | Decode tok/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 438 | 0 | 438 | 620.0 | 46.5 |
+| 1 | 493 | 463 | 30 | 147.4 | 51.8 |
+| 2 | 579 | 555 | 24 | 147.3 | 45.5 |
+| 3 | 634 | 604 | 30 | 159.6 | 46.1 |
+| 4 | 689 | 659 | 30 | 227.3 | 48.5 |
+| 5 | 775 | 751 | 24 | 147.0 | 46.0 |
+| 6 | 830 | 800 | 30 | 178.9 | 38.8 |
+
+`ornith15-functional-v1` was scored again, unchanged, on this cached release
+server. All ten runs passed. Greedy repeats of a card prompt are full cache
+hits, so their TTFT is about 5 ms. Card TTFT is a cold prefill.
+
+| Task | Sampling | TTFT ms | Decode tok/s | Cached |
+| --- | --- | --- | ---: | ---: |
+| write_merge | card | 382.4 | 43.3 | 0 |
+| fix_median | card | 514.2 | 43.2 | 0 |
+| tool_round_trip | card | 661.7, 257.3, 214.9 | 38.6, 41.1, 40.8 | 0, 425, 502 |
+| two_turn_clamp | card | 288.4, 304.7 | 42.8, 41.9 | 0, 206 |
+| rectangle_area | card | 246.2 | 43.0 | 0 |
+| write_merge | greedy | 5.4 | 42.2 | 110 |
+| fix_median | greedy | 5.7 | 42.3 | 214 |
+| tool_round_trip | greedy | 6.5, 255.2, 214.9 | 39.7, 41.8, 39.6 | 351, 428, 505 |
+| two_turn_clamp | greedy | 5.1, 303.1 | 42.1, 41.6 | 50, 188 |
+| rectangle_area | greedy | 5.1 | 41.8 | 42 |

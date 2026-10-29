@@ -178,3 +178,14 @@ recurrent region. Restored full sequences passed M1 on every frontier.
 Payload bytes depend only on position: 66877504 at P=1, 67000384 at P=7,
 67205184 at P=17, and 67840064 at P=48. Each additional token adds 20480
 bytes, ten F16 K/V layers.
+
+The server reuses that payload. A temperature-0 tool turn whose cached
+frontier was built by prefill plus decode steps can pick a different first
+token than a cold prefill of the same prompt. On the 507-token turn below,
+the two leaders were `I` (id 40) and `<tool_call>` (id 248058). One 512-token
+prefill scored them 20.8312 and 20.4856 (gap 0.3456). The same prefill split
+at token 500, which is the server's stable-prefix cut, scored 20.8926 and
+20.7317 (gap 0.1609) and still chose `I`. Splitting that cold prefill at the
+cached position 477 chose `<tool_call>` by 0.2029. Prefill, 39 teacher-forced
+steps, then the suffix chose `<tool_call>` by 1.2751. Chunks of 64 stayed
+with the single 512-token prefill. Thresholds are unchanged.
