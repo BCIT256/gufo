@@ -3074,20 +3074,22 @@ public:
         position(position),
         staged(std::move(staged)) {}
 
-  /// The host payload is copied from `staged` in the background. Restores
-  /// read the device image; persistence waits for the copy.
+  /// The host payload is copied from `image` in the background, which then
+  /// frees the image; readers of the payload wait for the copy. A cache entry
+  /// holds host memory only, as the RAM cache accounts for it.
   Ornith15TextRunnerSnapshot(
       std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
-      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged)
+      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> image)
       : model(std::move(model)),
-        position(staged->position),
-        staged(std::move(staged)),
-        pending_bytes(this->staged->bytes),
-        pending(std::async(std::launch::async, [image = this->staged] {
+        position(image->position),
+        pending_bytes(image->bytes),
+        pending(std::async(std::launch::async, [image = std::move(
+                                                    image)]() mutable {
+                  const auto frozen = std::move(image);
                   std::vector<std::uint8_t> bytes;
                   std::string error;
-                  if (!models::ornith15::rocm::ExportStagedImage(*image, &bytes,
-                                                                 &error))
+                  if (!models::ornith15::rocm::ExportStagedImage(
+                          *frozen, &bytes, &error))
                     throw std::runtime_error("Ornith staged export failed: " +
                                              error);
                   return bytes;
@@ -3447,9 +3449,13 @@ public:
     }
     // The host copy runs in the background; the first token does not wait.
     const auto started = std::chrono::steady_clock::now();
-    ornith.RememberCanonical(image);
-    *checkpoint =
-        std::make_unique<Ornith15TextRunnerSnapshot>(model_, std::move(image));
+    if (image) {
+      ornith.RememberCanonical(image);
+      *checkpoint = std::make_unique<Ornith15TextRunnerSnapshot>(
+          model_, std::move(image));
+    } else {
+      checkpoint->reset();
+    }
     const double capture_ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - started)
                                   .count();
@@ -3592,8 +3598,10 @@ public:
           payload.empty()) {
         throw std::runtime_error("Ornith staged snapshot failed: " + error);
       }
+      // The session keeps the image as its rewind frontier; the cache
+      // entry holds the host payload only.
       return std::make_unique<Ornith15TextRunnerSnapshot>(
-          model_, std::move(payload), position, std::move(image));
+          model_, std::move(payload), position);
     }
     if (!ornith.session().SaveSnapshot(&payload, &error) ||
         payload.size() != ornith.session().SnapshotPayloadBytes()) {

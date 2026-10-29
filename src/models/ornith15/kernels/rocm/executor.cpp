@@ -939,8 +939,15 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
       *error = "in-pass snapshot layout diverged";
     return false;
   }
+  // The image is optional: without device memory for it, prefill the same
+  // tokens and report no checkpoint.
+  if (hipMalloc(&image->device, image->bytes) != hipSuccess) {
+    (void)hipGetLastError();
+    image->device = nullptr;
+    staged->reset();
+    return Prefill(tokens, last_logits, error);
+  }
   try {
-    Check(hipMalloc(&image->device, image->bytes), "in-pass image");
     Check(hipEventCreateWithFlags(&image->ready, hipEventDisableTiming),
           "in-pass event");
     Check(hipMemcpyAsync(image->device, image->header_bytes, sizeof(header),

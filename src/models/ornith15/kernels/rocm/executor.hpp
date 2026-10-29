@@ -86,6 +86,8 @@ public:
   /// that stopped there. Requires a grid session without MTP and
   /// Position() < boundary < Position() + tokens.size() <= Position() +
   /// kMaxPrefillChunk. The live session continues to the end of `tokens`.
+  /// When no device memory is left for the image, the prefill still runs and
+  /// `*staged` is null.
   [[nodiscard]] bool PrefillThrough(std::span<const std::int32_t> tokens,
                                     std::span<float> last_logits,
                                     std::uint32_t boundary,
