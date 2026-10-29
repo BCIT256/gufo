@@ -196,7 +196,15 @@ multiple of 16. The direct session API leaves the grid off, so
 Checkpoints are stored only at a grid boundary that prefill produced.
 Decode steps and a short final cell are not reused; the next turn
 re-prefills them. A cached suffix therefore runs the same cells as a cold
-prefill of the same prompt.
+prefill of the same prompt. Whole cells inside one call are a single
+launch. `ornith15.gpu_chunk` checks that launch against 16-token cells
+and against grid-aligned splits (32+rest, 400+112, 16+middle+tail) on
+both capture sets and one agent prefix. Logits and boundary snapshots
+matched. A test-only column-dependent Q6_K/Q5_K product made the wide
+call diverge. Oracle `^(ornith15|qwen38_flash_next)\.` on that tree was
+32/32, including `gpu_chunk`. Held-out `gpu_decode` and `gpu_snapshot`
+passed. Thresholds were not changed. Flash-Next leaves the explicit
+product off, and its tests in that oracle run passed.
 
 `ornith15.gpu_grid` checks that schedule on each capture, repeated to 128
 tokens, and on a 128-token prefix of a rendered tool-agent chat. A cold
@@ -226,6 +234,13 @@ and 20.4856 (gap 0.3456). The same prefill split at token 500 scored
 cached position 477 chose `<tool_call>` by 0.2029. Prefill, 39
 teacher-forced steps, then the suffix chose `<tool_call>` by 1.2751.
 Chunks of 64 stayed with the single 512-token prefill.
+
+The wide-cell release binary was scored again with `--suite cache`.
+`legacy-tool-cancel`, `legacy-tool-cancel-disk`, `thinking-tool-cancel`,
+`thinking-tool-cancel-disk`, `disk-spacing` and `disk-spacing-disk`
+passed their own reports. `text-cancel` failed the same way (cached 160,
+prefill 26). The runner's shared-boundary check still fails with
+`stored_tokens` [2432, 6272], the same summary as the 16-cell run.
 
 The width-48 routed prefill tile was scored with those same ratios.
 Oracle `ctest` of `^(ornith15|qwen38_flash_next)\.` was 30/30, including
