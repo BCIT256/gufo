@@ -331,7 +331,7 @@ void Session::Dense(const DeviceTensor& w, const float* x, float* out) {
 
 void Session::Project(const DeviceTensor& w, const float* x, float* out,
                       std::uint32_t n) {
-  if (n == 1) {
+  if (n == 1 && !grid_rows_) {
     Dense(w, x, out);
     return;
   }
@@ -456,7 +456,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
   const auto& c = model_->config();
   Project(l.ssm_qkv, xn_, qkv_, n);
   Project(l.ssm_gate, xn_, z_, n);
-  if (n == 1) {
+  if (n == 1 && !grid_rows_) {
     Dense(l.ssm_alpha, xn_, ab_);
     Dense(l.ssm_beta, xn_, ab_ + c.ssm_num_v_heads);
   } else {
@@ -464,7 +464,16 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
     Project(l.ssm_beta, xn_, beta_, n);
     PackAlphaBeta(alpha_, beta_, ab_, n, c.ssm_num_v_heads, stream_);
   }
-  (void)layer;
+  // PrefillThrough: freeze this layer's conv history and recurrent state at
+  // the boundary token inside the same launch.
+  fn::GdnCheckpoint checkpoint{};
+  if (in_pass_.base != nullptr && layer < in_pass_.conv.size()) {
+    checkpoint.state =
+        reinterpret_cast<float*>(in_pass_.base + in_pass_.recurrent[layer]);
+    checkpoint.history =
+        reinterpret_cast<float*>(in_pass_.base + in_pass_.conv[layer]);
+    checkpoint.tokens = in_pass_.tokens;
+  }
   auto& state = state_[layer];
   fn::RollbackRows state_snaps{};
   fn::RollbackRows conv_snaps{};
@@ -480,7 +489,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
       l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), state.conv, conv_, qn_,
       kn_, raw_, state.recurrent, gdn_out_, nullptr, state_snaps, conv_snaps, n,
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
-      false, false, c.rms_eps, stream_, nullptr, {}, 0, nullptr,
+      false, false, c.rms_eps, stream_, nullptr, checkpoint, 0, nullptr,
       fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
   Project(l.ssm_out, gdn_out_, block_out_, n);
 }
@@ -506,7 +515,7 @@ void Session::Attention(const DeviceLayer& l, State& state, std::uint32_t n) {
                 device_pos_, c.num_heads, c.num_kv_heads, c.head_dim, 1,
                 stream_);
   fn::SigmoidMul(ctx_, gate_, std::size_t(n) * c.AttentionQDim(), stream_);
-  if (n == 1) {
+  if (n == 1 && !grid_rows_) {
     // Keep this input in F32: quantizing both V and the gated context can
     // amplify activation rounding through the attention value path. This dot
     // reads the original packed weights once, without a residual pass.
@@ -522,7 +531,7 @@ void Session::Moe(const DeviceLayer& l, std::uint32_t n) {
   Project(l.router, xn_, router_, n);
   fn::RouterTopK(router_, c.num_experts, ids_, route_weights_, n, c.num_experts,
                  c.num_experts_used, stream_);
-  if (n == 1) {
+  if (n == 1 && !grid_rows_) {
     Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, 1, c.num_experts_used);
     Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, 1, c.num_experts_used);
   } else {
@@ -531,7 +540,7 @@ void Session::Moe(const DeviceLayer& l, std::uint32_t n) {
   }
   fn::Swiglu(expert_gate_, expert_up_,
              std::size_t(n) * c.num_experts_used * c.expert_ff, stream_);
-  if (n == 1) {
+  if (n == 1 && !grid_rows_) {
     Quantized(l.ffn_down_exps, expert_gate_, ids_, expert_down_,
               c.num_experts_used, 1);
   } else {
@@ -783,14 +792,24 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
           "logits size)";
     return false;
   }
+  // On the grid, one-token launches take the batched kernels rather than the
+  // decode dots, so a lone final token matches its row in a wider launch.
+  const bool saved_grid_rows = grid_rows_;
+  grid_rows_ = canonical_grid_ != 0 && !lone_token_decode_dots_;
+  struct RestoreGridRows {
+    bool& flag;
+    bool value;
+    ~RestoreGridRows() { flag = value; }
+  } restore_grid_rows{grid_rows_, saved_grid_rows};
   try {
     std::uint32_t done = 0;
     while (done < n) {
       std::uint32_t count = std::min(chunk_tokens, n - done);
-      if (canonical_grid_ != 0 && count > canonical_grid_) {
-        // Whole cells are one launch. The short final cell stays its own
-        // launch: length 1 uses the decode dots, and a 2–15 cell uses the
-        // same convolution and attention entry a lone cell uses.
+      if (canonical_grid_ != 0 && count > canonical_grid_ && done + count < n) {
+        // A chunk that does not finish the call ends on a cell boundary. The
+        // final chunk keeps its short cell: every launch, a lone 1–15 token
+        // cell included, runs the batched kernels, so that cell matches the
+        // same tokens at the end of a wider launch without a second pass.
         count -= count % canonical_grid_;
       }
       const bool last = done + count == n;
@@ -855,9 +874,121 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
 }
 
 std::size_t Session::SnapshotPayloadBytes() const noexcept {
+  return SnapshotPayloadBytes(position_);
+}
+
+std::size_t Session::SnapshotPayloadBytes(
+    std::uint32_t position) const noexcept {
   if (model_ == nullptr)
     return 0;
-  return PayloadBytes(MakeHeader(model_->config(), position_, max_context_));
+  return PayloadBytes(MakeHeader(model_->config(), position, max_context_));
+}
+
+bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
+                             std::span<float> last_logits,
+                             std::uint32_t boundary,
+                             std::shared_ptr<StagedSnapshot>* staged,
+                             std::string* error) {
+  if (model_ == nullptr || staged == nullptr || failed_ ||
+      canonical_grid_ == 0 || mtp_enabled_ || boundary <= position_ ||
+      tokens.size() > kMaxPrefillChunk ||
+      std::uint64_t{boundary} >= std::uint64_t{position_} + tokens.size()) {
+    if (error != nullptr)
+      *error = "invalid in-pass checkpoint (grid, MTP, boundary or width)";
+    return false;
+  }
+  const auto& c = model_->config();
+  const SnapshotHeader header = MakeHeader(c, boundary, max_context_);
+  if (!HeaderMatches(header, c, max_context_)) {
+    if (error != nullptr)
+      *error = "session configuration cannot be snapshotted";
+    return false;
+  }
+  const std::uint32_t start = position_;
+  auto image = std::make_shared<StagedSnapshot>();
+  image->position = boundary;
+  image->lineage = lineage_;
+  image->bytes = PayloadBytes(header);
+  std::memcpy(image->header_bytes, &header, sizeof(header));
+  // Offsets follow TransferPayload at `boundary`.
+  const std::size_t conv_bytes = std::size_t(ConvFloats(c)) * sizeof(float);
+  const std::size_t recurrent_bytes =
+      std::size_t(RecurrentFloats(c)) * sizeof(float);
+  const std::size_t kv_bytes =
+      std::size_t(boundary) * c.AttentionKvDim() * sizeof(__half);
+  InPassImage layout;
+  layout.conv.assign(c.num_layers, 0);
+  layout.recurrent.assign(c.num_layers, 0);
+  std::vector<std::pair<std::size_t, std::uint32_t>> kv;  // offset, layer
+  std::size_t offset = sizeof(SnapshotHeader);
+  for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+    if (c.IsLinearLayer(layer)) {
+      layout.conv[layer] = offset;
+      offset += conv_bytes;
+      layout.recurrent[layer] = offset;
+      offset += recurrent_bytes;
+    } else {
+      kv.emplace_back(offset, layer);
+      offset += 2 * kv_bytes;
+    }
+  }
+  const std::size_t logit_offset = offset;
+  if (logit_offset + std::size_t(c.vocab_size) * sizeof(float) !=
+      image->bytes) {
+    if (error != nullptr)
+      *error = "in-pass snapshot layout diverged";
+    return false;
+  }
+  try {
+    Check(hipMalloc(&image->device, image->bytes), "in-pass image");
+    Check(hipEventCreateWithFlags(&image->ready, hipEventDisableTiming),
+          "in-pass event");
+    Check(hipMemcpyAsync(image->device, image->header_bytes, sizeof(header),
+                         hipMemcpyHostToDevice, stream_),
+          "in-pass header");
+  } catch (const std::exception& e) {
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  layout.base = static_cast<std::uint8_t*>(image->device);
+  layout.tokens = boundary - start;
+  in_pass_ = std::move(layout);
+  struct ClearInPass {
+    InPassImage& image;
+    ~ClearInPass() { image = {}; }
+  } clear_in_pass{in_pass_};
+  if (!Prefill(tokens, last_logits, error))
+    return false;
+  try {
+    // K/V below the boundary are final once written; later rows do not
+    // touch them. The boundary logits use the same one-row head a prefill
+    // ending there runs, from that row's final residual.
+    auto* base = static_cast<std::uint8_t*>(image->device);
+    for (const auto& [at, layer] : kv) {
+      Check(hipMemcpyAsync(base + at, state_[layer].k, kv_bytes,
+                           hipMemcpyDeviceToDevice, stream_),
+            "in-pass K");
+      Check(hipMemcpyAsync(base + at + kv_bytes, state_[layer].v, kv_bytes,
+                           hipMemcpyDeviceToDevice, stream_),
+            "in-pass V");
+    }
+    const std::uint32_t row = boundary - start - 1;
+    fn::RmsNormRows(res_ + std::size_t(row) * c.hidden_size,
+                    model_->output_norm().f32(), xn_, 1, c.hidden_size, 1,
+                    c.rms_eps, stream_);
+    Dense(model_->output(), xn_, reinterpret_cast<float*>(base + logit_offset));
+    Check(hipEventRecord(image->ready, stream_), "in-pass event record");
+    Check(hipGetLastError(), "in-pass launch");
+  } catch (const std::exception& e) {
+    (void)hipStreamSynchronize(stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  *staged = std::move(image);
+  return true;
 }
 
 void Session::TransferPayload(std::uint8_t* base, bool into_base,
@@ -970,6 +1101,38 @@ std::shared_ptr<StagedSnapshot> Session::StageSnapshot(std::string* error) {
     return nullptr;
   }
   return staged;
+}
+
+bool ExportStagedImage(const StagedSnapshot& staged,
+                       std::vector<std::uint8_t>* payload, std::string* error) {
+  if (staged.device == nullptr || staged.ready == nullptr ||
+      payload == nullptr || staged.bytes < 64) {
+    if (error != nullptr)
+      *error = "invalid staged image export";
+    return false;
+  }
+  hipStream_t stream = nullptr;
+  try {
+    Check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+          "image export stream");
+    Check(hipEventSynchronize(staged.ready), "image stage");
+    std::vector<std::uint8_t> bytes(staged.bytes);
+    Check(hipMemcpyAsync(bytes.data(), staged.device, staged.bytes,
+                         hipMemcpyDeviceToHost, stream),
+          "image export");
+    Check(hipStreamSynchronize(stream), "image export");
+    if (std::memcmp(bytes.data(), staged.header_bytes, 64) != 0)
+      throw std::runtime_error("staged image header mismatch");
+    *payload = std::move(bytes);
+  } catch (const std::exception& e) {
+    if (error != nullptr)
+      *error = e.what();
+    if (stream != nullptr)
+      (void)hipStreamDestroy(stream);
+    return false;
+  }
+  (void)hipStreamDestroy(stream);
+  return true;
 }
 
 bool Session::ExportStagedSnapshot(

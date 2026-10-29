@@ -34,6 +34,13 @@ struct StagedSnapshot {
   StagedSnapshot() = default;
 };
 
+/// Copies a staged image to a host payload on a private stream once the image
+/// is ready. Needs no session, so it may run on any thread while the session
+/// that staged the image keeps working.
+[[nodiscard]] bool ExportStagedImage(const StagedSnapshot& staged,
+                                     std::vector<std::uint8_t>* payload,
+                                     std::string* error = nullptr);
+
 /// One autoregressive session. The DeviceModel must outlive it. Each session
 /// owns its stream, scratch, KV and recurrent/conv state. Prefill runs the
 /// prompt in chunks. A plain decode may replay a HIP graph. Device failure
@@ -63,9 +70,10 @@ public:
   /// arguments return false and leave state unchanged.
   ///
   /// With a canonical grid, the call must already sit on a cell boundary.
-  /// Whole cells in the call are one launch. A short final cell is a second
-  /// launch on the same stream, and the call syncs once at the end. A zero
-  /// grid keeps the caller's chunk size and syncs every chunk. A token's
+  /// Up to the chunk size, the call is one launch, its short final cell
+  /// included; a longer call splits on cell boundaries and syncs once at the
+  /// end. One-token launches use the batched kernels, not the decode dots. A
+  /// zero grid keeps the caller's chunk size and syncs every chunk. A token's
   /// result follows the state at the start of its absolute cell, that cell's
   /// tokens, and earlier KV.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens,
@@ -73,6 +81,16 @@ public:
                              std::string* error = nullptr,
                              std::uint32_t chunk_tokens = kMaxPrefillChunk,
                              std::span<float> all_logits = {});
+  /// Prefill in one launch that also freezes the state at absolute position
+  /// `boundary` into a staged image, as StageSnapshot would after a prefill
+  /// that stopped there. Requires a grid session without MTP and
+  /// Position() < boundary < Position() + tokens.size() <= Position() +
+  /// kMaxPrefillChunk. The live session continues to the end of `tokens`.
+  [[nodiscard]] bool PrefillThrough(std::span<const std::int32_t> tokens,
+                                    std::span<float> last_logits,
+                                    std::uint32_t boundary,
+                                    std::shared_ptr<StagedSnapshot>* staged,
+                                    std::string* error = nullptr);
   /// Enables absolute prefill cells. `grid` 0 disables them. The session
   /// must still be at position 0, and `grid` cannot exceed kMaxPrefillChunk.
   [[nodiscard]] bool SetCanonicalGrid(std::uint32_t grid);
@@ -84,6 +102,11 @@ public:
   /// cells. Production leaves this off. Not a runtime option.
   void SetChunkDependentReductionForTest(bool enable) {
     chunk_dependent_reduction_ = enable;
+  }
+  /// Test hook. When set, a one-token grid launch uses the decode dots, so it
+  /// no longer matches that token inside a wider launch. Not a runtime option.
+  void SetLoneTokenDecodeDotsForTest(bool enable) {
+    lone_token_decode_dots_ = enable;
   }
   /// Allocates the NextN cache. The model must have been uploaded with the
   /// bundled block, and the session must still be at position 0. Autoregressive
@@ -137,6 +160,9 @@ public:
   /// Bytes SaveSnapshot writes at the current position. KV is the valid
   /// rows only; recurrent and convolution state are whole layers.
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
+  /// Payload size of a snapshot at `position`.
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      std::uint32_t position) const noexcept;
   /// Device-to-host copy of everything Step and Prefill read: position,
   /// gated-attention KV below that position, every DeltaNet recurrent and
   /// short-convolution state, and the logits. A failed session returns false
@@ -245,6 +271,17 @@ private:
   std::uint32_t max_context_{0}, position_{0};
   std::uint32_t canonical_grid_{0};
   bool chunk_dependent_reduction_{false};
+  /// Set while a grid prefill runs: n == 1 keeps the batched kernels.
+  bool grid_rows_{false};
+  bool lone_token_decode_dots_{false};
+  /// Set during PrefillThrough: linear layers write their boundary state
+  /// into this image. Offsets are per layer; zero for attention layers.
+  struct InPassImage {
+    std::uint8_t* base = nullptr;
+    std::uint32_t tokens = 0;
+    std::vector<std::size_t> conv;
+    std::vector<std::size_t> recurrent;
+  } in_pass_;
   std::uint64_t lineage_{0};
   std::uint32_t kv_high_water_{0};
   bool last_restore_skipped_kv_{false};

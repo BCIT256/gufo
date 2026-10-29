@@ -1,8 +1,12 @@
 // Wide prefill must match consecutive 16-token cells bit for bit.
 // One call at chunk 512, a 16-token cell schedule, and grid-aligned splits
-// (32+rest, 400+112, 16 + middle + tail) publish the same logits at every
-// position and the same snapshot at every shared boundary.
-// A test-only column-dependent GEMM must make the wide call disagree.
+// (32+rest, 400+112, 16 + middle + tail, whole cells + lone tail) publish the
+// same logits at every position and the same snapshot at every shared
+// boundary; a sweep covers final cells of 1, 2, 3, 8, 9 and 15 tokens.
+// Sessions run the server's one-token grid, so off-grid splits are included.
+// PrefillThrough's boundary image must equal a stop-at-boundary snapshot.
+// A test-only column-dependent GEMM must make the wide call disagree, and so
+// must a lone final token on the decode dots.
 //
 // Exits 77 when GUFO_ORNITH15_APEX_MTP_MODEL or GUFO_ORNITH15_LLAMA_LOGITS
 // is missing. Scores that directory and, when present beside it, oracle
@@ -38,7 +42,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Reference cell width. Sessions run the server's grid, under which any
+// split is a cell boundary.
 constexpr std::uint32_t kGrid = 16;
+constexpr std::uint32_t kServerGrid = 1;
 constexpr std::uint32_t kWide = 512;
 constexpr std::uint32_t kContext = 1024;
 
@@ -145,6 +152,23 @@ std::vector<std::uint32_t> SixteenMiddleTail(std::uint32_t n) {
   return parts;
 }
 
+// 16-token cells, also cut at every compared boundary so the reference has
+// a snapshot there.
+std::vector<std::uint32_t> CellsThrough(std::uint32_t n,
+                                        const std::set<std::uint32_t>& cuts) {
+  std::vector<std::uint32_t> parts;
+  std::uint32_t at = 0;
+  while (at < n) {
+    std::uint32_t next = std::min(n, (at / kGrid + 1) * kGrid);
+    const auto cut = cuts.upper_bound(at);
+    if (cut != cuts.end() && *cut < next)
+      next = *cut;
+    parts.push_back(next - at);
+    at = next;
+  }
+  return parts;
+}
+
 struct Outcome {
   std::vector<float> logits;
   std::map<std::uint32_t, std::vector<std::uint8_t>> snaps;
@@ -154,17 +178,20 @@ struct Outcome {
 Outcome Run(const orn::rocm::DeviceModel& device,
             std::span<const std::int32_t> tokens, std::uint32_t vocab,
             const std::vector<std::uint32_t>& parts,
-            const std::set<std::uint32_t>& snap_at, bool mutate) {
+            const std::set<std::uint32_t>& snap_at, bool mutate,
+            bool decode_dots = false) {
   std::uint32_t sum = 0;
   for (const auto part : parts)
     sum += part;
   Require(sum == tokens.size(), "schedule does not cover the prompt");
   std::string error;
   auto session = orn::rocm::Session::Create(device, kContext, &error);
-  Require(session != nullptr && session->SetCanonicalGrid(kGrid),
+  Require(session != nullptr && session->SetCanonicalGrid(kServerGrid),
           "session: " + error);
   if (mutate)
     session->SetChunkDependentReductionForTest(true);
+  if (decode_dots)
+    session->SetLoneTokenDecodeDotsForTest(true);
   Outcome out;
   out.logits.assign(tokens.size() * static_cast<std::size_t>(vocab), 0.f);
   std::vector<float> last(vocab);
@@ -247,9 +274,19 @@ bool ScorePrompt(const orn::rocm::DeviceModel& device, const std::string& name,
     schedules.push_back({"split_32_rest", {32, n - 32}});
   if (n >= 512)
     schedules.push_back({"split_400_112", {400, 112}});
+  if (n > 40) {
+    schedules.push_back({"split_37_rest", {37, n - 37}});
+    schedules.push_back({"split_5_11_rest", {5, 11, n - 16}});
+    schedules.push_back({"split_rest_3", {n - 3, 3}});
+    schedules.push_back({"split_rest_1", {n - 1, 1}});
+  }
   const auto mid = SixteenMiddleTail(n);
   if (mid.size() > 1)
     schedules.push_back({"split_16_mid_tail", mid});
+  // A cached turn resumes on the last cell boundary and may prefill only a
+  // short cell, down to one token, that a cold call ran inside a wide launch.
+  if (n > kGrid && n % kGrid != 0)
+    schedules.push_back({"split_cells_lone_tail", {n - n % kGrid, n % kGrid}});
 
   std::set<std::uint32_t> bounds{n};
   for (const auto& schedule : schedules) {
@@ -259,7 +296,8 @@ bool ScorePrompt(const orn::rocm::DeviceModel& device, const std::string& name,
       bounds.insert(at);
     }
   }
-  const auto cells = Run(device, tokens, vocab, Cells(n), bounds, false);
+  const auto cells =
+      Run(device, tokens, vocab, CellsThrough(n, bounds), bounds, false);
   std::cout << name << " tokens=" << n << " cells_ms=" << cells.ms
             << " cells_tok_s=" << (1000.0 * n) / cells.ms << std::endl;
   bool ok = true;
@@ -267,6 +305,63 @@ bool ScorePrompt(const orn::rocm::DeviceModel& device, const std::string& name,
     const auto got = Run(device, tokens, vocab, schedule.second, bounds, false);
     ok = Compare(name + " " + schedule.first, cells, got, vocab, n) && ok;
   }
+  return ok;
+}
+
+// PrefillThrough from `start` must publish the same final logits as a plain
+// prefill and freeze a boundary image byte-identical to SaveSnapshot after a
+// prefill that stopped at `boundary`.
+bool InPassCheck(const orn::rocm::DeviceModel& device,
+                 const std::vector<std::int32_t>& tokens, std::uint32_t vocab,
+                 std::uint32_t start, std::uint32_t boundary) {
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  const auto make = [&] {
+    std::string error;
+    auto session = orn::rocm::Session::Create(device, kContext, &error);
+    Require(session != nullptr && session->SetCanonicalGrid(kServerGrid),
+            "session: " + error);
+    return session;
+  };
+  const auto span = [&](std::uint32_t from, std::uint32_t to) {
+    return std::span<const std::int32_t>(tokens.data() + from, to - from);
+  };
+  std::string error;
+  std::vector<float> ref_last(vocab);
+  std::vector<float> got_last(vocab);
+  std::vector<std::uint8_t> ref_payload;
+  auto ref = make();
+  if (start > 0)
+    Require(ref->Prefill(span(0, start), ref_last, &error), error);
+  Require(ref->Prefill(span(start, boundary), ref_last, &error), error);
+  Require(ref->SaveSnapshot(&ref_payload, &error), error);
+  Require(ref->Prefill(span(boundary, n), ref_last, &error), error);
+
+  auto got = make();
+  if (start > 0)
+    Require(got->Prefill(span(0, start), got_last, &error), error);
+  std::shared_ptr<orn::rocm::StagedSnapshot> image;
+  Require(
+      got->PrefillThrough(span(start, n), got_last, boundary, &image, &error) &&
+          image != nullptr && got->Position() == n,
+      "prefill through: " + error);
+  std::vector<std::uint8_t> payload;
+  Require(got->ExportStagedSnapshot(image, &payload, &error), error);
+
+  // The image must also resume: restore it elsewhere and finish the prompt.
+  auto resumed = make();
+  std::vector<float> resumed_last(vocab);
+  Require(resumed->RestoreStagedSnapshot(*image, {}, &error) &&
+              resumed->Prefill(span(boundary, n), resumed_last, &error),
+          "resume: " + error);
+
+  const bool same_payload = SameBytes(ref_payload, payload);
+  const bool same_last = ref_last == got_last;
+  const bool same_resumed = ref_last == resumed_last;
+  const bool ok = same_payload && same_last && same_resumed;
+  std::cout << "in_pass start=" << start << " boundary=" << boundary
+            << " end=" << n << (ok ? " PASS" : " FAIL")
+            << " payload=" << same_payload << " last=" << same_last
+            << " resumed=" << same_resumed << std::endl;
   return ok;
 }
 
@@ -332,6 +427,26 @@ int main() {
       ok = ScorePrompt(*device, "agent/wide", RepeatTo(agent, kWide), vocab) &&
            ok;
 
+    // Every short-cell length class: one token, the two-row attention
+    // group, the saved-history convolution, and the wider entries.
+    for (const std::uint32_t tail : {1u, 2u, 3u, 8u, 9u, 15u}) {
+      auto tokens = RepeatTo(agent, 6 * kGrid + tail);
+      tokens.resize(6 * kGrid + tail);
+      ok = ScorePrompt(*device, "agent/tail" + std::to_string(tail), tokens,
+                       vocab) &&
+           ok;
+    }
+
+    for (const auto& [start, boundary] :
+         std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {0, 1},
+             {0, 37},
+             {0, static_cast<std::uint32_t>(agent.size()) - 7},
+             {0, static_cast<std::uint32_t>(agent.size()) - 1},
+             {32, static_cast<std::uint32_t>(agent.size()) - 5}}) {
+      ok = InPassCheck(*device, agent, vocab, start, boundary) && ok;
+    }
+
     auto mutation_tokens = agent;
     if (mutation_tokens.size() < 128)
       mutation_tokens = RepeatTo(std::move(mutation_tokens), 128);
@@ -346,6 +461,21 @@ int main() {
     std::cout << "mutation " << (diverged ? "DIVERGED" : "FAILED_TO_DIVERGE")
               << " first_bad_token=" << bad << std::endl;
     ok = ok && diverged;
+
+    // A lone final token on the decode dots must not match its row in the
+    // one-call reference.
+    auto lone_tokens = RepeatTo(agent, 6 * kGrid + 1);
+    lone_tokens.resize(6 * kGrid + 1);
+    const auto lone_n = static_cast<std::uint32_t>(lone_tokens.size());
+    const auto wide = Run(*device, lone_tokens, vocab, {lone_n}, {}, false);
+    const auto lone =
+        Run(*device, lone_tokens, vocab, {lone_n - 1, 1}, {}, false, true);
+    const auto lone_bad = FirstMismatch(wide.logits, lone.logits, vocab);
+    const bool lone_diverged = lone_bad < lone_n;
+    std::cout << "mutation_lone_token "
+              << (lone_diverged ? "DIVERGED" : "FAILED_TO_DIVERGE")
+              << " first_bad_token=" << lone_bad << std::endl;
+    ok = ok && lone_diverged;
 
     if (!ok)
       return 1;
