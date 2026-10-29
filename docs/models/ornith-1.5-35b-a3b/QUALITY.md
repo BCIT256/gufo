@@ -1,7 +1,7 @@
 # Ornith GPU AR checkpoint quality
 
-Historical P4/P4b evidence is retained below; the P4c section at the end
-records the current policy and acceptance criteria.
+Historical P4/P4b evidence is retained below. The P4c section records the
+policy choice. The M1 section replaces the GPU acceptance gate.
 
 October 23, 2026; synthetic operators and teacher-forced full-vocabulary
 comparisons at 183 positions in three fixed histories. This is a numerical
@@ -136,3 +136,23 @@ removed the tool flips and created confident KL 5.280833756 at code position
 The next measurement protocol is registered in
 [EXPERIMENTS.md](EXPERIMENTS.md#p4e-protocol-registered-october-24-2026-before-new-scoring)
 and is not itself a result.
+
+## M1 acceptance reset
+
+User-approved replacement of the GPU gate. The historical per-position rules
+above stay in the record. They are no longer acceptance criteria for
+`ornith15.gpu_decode`.
+
+The gate is distribution-level, on whichever capture directory
+`GUFO_ORNITH15_LLAMA_LOGITS` points at:
+
+- Per prompt, mean KL(llama batch || GPU) <= 2.0 times mean KL(llama batch ||
+  llama sequential).
+- Every position's KL(llama batch || GPU) <= 3.0 times the largest
+  per-position KL(llama batch || llama sequential) in that capture set.
+  A zero self-spread rejects any positive GPU KL.
+
+Clear flips and confident-position KL are diagnostics. They are computed only
+when `GUFO_ORNITH15_SCALAR_REFERENCE=1`. The scalar reference and
+`ornith15.reference_oracle` are unchanged. The GPU test leaves the reference
+off unless that variable is set. Thresholds are not tuned from results.
