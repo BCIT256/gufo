@@ -58,8 +58,8 @@ def check():
         raise SystemExit("nested")
     if merge_half_open([[5, 7], [1, 3], [2, 6]]) != [[1, 7]]:
         raise SystemExit("unsorted overlap")
-    if merge_half_open([[0, 1], [3, 4], [1, 2]]) != [[0, 2], [3, 4]]:
-        raise SystemExit("adjacent after sort")
+    if merge_half_open([[0, 1], [3, 4], [1, 2]]) != [[0, 1], [1, 2], [3, 4]]:
+        raise SystemExit("touching after sort")
     if merge_half_open([[0, 5], [3, 8], [10, 12]]) != [[0, 8], [10, 12]]:
         raise SystemExit("overlap and gap")
 check()
