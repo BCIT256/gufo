@@ -13,6 +13,14 @@ namespace gufo::models::ornith15::rocm {
 void EmbedQ6(const void* table, std::uint32_t token, float* out,
              std::uint32_t hidden, hipStream_t stream);
 
+/// Gather `n` Q6_K embedding rows. `tokens` is device memory.
+void EmbedQ6Rows(const void* table, const std::int32_t* tokens, float* out,
+                 std::uint32_t n, std::uint32_t hidden, hipStream_t stream);
+
+/// Pack per-token alpha and beta rows into [t][alpha | beta].
+void PackAlphaBeta(const float* alpha, const float* beta, float* out,
+                   std::uint32_t n, std::uint32_t v_heads, hipStream_t stream);
+
 /// Dense Q6_K/Q8_0 dot retaining F32 activations. One weight pass, no
 /// activation quantization or persistent unpacked-weight copy. Only the
 /// numerically sensitive attention output projection uses this route.

@@ -68,12 +68,65 @@ __global__ void EmbedQ6Kernel(const unsigned char* table, std::uint32_t token,
   out[i] = (d * static_cast<float>(scale)) * static_cast<float>(code);
 }
 
+__global__ void EmbedQ6RowsKernel(const unsigned char* table,
+                                  const std::int32_t* tokens, float* out,
+                                  std::uint32_t n, std::uint32_t hidden) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t total = std::size_t(n) * hidden;
+  if (i >= total)
+    return;
+  const std::uint32_t t = i / hidden;
+  const std::uint32_t elem = i - t * hidden;
+  const auto token = static_cast<std::uint32_t>(tokens[t]);
+  const auto* p =
+      table + (std::size_t(token) * hidden / 256 + elem / 256) * 210;
+  const auto index = elem % 256;
+  const auto half = index / 128, segment = index % 128 / 32, lane = index % 32;
+  const auto low = p[half * 64 + segment % 2 * 32 + lane];
+  const int code = (((low >> (segment / 2 * 4)) & 15) |
+                    (((p[128 + half * 32 + lane] >> (2 * segment)) & 3) << 4)) -
+                   32;
+  const auto scale = reinterpret_cast<const std::int8_t*>(p + 192)[index / 16];
+  const float d = __half2float(*reinterpret_cast<const __half*>(p + 208));
+  out[i] = (d * static_cast<float>(scale)) * static_cast<float>(code);
+}
+
+__global__ void PackAlphaBetaKernel(const float* alpha, const float* beta,
+                                    float* out, std::uint32_t n,
+                                    std::uint32_t v) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n * v)
+    return;
+  const std::uint32_t t = i / v;
+  const std::uint32_t h = i - t * v;
+  out[t * (2 * v) + h] = alpha[i];
+  out[t * (2 * v) + v + h] = beta[i];
+}
+
 }  // namespace
 
 void EmbedQ6(const void* table, std::uint32_t token, float* out,
              std::uint32_t hidden, hipStream_t stream) {
   EmbedQ6Kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
       static_cast<const unsigned char*>(table), token, out, hidden);
+}
+
+void EmbedQ6Rows(const void* table, const std::int32_t* tokens, float* out,
+                 std::uint32_t n, std::uint32_t hidden, hipStream_t stream) {
+  const auto count = static_cast<std::uint32_t>(std::size_t(n) * hidden);
+  if (count == 0)
+    return;
+  EmbedQ6RowsKernel<<<(count + 255) / 256, 256, 0, stream>>>(
+      static_cast<const unsigned char*>(table), tokens, out, n, hidden);
+}
+
+void PackAlphaBeta(const float* alpha, const float* beta, float* out,
+                   std::uint32_t n, std::uint32_t v_heads, hipStream_t stream) {
+  const auto count = n * v_heads;
+  if (count == 0)
+    return;
+  PackAlphaBetaKernel<<<(count + 255) / 256, 256, 0, stream>>>(alpha, beta, out,
+                                                               n, v_heads);
 }
 
 void DenseMatVecF32(core::GgmlType type, const void* weights, const float* x,
