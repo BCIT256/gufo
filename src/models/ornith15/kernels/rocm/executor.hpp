@@ -16,6 +16,24 @@
 
 namespace gufo::models::ornith15::rocm {
 
+/// Private device image of one session frontier. The host may keep prefilling
+/// after StageSnapshot; ExportStagedSnapshot reads this image, not the live
+/// buffers. The image outlives the session that produced it.
+struct StagedSnapshot {
+  std::uint32_t position = 0;
+  /// Identity of the append-only KV history this image was taken from.
+  std::uint64_t lineage = 0;
+  std::size_t bytes = 0;
+  void* device = nullptr;
+  hipEvent_t ready = nullptr;
+  alignas(64) std::uint8_t header_bytes[64]{};
+
+  ~StagedSnapshot();
+  StagedSnapshot(const StagedSnapshot&) = delete;
+  StagedSnapshot& operator=(const StagedSnapshot&) = delete;
+  StagedSnapshot() = default;
+};
+
 /// One autoregressive session. The DeviceModel must outlive it. Each session
 /// owns its stream, scratch, KV and recurrent/conv state. Prefill runs the
 /// prompt in chunks. A plain decode may replay a HIP graph. Device failure
@@ -63,6 +81,31 @@ public:
   /// and leaves `payload` unchanged.
   [[nodiscard]] bool SaveSnapshot(std::vector<std::uint8_t>* payload,
                                   std::string* error = nullptr) const;
+  /// Copies the current frontier into private device storage on the session
+  /// stream and returns without a host sync. Null when the session cannot
+  /// stage. Prefill and Step may then proceed; they are ordered after the copy.
+  [[nodiscard]] std::shared_ptr<StagedSnapshot> StageSnapshot(
+      std::string* error = nullptr);
+  /// Host payload of a staged image. Bit-identical to SaveSnapshot at the
+  /// staged position, including after the live session has moved on.
+  [[nodiscard]] bool ExportStagedSnapshot(
+      const std::shared_ptr<StagedSnapshot>& staged,
+      std::vector<std::uint8_t>* payload, std::string* error = nullptr) const;
+  /// Device-to-device restore from a staged image. Skips KV rows that are
+  /// already the live prefix of this same history.
+  [[nodiscard]] bool RestoreStagedSnapshot(const StagedSnapshot& staged,
+                                           std::span<float> logits,
+                                           std::string* error = nullptr);
+  /// True when the most recent RestoreStagedSnapshot left KV in place.
+  [[nodiscard]] bool LastRestoreSkippedKv() const noexcept {
+    return last_restore_skipped_kv_;
+  }
+  /// Append-only KV history identity. A staged restore skips KV only when
+  /// the destination still carries this history through the staged position.
+  [[nodiscard]] std::uint64_t KvLineage() const noexcept { return lineage_; }
+  [[nodiscard]] std::uint32_t KvHighWater() const noexcept {
+    return kv_high_water_;
+  }
   /// Host-to-device restore into this session, fresh or already used.
   /// `logits` receives the restored row when it holds one vocabulary row;
   /// an empty span leaves that download to the caller. An invalid payload
@@ -99,11 +142,21 @@ private:
   void EnsureLogitsBatch();
   void* Allocate(std::size_t bytes);
   float* Floats(std::size_t count);
+  /// `into_base` copies state into `base`; otherwise copies `base` into state.
+  /// `skip_kv` leaves gated-attention K/V untouched. `base` is the payload
+  /// address, including the 64-byte header the caller fills separately.
+  void TransferPayload(std::uint8_t* base, bool into_base, hipMemcpyKind kind,
+                       hipStream_t stream, bool skip_kv,
+                       std::uint32_t position) const;
 
   const DeviceModel* model_{nullptr};
   hipStream_t stream_{nullptr};
+  mutable hipStream_t copy_stream_{nullptr};
   hipGraphExec_t graph_exec_{nullptr};
   std::uint32_t max_context_{0}, position_{0};
+  std::uint64_t lineage_{0};
+  std::uint32_t kv_high_water_{0};
+  bool last_restore_skipped_kv_{false};
   bool failed_{false};
   bool warmed_{false};
   bool graph_failed_{false};

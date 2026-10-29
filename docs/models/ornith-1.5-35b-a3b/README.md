@@ -2,10 +2,14 @@
 
 `qwen35moe` autoregressive decode and chunked prefill on gfx1151.
 `gufo serve llm --model <gguf>` and `gufo chat --model <gguf>` load this
-architecture on ROCm. The server keeps a host snapshot of each session
+architecture on ROCm. The server keeps an exact snapshot of each session
 frontier and reuses it when a later prompt has the same prefix. A miss
-re-prefills. That payload is also the disk cache when `--cache-disk` is set.
-There is no in-pass checkpoint; prefill yields at snapshot boundaries.
+re-prefills. Capture queues a private device image at the boundary and copies
+it to the host after that boundary, so a cached turn does not wait for the
+host copy before its first token. A later restore of that image skips KV
+rows that are already the live prefix; a disk payload uploads every region.
+The host payload is the disk cache when `--cache-disk` is set. There is no
+in-pass checkpoint; prefill yields at snapshot boundaries.
 Vision, YaRN and MTP execution are absent. `--speculative`,
 `--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
 in chunks of at most 512 tokens. `Session::Step` advances one token. A plain decode step
@@ -14,9 +18,13 @@ an empty buffer plus a sampled id to take a device argmax without downloading
 logits. Invalid calls leave state untouched. A device execution failure
 requires `Reset` before reuse. `SaveSnapshot` copies the position, the
 gated-attention KV below it, every DeltaNet recurrent and short-conv state,
-and the logits into a version-1 host payload. `RestoreSnapshot` loads that
-image into a fresh or already used session. `SnapshotPayloadBytes` reports
-the size. A prefill that returns every row also stores its last row in the
+and the logits into a version-1 host payload. `StageSnapshot` queues that
+copy into a private device image and returns without a host sync.
+`ExportStagedSnapshot` writes the version-1 payload from the image after the
+session has moved on. `RestoreSnapshot` loads a host payload into a fresh or
+already used session. `RestoreStagedSnapshot` loads the device image and
+skips KV when the destination still holds that prefix. `SnapshotPayloadBytes`
+reports the size. A prefill that returns every row also stores its last row in the
 decode logit buffer, so the payload matches the published frontier.
 
 Bind with `ModelWeights::Bind(reader, BindOptions{})`, upload with

@@ -1,8 +1,10 @@
 #include "src/models/ornith15/kernels/rocm/executor.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -111,17 +113,38 @@ SnapshotHeader MakeHeader(const Config& c, std::uint32_t position,
   return header;
 }
 
+std::uint64_t NextLineage() {
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 }  // namespace
+
+StagedSnapshot::~StagedSnapshot() {
+  if (ready != nullptr) {
+    (void)hipEventSynchronize(ready);
+    (void)hipEventDestroy(ready);
+    ready = nullptr;
+  }
+  if (device != nullptr) {
+    (void)hipFree(device);
+    device = nullptr;
+  }
+}
 
 Session::~Session() {
   if (stream_ != nullptr) {
     (void)hipStreamSynchronize(stream_);
     qfn_mmq_release_stream(stream_);
   }
+  if (copy_stream_ != nullptr)
+    (void)hipStreamSynchronize(copy_stream_);
   if (graph_exec_ != nullptr)
     (void)hipGraphExecDestroy(graph_exec_);
   for (void* p : allocations_)
     (void)hipFree(p);
+  if (copy_stream_ != nullptr)
+    (void)hipStreamDestroy(copy_stream_);
   if (stream_ != nullptr)
     (void)hipStreamDestroy(stream_);
 }
@@ -164,8 +187,11 @@ std::unique_ptr<Session> Session::Create(const DeviceModel& model,
       throw std::runtime_error("invalid AR context capacity");
     s->model_ = &model;
     s->max_context_ = max_context;
+    s->lineage_ = NextLineage();
     Check(hipStreamCreateWithFlags(&s->stream_, hipStreamNonBlocking),
           "stream");
+    Check(hipStreamCreateWithFlags(&s->copy_stream_, hipStreamNonBlocking),
+          "snapshot stream");
     const std::uint32_t n = kMaxPrefillChunk;
     const std::uint32_t used = c.num_experts_used;
     s->zero_ids_ = static_cast<std::int32_t*>(
@@ -258,6 +284,8 @@ bool Session::Reset(std::string* error) {
     }
     Check(hipStreamSynchronize(stream_), "reset");
     position_ = 0;
+    lineage_ = NextLineage();
+    kv_high_water_ = 0;
     failed_ = false;
     return true;
   } catch (const std::exception& e) {
@@ -621,6 +649,7 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
             "logits download");
     Check(hipStreamSynchronize(stream_), "AR step");
     ++position_;
+    kv_high_water_ = std::max(kv_high_water_, position_);
     return true;
   } catch (const std::exception& e) {
     (void)hipStreamSynchronize(stream_);
@@ -704,6 +733,7 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
       }
       position_ += count;
       done += count;
+      kv_high_water_ = std::max(kv_high_water_, position_);
     }
     return true;
   } catch (const std::exception& e) {
@@ -719,6 +749,51 @@ std::size_t Session::SnapshotPayloadBytes() const noexcept {
   if (model_ == nullptr)
     return 0;
   return PayloadBytes(MakeHeader(model_->config(), position_, max_context_));
+}
+
+void Session::TransferPayload(std::uint8_t* base, bool into_base,
+                              hipMemcpyKind kind, hipStream_t stream,
+                              bool skip_kv, std::uint32_t position) const {
+  // Layout is the version-1 payload. Callers have already checked that the
+  // header matches this session, so the live config describes `base`.
+  const auto& c = model_->config();
+  std::size_t offset = sizeof(SnapshotHeader);
+  const std::size_t conv_bytes = std::size_t(ConvFloats(c)) * sizeof(float);
+  const std::size_t recurrent_bytes =
+      std::size_t(RecurrentFloats(c)) * sizeof(float);
+  const std::size_t kv_bytes =
+      std::size_t(position) * c.AttentionKvDim() * sizeof(__half);
+  const auto copy = [&](void* state, std::size_t count, const char* what) {
+    if (count == 0)
+      return;
+    void* dst = into_base ? static_cast<void*>(base + offset) : state;
+    const void* src =
+        into_base ? state : static_cast<const void*>(base + offset);
+    Check(hipMemcpyAsync(dst, src, count, kind, stream), what);
+  };
+  for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+    const auto& state = state_[layer];
+    if (c.IsLinearLayer(layer)) {
+      copy(state.conv, conv_bytes,
+           into_base ? "snapshot conv" : "restore conv");
+      offset += conv_bytes;
+      copy(state.recurrent, recurrent_bytes,
+           into_base ? "snapshot recurrent" : "restore recurrent");
+      offset += recurrent_bytes;
+    } else if (!skip_kv) {
+      copy(state.k, kv_bytes, into_base ? "snapshot K" : "restore K");
+      offset += kv_bytes;
+      copy(state.v, kv_bytes, into_base ? "snapshot V" : "restore V");
+      offset += kv_bytes;
+    } else {
+      offset += 2 * kv_bytes;
+    }
+  }
+  const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
+  copy(logits_, logit_bytes, into_base ? "snapshot logits" : "restore logits");
+  offset += logit_bytes;
+  if (offset != PayloadBytes(MakeHeader(c, position, max_context_)))
+    throw std::runtime_error("snapshot size diverged");
 }
 
 bool Session::SaveSnapshot(std::vector<std::uint8_t>* payload,
@@ -740,50 +815,133 @@ bool Session::SaveSnapshot(std::vector<std::uint8_t>* payload,
   std::memcpy(bytes.data(), &header, sizeof(header));
   try {
     Check(hipStreamSynchronize(stream_), "snapshot drain");
-    std::size_t offset = sizeof(header);
-    const std::size_t conv_bytes =
-        std::size_t(header.conv_floats) * sizeof(float);
-    const std::size_t recurrent_bytes =
-        std::size_t(header.recurrent_floats) * sizeof(float);
-    const std::size_t kv_bytes =
-        std::size_t(header.position) * header.kv_dim * sizeof(__half);
-    const auto copy_out = [&](void* dst, const void* src, std::size_t count,
-                              const char* what) {
-      if (count == 0)
-        return;
-      Check(hipMemcpyAsync(dst, src, count, hipMemcpyDeviceToHost, stream_),
-            what);
-    };
-    for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
-      const auto& state = state_[layer];
-      if (c.IsLinearLayer(layer)) {
-        copy_out(bytes.data() + offset, state.conv, conv_bytes,
-                 "snapshot conv");
-        offset += conv_bytes;
-        copy_out(bytes.data() + offset, state.recurrent, recurrent_bytes,
-                 "snapshot recurrent");
-        offset += recurrent_bytes;
-      } else {
-        copy_out(bytes.data() + offset, state.k, kv_bytes, "snapshot K");
-        offset += kv_bytes;
-        copy_out(bytes.data() + offset, state.v, kv_bytes, "snapshot V");
-        offset += kv_bytes;
-      }
-    }
-    const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
-    Check(hipMemcpyAsync(bytes.data() + offset, logits_, logit_bytes,
-                         hipMemcpyDeviceToHost, stream_),
-          "snapshot logits");
-    offset += logit_bytes;
+    TransferPayload(bytes.data(), true, hipMemcpyDeviceToHost, stream_, false,
+                    position_);
     Check(hipStreamSynchronize(stream_), "snapshot");
-    if (offset != bytes.size())
-      throw std::runtime_error("snapshot size diverged");
   } catch (const std::exception& e) {
     if (error != nullptr)
       *error = e.what();
     return false;
   }
   *payload = std::move(bytes);
+  return true;
+}
+
+std::shared_ptr<StagedSnapshot> Session::StageSnapshot(std::string* error) {
+  if (model_ == nullptr || failed_ || stream_ == nullptr) {
+    if (error != nullptr)
+      *error = "invalid snapshot stage (failed session)";
+    return nullptr;
+  }
+  const auto& c = model_->config();
+  const SnapshotHeader header = MakeHeader(c, position_, max_context_);
+  if (!HeaderMatches(header, c, max_context_)) {
+    if (error != nullptr)
+      *error = "session configuration cannot be snapshotted";
+    return nullptr;
+  }
+  auto staged = std::make_shared<StagedSnapshot>();
+  staged->position = position_;
+  staged->lineage = lineage_;
+  staged->bytes = PayloadBytes(header);
+  std::memcpy(staged->header_bytes, &header, sizeof(header));
+  try {
+    Check(hipMalloc(&staged->device, staged->bytes), "snapshot image");
+    Check(hipEventCreateWithFlags(&staged->ready, hipEventDisableTiming),
+          "snapshot event");
+    Check(hipMemcpyAsync(staged->device, staged->header_bytes, sizeof(header),
+                         hipMemcpyHostToDevice, stream_),
+          "snapshot header");
+    TransferPayload(static_cast<std::uint8_t*>(staged->device), true,
+                    hipMemcpyDeviceToDevice, stream_, false, position_);
+    Check(hipEventRecord(staged->ready, stream_), "snapshot event record");
+  } catch (const std::exception& e) {
+    if (error != nullptr)
+      *error = e.what();
+    return nullptr;
+  }
+  return staged;
+}
+
+bool Session::ExportStagedSnapshot(
+    const std::shared_ptr<StagedSnapshot>& staged,
+    std::vector<std::uint8_t>* payload, std::string* error) const {
+  if (staged == nullptr || staged->device == nullptr ||
+      staged->ready == nullptr || payload == nullptr ||
+      copy_stream_ == nullptr || staged->bytes < 64) {
+    if (error != nullptr)
+      *error = "invalid staged snapshot export";
+    return false;
+  }
+  try {
+    Check(hipEventSynchronize(staged->ready), "snapshot stage");
+    std::vector<std::uint8_t> bytes(staged->bytes);
+    Check(hipMemcpyAsync(bytes.data(), staged->device, staged->bytes,
+                         hipMemcpyDeviceToHost, copy_stream_),
+          "snapshot export");
+    Check(hipStreamSynchronize(copy_stream_), "snapshot export");
+    if (std::memcmp(bytes.data(), staged->header_bytes, 64) != 0)
+      throw std::runtime_error("staged snapshot header mismatch");
+    *payload = std::move(bytes);
+  } catch (const std::exception& e) {
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  return true;
+}
+
+bool Session::RestoreStagedSnapshot(const StagedSnapshot& staged,
+                                    std::span<float> logits,
+                                    std::string* error) {
+  if (model_ == nullptr || stream_ == nullptr || staged.device == nullptr ||
+      staged.ready == nullptr || staged.bytes < sizeof(SnapshotHeader)) {
+    if (error != nullptr)
+      *error = "invalid staged snapshot restore";
+    return false;
+  }
+  const auto& c = model_->config();
+  SnapshotHeader header{};
+  std::memcpy(&header, staged.header_bytes, sizeof(header));
+  if (!HeaderMatches(header, c, max_context_) ||
+      header.position != staged.position ||
+      staged.bytes != PayloadBytes(header) ||
+      (logits.size() != c.vocab_size && !logits.empty())) {
+    if (error != nullptr)
+      *error = "staged snapshot does not match this session";
+    return false;
+  }
+  const bool skip_kv = staged.lineage != 0 && staged.lineage == lineage_ &&
+                       kv_high_water_ >= staged.position;
+  try {
+    Check(hipEventSynchronize(staged.ready), "staged restore wait");
+    Check(hipStreamSynchronize(stream_), "staged restore drain");
+    TransferPayload(static_cast<std::uint8_t*>(staged.device), false,
+                    hipMemcpyDeviceToDevice, stream_, skip_kv, staged.position);
+    const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
+    const std::size_t logit_offset = staged.bytes - logit_bytes;
+    if (!logits.empty()) {
+      Check(hipMemcpyAsync(
+                logits.data(),
+                static_cast<std::uint8_t*>(staged.device) + logit_offset,
+                logit_bytes, hipMemcpyDeviceToHost, stream_),
+            "staged restore logits");
+    }
+    Check(hipStreamSynchronize(stream_), "staged restore");
+  } catch (const std::exception& e) {
+    failed_ = true;
+    last_restore_skipped_kv_ = false;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  position_ = staged.position;
+  if (!skip_kv) {
+    lineage_ = staged.lineage == 0 ? NextLineage() : staged.lineage;
+    kv_high_water_ = staged.position;
+  }
+  last_restore_skipped_kv_ = skip_kv;
+  failed_ = false;
   return true;
 }
 
@@ -809,54 +967,42 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
       *error = "snapshot does not match this session";
     return false;
   }
+  // Pinning the caller buffer makes the upload one DMA rather than a
+  // bounce through unpinned pages. Failure leaves the ordinary path.
+  // Restores of one payload share the pin; two threads must not register
+  // or unregister the same pages together.
+  static std::mutex pin_mu;
+  std::lock_guard<std::mutex> pin_lock(pin_mu);
+  void* registered = const_cast<std::uint8_t*>(payload.data());
+  const bool pinned = hipHostRegister(registered, payload.size(),
+                                      hipHostRegisterReadOnly) == hipSuccess;
+  if (!pinned)
+    (void)hipGetLastError();
   try {
     Check(hipStreamSynchronize(stream_), "restore drain");
-    std::size_t offset = sizeof(header);
-    const std::size_t conv_bytes =
-        std::size_t(header.conv_floats) * sizeof(float);
-    const std::size_t recurrent_bytes =
-        std::size_t(header.recurrent_floats) * sizeof(float);
-    const std::size_t kv_bytes =
-        std::size_t(header.position) * header.kv_dim * sizeof(__half);
-    const auto copy_in = [&](void* dst, const void* src, std::size_t count,
-                             const char* what) {
-      if (count == 0)
-        return;
-      Check(hipMemcpyAsync(dst, src, count, hipMemcpyHostToDevice, stream_),
-            what);
-    };
-    for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
-      auto& state = state_[layer];
-      if (c.IsLinearLayer(layer)) {
-        copy_in(state.conv, payload.data() + offset, conv_bytes,
-                "restore conv");
-        offset += conv_bytes;
-        copy_in(state.recurrent, payload.data() + offset, recurrent_bytes,
-                "restore recurrent");
-        offset += recurrent_bytes;
-      } else {
-        copy_in(state.k, payload.data() + offset, kv_bytes, "restore K");
-        offset += kv_bytes;
-        copy_in(state.v, payload.data() + offset, kv_bytes, "restore V");
-        offset += kv_bytes;
-      }
-    }
-    const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
-    const std::size_t logit_offset = offset;
-    copy_in(logits_, payload.data() + offset, logit_bytes, "restore logits");
-    offset += logit_bytes;
+    TransferPayload(const_cast<std::uint8_t*>(payload.data()), false,
+                    hipMemcpyHostToDevice, stream_, false, header.position);
     Check(hipStreamSynchronize(stream_), "restore");
-    if (offset != payload.size())
-      throw std::runtime_error("snapshot restore size diverged");
-    if (!logits.empty())
-      std::memcpy(logits.data(), payload.data() + logit_offset, logit_bytes);
+    if (!logits.empty()) {
+      const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
+      std::memcpy(logits.data(), payload.data() + payload.size() - logit_bytes,
+                  logit_bytes);
+    }
   } catch (const std::exception& e) {
+    if (pinned)
+      (void)hipHostUnregister(registered);
     failed_ = true;
+    last_restore_skipped_kv_ = false;
     if (error != nullptr)
       *error = e.what();
     return false;
   }
+  if (pinned)
+    (void)hipHostUnregister(registered);
   position_ = header.position;
+  lineage_ = NextLineage();
+  kv_high_water_ = header.position;
+  last_restore_skipped_kv_ = false;
   failed_ = false;
   return true;
 }

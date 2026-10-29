@@ -2,7 +2,11 @@
 // A continuation after SaveSnapshot must match the same continuation after
 // RestoreSnapshot into another session, bit for bit, including a prefix that
 // ends inside a prefill chunk and a prefix that ends on a decode Step.
-// Restored full sequences also take the distribution gate. See QUALITY.md.
+// A staged device image exported after the session has moved on must match
+// that stop-at-boundary payload. Restoring it into the same session skips
+// KV; restoring it into a foreign session copies KV. Both continuations
+// match bit for bit. Restored full sequences also take the distribution
+// gate. See QUALITY.md.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -419,6 +423,48 @@ int main() {
                      same_full.data() + std::size_t(plan.position) * vocab,
                      tail, &same_index, &same_abs);
 
+        // Stage at the stop-at-boundary frontier, then move the live session
+        // before the host export. The image must still match `again`.
+        auto staged_image = other->StageSnapshot(&error);
+        Require(staged_image != nullptr, "stage snapshot: " + error);
+        std::vector<float> staged_moved(std::size_t(n) * vocab);
+        Continue(*other, batch.tokens, plan, vocab, &staged_moved, &error);
+        std::vector<std::uint8_t> exported;
+        Require(other->ExportStagedSnapshot(staged_image, &exported, &error),
+                "export staged: " + error);
+        const bool staged_bytes = exported == again;
+        if (!staged_bytes)
+          ReportPayloadDiff(again, exported);
+        Require(other->RestoreStagedSnapshot(*staged_image, restored_logits,
+                                             &error),
+                "staged restore same: " + error);
+        const bool staged_skipped = other->LastRestoreSkippedKv();
+        Require(other->Position() == plan.position, "staged position");
+        std::vector<float> staged_full(std::size_t(n) * vocab);
+        Continue(*other, batch.tokens, plan, vocab, &staged_full, &error);
+        std::size_t staged_index = 0;
+        double staged_abs = 0;
+        const bool staged_same =
+            SameBits(full.data() + std::size_t(plan.position) * vocab,
+                     staged_full.data() + std::size_t(plan.position) * vocab,
+                     tail, &staged_index, &staged_abs);
+        auto staged_foreign = orn::rocm::Session::Create(*device, n, &error);
+        Require(staged_foreign != nullptr, "staged foreign session: " + error);
+        Require(staged_foreign->RestoreStagedSnapshot(*staged_image,
+                                                      restored_logits, &error),
+                "staged restore foreign: " + error);
+        const bool staged_foreign_copied =
+            !staged_foreign->LastRestoreSkippedKv();
+        std::vector<float> staged_foreign_full(std::size_t(n) * vocab);
+        Continue(*staged_foreign, batch.tokens, plan, vocab,
+                 &staged_foreign_full, &error);
+        std::size_t foreign_index = 0;
+        double foreign_abs = 0;
+        const bool staged_foreign_match = SameBits(
+            full.data() + std::size_t(plan.position) * vocab,
+            staged_foreign_full.data() + std::size_t(plan.position) * vocab,
+            tail, &foreign_index, &foreign_abs);
+
         std::vector<std::uint8_t> bad = payload;
         std::size_t region = 0, region_bytes = 0;
         Require(orn::rocm::Session::SnapshotRecurrentRegion(bad, 0, &region,
@@ -494,17 +540,28 @@ int main() {
                   << " used_max_abs=" << used_abs
                   << " same_identical=" << same_match
                   << " same_max_abs=" << same_abs
+                  << " staged_bytes=" << staged_bytes
+                  << " staged_skipped_kv=" << staged_skipped
+                  << " staged_identical=" << staged_same
+                  << " staged_max_abs=" << staged_abs
+                  << " staged_foreign_copied_kv=" << staged_foreign_copied
+                  << " staged_foreign_identical=" << staged_foreign_match
+                  << " staged_foreign_max_abs=" << foreign_abs
                   << " mutation_nonzero=" << nonzero
                   << " mutation_caught=" << caught
                   << " mutation_max_abs=" << mutated_abs << std::endl;
-        if (!fresh_match || !used_match || !same_match)
+        if (!fresh_match || !used_match || !same_match || !staged_same ||
+            !staged_foreign_match)
           std::cout << prompt << " mismatch fresh_index=" << index
                     << " used_index=" << used_index
-                    << " same_index=" << same_index << std::endl;
+                    << " same_index=" << same_index
+                    << " staged_index=" << staged_index
+                    << " staged_foreign_index=" << foreign_index << std::endl;
         if (!payloads_match)
           ReportPayloadDiff(payload, again);
         ok = ok && payloads_match && fresh_match && used_match && same_match &&
-             gate_ok;
+             staged_bytes && staged_skipped && staged_same &&
+             staged_foreign_copied && staged_foreign_match && gate_ok;
       }
       std::cout << prompt << " mutation_caught=" << saw_mutation << std::endl;
       ok = ok && saw_mutation;

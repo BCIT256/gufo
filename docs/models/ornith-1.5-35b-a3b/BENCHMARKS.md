@@ -251,3 +251,35 @@ Kernel sums: 20 tokens 107.4 to 86.2 ms, 261 tokens 408.5 to 346.5 ms,
 2048 tokens 2405.9 to 2218.7 ms. The 20-token rocprof pass idled 10.4 ms
 before and 11.6 ms after. Removing the per-chunk stream sync left the
 unprofiled 2048-token prefill at 2.4684 s.
+
+## M4 staged snapshot
+
+2026-10-29, gfx1151, release `build/release/gufo`, one session, context
+16384, `--cache-disk`. Power: `AC0/online=1`, `BAT0/status=Charging`.
+Lemonade's llama-server (pid 3363206, state `Sl`, port 8003, MTP) was
+running on the same GGUF and was not paused. The replay is the
+`tool-agent-loop` prompt (temperature 0, seed 41, thinking off, at most
+192 new tokens). The live cache-on conversation was recorded, the server
+restarted, then those exact message lists ran cache on, off, on, off.
+
+`cache_snapshot_ms` is the device-stage time plus any later join of the
+host export. On a partial hit, TTFT minus `prefill_ms` is smaller than
+`cache_snapshot_ms`, so that join is not all on the first-token path.
+`on-a-0` is the disk restore after restart. `on-b` reuses the full prompt
+from RAM (`prefill_tokens` 0). A reusable pinned host bounce measured
+110.4 ms on one 62-token disk hit and was not kept.
+
+| Turn | Prompt | On cached | On TTFT | On snapshot | On restore | On prefill ms | Off TTFT | Off TTFT again | RAM TTFT | RAM restore |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 438 | 431 | 214.6 | 26.9 | 84.9 | 109.3 | 673.5 | 677.2 | 2.4 | 1.3 |
+| 1 | 507 | 477 | 226.4 | 29.9 | 0 | 204.3 | 756.2 | 761.1 | 2.8 | 1.8 |
+| 2 | 628 | 604 | 209.8 | 27.8 | 0 | 191.2 | 1099.4 | 1092.4 | 2.6 | 1.5 |
+| 3 | 697 | 667 | 260.8 | 45.9 | 0 | 225.4 | 1129.4 | 1144.2 | 2.8 | 1.6 |
+| 4 | 767 | 737 | 266.8 | 49.3 | 0 | 232.5 | 1192.6 | 1192.3 | 3.0 | 1.8 |
+| 5 | 868 | 844 | 237.9 | 49.3 | 0 | 204.8 | 1320.8 | 1350.1 | 3.6 | 2.3 |
+| 6 | 937 | 907 | 270.5 | 49.7 | 0 | 236.4 | 1364.3 | 1360.7 | 3.5 | 2.2 |
+
+Suffix prefills of 24–30 tokens took 191–233 ms. Lemonade's earlier
+`prompt_ms` on similar suffixes was 147–227 ms. This run does not put
+those suffix TTFTs under that range. Exact RAM hits are 2.4–3.6 ms.
+Disk restore of the 431-token prefix was 84.9 ms.

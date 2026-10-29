@@ -2959,6 +2959,7 @@ public:
       : session_(std::move(session)), logits_(vocab) {}
 
   void Invalidate() noexcept override {
+    staged_.reset();
     have_logits_ = false;
     position_ = 0;
     std::string error;
@@ -2981,10 +2982,19 @@ public:
   void set_have_logits(bool value) noexcept { have_logits_ = value; }
   [[nodiscard]] bool reset_failed() const noexcept { return reset_failed_; }
   void set_reset_failed(bool value) noexcept { reset_failed_ = value; }
+  void set_staged(
+      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged) const {
+    staged_ = std::move(staged);
+  }
+  [[nodiscard]] std::shared_ptr<models::ornith15::rocm::StagedSnapshot>
+  take_staged() const {
+    return std::exchange(staged_, nullptr);
+  }
 
 private:
   std::unique_ptr<models::ornith15::rocm::Session> session_;
   std::vector<float> logits_;
+  mutable std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged_;
   std::uint32_t position_{0};
   bool have_logits_{false};
   bool reset_failed_{false};
@@ -3020,18 +3030,32 @@ class Ornith15TextRunnerSnapshot final : public TextRunnerSnapshot {
 public:
   Ornith15TextRunnerSnapshot(
       std::shared_ptr<const models::ornith15::rocm::DeviceModel> model,
-      std::vector<std::uint8_t> payload, std::uint32_t position)
+      std::vector<std::uint8_t> payload, std::uint32_t position,
+      std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged = nullptr)
       : model(std::move(model)),
         payload(std::move(payload)),
-        position(position) {}
+        position(position),
+        staged(std::move(staged)) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
     return payload.size();
+  }
+  /// Same-history device restore skips KV that is already resident.
+  [[nodiscard]] bool PrefersState(
+      const ContinuationState& state) const noexcept override {
+    if (staged == nullptr || staged->lineage == 0)
+      return false;
+    const auto* ornith = dynamic_cast<const Ornith15TextRunnerState*>(&state);
+    if (ornith == nullptr)
+      return false;
+    return ornith->session().KvLineage() == staged->lineage &&
+           ornith->session().KvHighWater() >= staged->position;
   }
 
   std::shared_ptr<const models::ornith15::rocm::DeviceModel> model;
   std::vector<std::uint8_t> payload;
   std::uint32_t position{0};
+  std::shared_ptr<models::ornith15::rocm::StagedSnapshot> staged;
 };
 
 // One session per request. A host snapshot is the prefix cache; a miss
@@ -3084,6 +3108,7 @@ public:
                 .batched_multi_token_decode_max_width = 0,
                 .prefix_reuse = true,
                 .in_pass_checkpoint = false,
+                .staged_snapshot = true,
                 .partial_prefill_retention = true,
                 .prefill_rollback = false,
             },
@@ -3324,6 +3349,18 @@ public:
     return bytes;
   }
 
+  [[nodiscard]] bool StageSnapshot(TextRunnerState& state) const override {
+    auto& ornith = RequireOrnithState(state);
+    if (ornith.reset_failed())
+      return false;
+    std::string error;
+    auto image = ornith.session().StageSnapshot(&error);
+    if (!image)
+      return false;
+    ornith.set_staged(std::move(image));
+    return true;
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
     const auto& ornith = RequireOrnithState(state);
@@ -3331,6 +3368,17 @@ public:
       throw std::runtime_error("Ornith session reset failed");
     std::string error;
     std::vector<std::uint8_t> payload;
+    // The capture worker exports the frozen image. SaveSnapshot would read
+    // the live session, which may already be prefilling the suffix.
+    if (auto image = ornith.take_staged()) {
+      const auto position = image->position;
+      if (!ornith.session().ExportStagedSnapshot(image, &payload, &error) ||
+          payload.empty()) {
+        throw std::runtime_error("Ornith staged snapshot failed: " + error);
+      }
+      return std::make_unique<Ornith15TextRunnerSnapshot>(
+          model_, std::move(payload), position, std::move(image));
+    }
     if (!ornith.session().SaveSnapshot(&payload, &error) ||
         payload.size() != ornith.session().SnapshotPayloadBytes()) {
       throw std::runtime_error("Ornith snapshot failed: " + error);
@@ -3351,8 +3399,13 @@ public:
     }
     auto& restored = RequireOrnithState(state);
     std::string error;
-    if (!restored.session().RestoreSnapshot(ornith_snapshot->payload,
-                                            restored.logits(), &error) ||
+    const bool restored_ok =
+        ornith_snapshot->staged
+            ? restored.session().RestoreStagedSnapshot(
+                  *ornith_snapshot->staged, restored.logits(), &error)
+            : restored.session().RestoreSnapshot(ornith_snapshot->payload,
+                                                 restored.logits(), &error);
+    if (!restored_ok ||
         restored.session().Position() != ornith_snapshot->position) {
       FailOrnithSession(restored, "Ornith snapshot restore failed: " + error);
     }

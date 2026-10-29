@@ -1039,19 +1039,34 @@ struct TextRunnerPool::Request::Impl {
     }
 
     snapshot_start = std::chrono::steady_clock::now();
+    snapshot_overlapped = false;
     try {
-      // A warm prefill must await its fallback before mutating recurrent
-      // state. Run that copy on this worker instead of starting a thread
-      // only to join it. Post-token captures remain asynchronous.
-      snapshot_future =
-          std::async(wait ? std::launch::deferred : std::launch::async,
-                     [this, owner = runner, state, persist = bool(disk_store)] {
-                       if (lease.component())
-                         return lease.Capture();
-                       return persist ? owner->SnapshotForPersistence(*state)
-                                      : owner->Snapshot(*state);
-                     });
+      // Freeze mutable state before the worker exports it. A staged image
+      // stays valid while this request prefills past the boundary, so the
+      // host copy is not on the first-token path.
+      auto& mutable_state = dynamic_cast<TextRunnerState&>(lease.state());
+      if (capabilities.staged_snapshot &&
+          runner->StageSnapshot(mutable_state)) {
+        snapshot_overlapped = true;
+        snapshot_metrics.snapshot_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - snapshot_start)
+                .count();
+      }
+      // A warm prefill must await a capture that still reads live buffers.
+      // Run that copy on this worker instead of starting a thread only to
+      // join it. Staged and post-token captures remain asynchronous.
+      const auto launch = (wait && !snapshot_overlapped) ? std::launch::deferred
+                                                         : std::launch::async;
+      snapshot_future = std::async(
+          launch, [this, owner = runner, state, persist = bool(disk_store)] {
+            if (lease.component())
+              return lease.Capture();
+            return persist ? owner->SnapshotForPersistence(*state)
+                           : owner->Snapshot(*state);
+          });
     } catch (...) {
+      snapshot_overlapped = false;
       disk_capture.reset();
       if (retain_snapshot)
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
@@ -1060,15 +1075,21 @@ struct TextRunnerPool::Request::Impl {
   }
 
   void FinishPromptSnapshot() noexcept {
+    const auto wait_start = std::chrono::steady_clock::now();
     try {
       prompt_snapshot = snapshot_future.get();
     } catch (...) {
       prompt_snapshot.reset();
     }
+    // An overlapped export already counted the device freeze. Add only the
+    // time this thread actually waited for the host bytes.
+    const auto finished = std::chrono::steady_clock::now();
     snapshot_metrics.snapshot_ms +=
         std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - snapshot_start)
+            (snapshot_overlapped ? finished - wait_start
+                                 : finished - snapshot_start))
             .count();
+    snapshot_overlapped = false;
     if (prompt_snapshot == nullptr) {
       disk_capture.reset();
       if (retain_snapshot) {
@@ -1125,6 +1146,11 @@ struct TextRunnerPool::Request::Impl {
   void CaptureBoundarySnapshot(
       std::size_t position, bool history, bool shared,
       SnapshotPurpose purpose = SnapshotPurpose::kHistory) noexcept {
+    // One future slot. A staged prompt export may still be running; finish
+    // it before a boundary worker replaces that slot, or its payload is
+    // dropped. The join is after the suffix that overlapped the copy.
+    if (!boundary_capture && snapshot_future.valid())
+      FinishPromptSnapshot();
     if (!overlap_snapshots) {
       // A single execution slot has no peer work to overlap with the copy.
       CaptureBoundarySnapshotNow(position, history, shared, purpose);
@@ -1256,6 +1282,9 @@ struct TextRunnerPool::Request::Impl {
                    : std::span<const std::uint8_t>{};
   }
   bool prompt_snapshot_attempted{false};
+  /// The in-flight prompt snapshot reads a private image, so prefill may
+  /// continue before the host export finishes.
+  bool snapshot_overlapped{false};
   std::shared_ptr<const TextRunnerSnapshot> prompt_snapshot;
   TextRunnerPool::Request::CommitMetrics snapshot_metrics;
   std::size_t snapshot_bytes{0};
@@ -1458,8 +1487,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   }
 
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
-  // Direct callers join any capture before mutating its borrowed state.
-  impl_->CapturePromptSnapshot();
+  // A staged snapshot already froze that boundary, so the suffix prefill
+  // does not wait for the host export. Direct callers still join a capture
+  // that reads live buffers before mutating them.
+  const bool overlapped =
+      impl_->snapshot_overlapped &&
+      impl_->runner->Descriptor().capabilities.staged_snapshot;
+  impl_->CapturePromptSnapshot(!overlapped);
   const auto snapshot_position = impl_->snapshot_tokens.size();
   while (!impl_->boundaries.empty() &&
          impl_->boundaries.front() <= impl_->prefill_offset) {

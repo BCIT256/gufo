@@ -123,6 +123,10 @@ struct TextRunnerCapabilities {
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
   bool in_pass_checkpoint{false};
+  /// StageSnapshot freezes the frontier in private storage. The host export
+  /// may then overlap later prefill; a cached turn does not wait for it
+  /// before the first token.
+  bool staged_snapshot{false};
   /// A completed prefill step leaves a consistent state, so a cancelled
   /// request can keep it as a live prefix for a superseding request.
   bool partial_prefill_retention{false};
@@ -483,6 +487,14 @@ public:
   /// shared execution scratch; other sessions may execute concurrently.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const;
+  /// Queues a private copy of the current frontier. True means Snapshot may
+  /// run concurrently with later prefill on this state. False leaves the
+  /// live buffers as the only copy, so the caller must finish Snapshot
+  /// before mutating them.
+  [[nodiscard]] virtual bool StageSnapshot(TextRunnerState& state) const {
+    (void)state;
+    return false;
+  }
   /// Complete state before returning so export cannot introduce device copies
   /// while the session resumes prefill. Defaults to the ordinary snapshot.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot>

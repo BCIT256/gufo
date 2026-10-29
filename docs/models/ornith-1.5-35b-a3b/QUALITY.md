@@ -179,6 +179,16 @@ Payload bytes depend only on position: 66877504 at P=1, 67000384 at P=7,
 67205184 at P=17, and 67840064 at P=48. Each additional token adds 20480
 bytes, ten F16 K/V layers.
 
+The same gate covers a staged device image. At each frontier the test
+copies with `SaveSnapshot`, then `StageSnapshot`, prefills past that
+frontier, and `ExportStagedSnapshot`. The exported bytes must equal the
+stop-at-boundary payload. `RestoreStagedSnapshot` into that same session
+must leave KV in place, and into a fresh session must copy KV. Both
+continuations must match the source continuation bit for bit. Oracle and
+held-out both passed that case: exported bytes matched, same-session
+restore skipped KV, foreign restore copied KV, and every continuation
+logit was bit-identical (max abs error 0). Payload sizes were unchanged.
+
 The server reuses that payload. A temperature-0 tool turn whose cached
 frontier was built by prefill plus decode steps can pick a different first
 token than a cold prefill of the same prompt. On the 507-token turn below,
