@@ -30,7 +30,11 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_ornith15_gpu PUBLIC
     gufo_ornith15 gufo_qwen38_flash_next gufo_qwen38_flash_next_mmq hip::host)
 
-  add_executable(ornith15_bench EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/ornith15/bench.cpp)
-  target_link_libraries(ornith15_bench PRIVATE gufo_ornith15_gpu)
+  # tools/ is outside the production source filter. The release preset
+  # reaches this target with -DGUFO_BUILD_TOOLS=ON. It is not installed.
+  if (GUFO_BUILD_TOOLS)
+    add_executable(ornith15_bench EXCLUDE_FROM_ALL
+      ${PROJECT_SOURCE_DIR}/tools/ornith15/bench.cpp)
+    target_link_libraries(ornith15_bench PRIVATE gufo_ornith15_gpu)
+  endif()
 endif()

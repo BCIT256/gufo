@@ -107,6 +107,7 @@ stdenv.mkDerivation {
     test "$($out/bin/gufo-server --version)" = "gufo version ${versionLabel} (${revision})"
     $out/bin/gufo-server --help >/dev/null
     test ! -e $out/bin/gufo-kernel-bench
+    test ! -e $out/bin/ornith15_bench
     test -f $out/share/licenses/gufo/LICENSE
     test -f $out/share/licenses/gufo/third-party/LICENSE.ds4
 
