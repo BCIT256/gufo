@@ -370,6 +370,61 @@ int main() {
       Require(actual == first_logits, "traced replay changed logits");
       gpu.reset();
       other.reset();
+
+      const auto tail = std::min<std::uint32_t>(8, n - 1);
+      const auto prefix = n - tail;
+      for (const std::uint32_t chunk : {64u, 512u}) {
+        Require(chunk <= orn::rocm::Session::kMaxPrefillChunk, "chunk limit");
+        auto session = orn::rocm::Session::Create(*device, n, &error);
+        Require(session != nullptr, "prefill session: " + error);
+        std::vector<float> last(vocab), all(std::size_t(prefix) * vocab),
+            got(std::size_t(n) * vocab);
+        Require(session->Prefill(
+                    std::span<const std::int32_t>(batch.tokens.data(), prefix),
+                    last, &error, chunk, all),
+                "prefill: " + error);
+        Require(std::equal(last.begin(), last.end(),
+                           all.end() - static_cast<std::ptrdiff_t>(vocab)),
+                "prefill last row differs from all-logits");
+        std::copy(all.begin(), all.end(), got.begin());
+        for (std::uint32_t t = 0; t < tail; ++t) {
+          Require(session->Step(batch.tokens[prefix + t], actual, &error),
+                  "prefill tail: " + error);
+          std::copy(actual.begin(), actual.end(),
+                    got.begin() + std::size_t(prefix + t) * vocab);
+        }
+        Require(session->Position() == n, "prefill position");
+        GateStats pre;
+        double kl_sum = 0, kl_max = 0;
+        for (std::uint32_t t = 0; t < n; ++t) {
+          const auto gpu_row = got.data() + std::size_t(t) * vocab;
+          const auto step_row = step_logits.data() + std::size_t(t) * vocab;
+          const auto lq = LogSoftmax(gpu_row, vocab);
+          const auto ll = LogSoftmax(batch.Row(t), vocab);
+          const double lk = Kl(ll, lq);
+          const double floor = Kl(ll, LogSoftmax(sequential.Row(t), vocab));
+          const double versus = Kl(LogSoftmax(step_row, vocab), lq);
+          pre.llama_sum += lk;
+          pre.floor_sum += floor;
+          pre.llama_max = std::max(pre.llama_max, lk);
+          const bool outlier = !(lk <= kOutlierRatio * self_max);
+          pre.outliers += outlier;
+          ++pre.positions;
+          kl_sum += versus;
+          kl_max = std::max(kl_max, versus);
+          if (outlier)
+            std::cout << prompt << " chunk=" << chunk << " t=" << t
+                      << " llama_kl=" << lk << " outlier=1" << std::endl;
+        }
+        const bool pre_pass = MeanPass(pre) && OutlierPass(pre);
+        std::cout << prompt << " chunk=" << chunk << " prefill=" << prefix
+                  << " step_tail=" << tail << " ";
+        PrintGate(pre, self_max);
+        std::cout << prompt << " chunk=" << chunk
+                  << " prefill_vs_step_mean_kl=" << kl_sum / n
+                  << " prefill_vs_step_max_kl=" << kl_max << std::endl;
+        ok = ok && pre_pass;
+      }
     }
     Require(ok, "one or more prompts failed the distribution contract");
   } catch (const std::exception& e) {
