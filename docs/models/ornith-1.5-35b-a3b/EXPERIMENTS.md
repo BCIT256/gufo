@@ -1140,3 +1140,11 @@ edit. A causal test, before any kernel change, would compare one
 unmatched row's device partial with these two host readings. The shared
 Q8_0 experts were not scored. This audit still does not explain the
 different norm that reaches layer 6.
+
+## M1
+
+The per-position scalar chase is closed. GPU acceptance is the distribution
+gate in [QUALITY.md](QUALITY.md). Decode downloads logits only when requested
+and can take a device argmax. Plain decode may replay one HIP graph. Prefill
+runs chunks of up to 512 tokens on the batched MMQ, GatedDeltaNet and causal
+attention kernels. Measured rates are in [BENCHMARKS.md](BENCHMARKS.md).

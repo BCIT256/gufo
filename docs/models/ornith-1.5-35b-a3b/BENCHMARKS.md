@@ -1,7 +1,7 @@
 # Ornith GPU AR checkpoint measurements
 
-Historical P4/P4b evidence is retained below; the P4c section at the end
-records the current policy and acceptance criteria.
+Historical P4/P4b evidence is retained below; the P4c section records the
+policy choice. The M1 section records the later prefill and decode rates.
 
 October 23, 2026; gfx1151, pinned Nix RelWithDebInfo correctness build with
 assertions. These are informational measurements from eager single-token
@@ -61,3 +61,36 @@ B 50.0442 ms/token over 649 positions. Kept policy: B.
 Single sequential B-then-A comparison with uncached scalar-reference
 interleave, not an alternating production benchmark or an equivalent-fidelity
 speedup claim. See [per-prompt timings and scope](EXPERIMENTS.md#p4c-informational-timings).
+
+## M1 prefill and greedy decode
+
+2026-10-28, gfx1151, one session, context 4096, prefill chunks of 512.
+`ornith15_bench` from the `gpu-test` preset: Nix RelWithDebInfo with
+assertions. The model is loaded once. Warmup is one prefill plus 16 untimed
+device-argmax steps. Each reported rate is the median of five later runs.
+A run is `Reset`, `Prefill`, a host argmax of the last logits (not timed),
+then 128 `Step` calls that take a device argmax and do not download logits.
+Power at the start of the run: `AC0/online=1`, `BAT0/status=Charging`.
+
+The prompt is the GGUF tokenizer's encoding of one English coding request
+(merge half-open intervals, C++17, no BOS or EOS, special tokens not parsed),
+repeated until it fills 2048 tokens and, separately, 261 tokens.
+
+Lemonade numbers are the project's 2026-10-26 stock llama.cpp measurement on
+this laptop and the same GGUF, autoregressive, without MTP. That run used a
+2033-token prompt for the long prefill. The prompts and the builds differ.
+Each column is that run's own measurement.
+
+| | Prompt tokens | pp tok/s | tg tok/s |
+| --- | ---: | ---: | ---: |
+| Gufo-Ornith median | 2048 | 717.2346 | 38.4167 |
+| Lemonade, 2026-10-26 | 2033 | ~995 | ~35.4 |
+| Gufo-Ornith median | 261 | 544.8397 | 40.6073 |
+| Lemonade, 2026-10-26 | 261 | ~626 | ~38.7 |
+
+Five Gufo-Ornith samples, in run order:
+
+| Prompt tokens | pp tok/s | tg tok/s |
+| ---: | --- | --- |
+| 2048 | 750.5527, 717.5176, 715.8051, 716.3496, 717.2346 | 38.9878, 38.4167, 38.1848, 38.7807, 38.4011 |
+| 261 | 547.5602, 544.2966, 543.6358, 545.5704, 544.8397 | 42.1052, 41.1675, 40.1747, 40.6073, 40.3313 |

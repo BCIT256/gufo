@@ -45,4 +45,8 @@ if (ENGINE_ENABLE_HIP)
     $<$<COMPILE_LANGUAGE:HIP>:-O3>)
   target_link_libraries(gufo_ornith15_gpu_probe PUBLIC
     gufo_ornith15 gufo_qwen38_flash_next gufo_qwen38_flash_next_mmq hip::host)
+
+  add_executable(ornith15_bench EXCLUDE_FROM_ALL
+    ${PROJECT_SOURCE_DIR}/tools/ornith15/bench.cpp)
+  target_link_libraries(ornith15_bench PRIVATE gufo_ornith15_gpu)
 endif()
