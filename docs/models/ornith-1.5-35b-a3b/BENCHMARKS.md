@@ -325,3 +325,75 @@ gap is much larger than the earlier gpu-test versus release gap.
 | ---: | --- | --- | --- | --- | --- |
 | 69 | old, new, old, new | 276.5, 263.9 | 164.4, 166.0 | 48.8, 43.3 | 43.3, 41.5 |
 | 4012 | old, new, old, new | 842.2, 836.1 | 173.9, 169.8 | 38.2, 37.6 | 35.6, 36.8 |
+
+## M4 Gufo versus llama.cpp
+
+2026-10-29T08:52:20-05:00, gfx1151. Gufo is `result/bin/gufo` (nix
+package of `beb0cd31`, 16-token grid). llama.cpp is
+`llama-b11580` under Lemonade's rocm-stable tree. Same GGUF, one
+server at a time, fresh process per sample except the agent replay,
+which keeps one process for all seven turns. Power: `AC0/online=1`,
+`BAT0/status=Not charging`. Lemonade's own llama-server (pid 3363206,
+state `Sl`, port 8003, `--spec-type draft-mtp`) stayed up and was not
+paused. Sentence repeats did not land on 261 or 2048 tokens. The
+closest prompts are 252 tokens (24 sentences) and 2052 tokens (204
+sentences). The binary search that found those lengths is not in the
+tables. Temperature 0, seed 41, thinking off. Each row is two cycles
+in the order named.
+
+Gufo:
+
+```
+result/bin/gufo serve --host 127.0.0.1 --port PORT llm --model Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --context 16384 --sessions 1 --served-model-name ornith-m4 --cache-disk artifacts/m4/m3-disk --cache-disk-bytes 8589934592
+```
+
+llama.cpp autoregressive (no `--spec-type`):
+
+```
+llama-server -m Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --host 127.0.0.1 --port PORT --ctx-size 16384 --jinja --parallel 1
+```
+
+llama.cpp MTP adds `--spec-type draft-mtp`. Ports changed per process.
+`cache_prompt` was false for the length table and the MTP table, true
+for the agent replay. The length and MTP samples generate 64 tokens.
+The agent replay generates at most 8, with tools `read` and `edit`,
+from the release G=16 message lists.
+
+| Prompt tokens | Order | Gufo pp tok/s | llama.cpp pp tok/s | Gufo tg tok/s | llama.cpp tg tok/s |
+| ---: | --- | --- | --- | --- | --- |
+| 252 | gufo, llama, gufo, llama | 167.6, 170.3 | 237.1, 235.3 | 39.22, 39.43 | 25.68, 25.54 |
+| 2052 | gufo, llama, gufo, llama | 171.2, 171.1 | 231.0, 229.0 | 37.40, 37.74 | 25.00, 25.24 |
+
+Agent replay, one engine per process, then the other, twice. Gufo's
+second pass reuses `--cache-disk` (turn 0 cached 384 of 402, restore
+92.1 ms, TTFT 326.8 ms). llama.cpp's second pass is a new process, so
+its turn 0 is cold again. This llama.cpp build has no TTFT field. The
+llama columns are `timings.prompt_ms`. Gufo columns are
+`usage.gufo.ttft_ms`. Turn 6 stopped at 2 tokens on llama.cpp and at
+the 8-token cap on Gufo.
+
+| Turn | Prompt | Gufo TTFT | llama prompt ms | Gufo TTFT again | llama prompt ms again |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 402 | 2394.8 | 1929.6 | 326.8 | 1922.7 |
+| 1 | 471 | 497.2 | 468.3 | 439.9 | 464.0 |
+| 2 | 584 | 806.2 | 699.0 | 814.7 | 703.1 |
+| 3 | 653 | 541.0 | 480.6 | 542.9 | 483.1 |
+| 4 | 723 | 647.3 | 547.8 | 636.8 | 559.5 |
+| 5 | 824 | 726.6 | 614.1 | 713.1 | 620.7 |
+| 6 | 892 | 552.0 | 485.5 | 541.7 | 497.0 |
+
+Gufo cached tokens on the first pass were 0, 400, 464, 576, 640, 720,
+816. llama.cpp `cache_n` on each pass was 0, 409, 467, 591, 649, 730,
+831. The second Gufo pass cached 384, 400, 464, 576, 640, 720, 816.
+
+MTP decode is Gufo autoregressive against llama.cpp `--spec-type
+draft-mtp`, 64 new tokens, cache off, same interleave.
+
+| Prompt tokens | Gufo AR tg tok/s | llama.cpp MTP tg tok/s | llama.cpp drafts accepted |
+| ---: | --- | --- | --- |
+| 252 | 42.86, 42.31 | 20.83, 20.73 | 29/100, 29/100 |
+| 2052 | 40.12, 40.44 | 20.27, 20.13 | 30/95, 30/95 |
+
+On these prompts llama.cpp MTP decode is slower than the same build's
+autoregressive decode above. This run does not reproduce an earlier
+~46 tok/s MTP figure.
