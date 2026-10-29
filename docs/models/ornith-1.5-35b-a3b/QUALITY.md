@@ -157,3 +157,24 @@ when `GUFO_ORNITH15_SCALAR_REFERENCE=1`. The scalar reference and
 `ornith15.reference_oracle` are unchanged. The GPU test leaves the reference
 off unless that variable is set. Thresholds are not tuned from results.
 Chunked prefill is scored at 16, 48, 64 and 512 tokens.
+
+## Session snapshot
+
+`ornith15.gpu_snapshot` uses the same M1 ratios, unchanged. A continuation
+after `SaveSnapshot` must match the continuation after `RestoreSnapshot`
+bit for bit: into a fresh session, into a session that has already prefilled
+another prompt, and back into the source session. The checked frontiers are
+P=1, P=7, P=17 inside a 16-token chunk, P=48 with chunk 64 when the history
+is longer than 50, and P=17 immediately after a decode `Step`.
+
+Oracle (3 histories, set max self-KL 1.039941167) and held-out (6 histories,
+set max self-KL 5.040428549) both passed. Every compared continuation logit
+was bit-identical (max abs error 0). Two independent reaches of the same
+frontier produced equal payloads. Zeroing layer 0's recurrent state changed
+the next token's logits on every history; a truncated payload was rejected
+and left the position unchanged; layer 3, a full-attention layer, has no
+recurrent region. Restored full sequences passed M1 on every frontier.
+
+Payload bytes depend only on position: 66877504 at P=1, 67000384 at P=7,
+67205184 at P=17, and 67840064 at P=48. Each additional token adds 20480
+bytes, ten F16 K/V layers. The server still has no prefix cache.

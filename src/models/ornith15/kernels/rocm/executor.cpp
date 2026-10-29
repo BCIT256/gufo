@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -18,6 +19,96 @@ namespace {
 void Check(hipError_t rc, const char* what) {
   if (rc != hipSuccess)
     throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(rc));
+}
+
+// Packed host image of one session frontier. Fields are native-endian and
+// the struct is 64 bytes so a payload has no header padding.
+struct SnapshotHeader {
+  char magic[4];
+  std::uint32_t version;
+  std::uint32_t position;
+  std::uint32_t max_context;
+  std::uint32_t num_layers;
+  std::uint32_t full_attention_interval;
+  std::uint32_t conv_floats;
+  std::uint32_t recurrent_floats;
+  std::uint32_t kv_dim;
+  std::uint32_t vocab;
+  std::uint32_t hidden_size;
+  std::uint32_t ssm_conv_kernel;
+  std::uint32_t ssm_num_v_heads;
+  std::uint32_t ssm_head_dim;
+  std::uint32_t num_kv_heads;
+  std::uint32_t head_dim;
+};
+static_assert(sizeof(SnapshotHeader) == 64, "snapshot header is packed");
+
+constexpr char kSnapshotMagic[4] = {'O', 'R', 'N', 'S'};
+
+std::uint32_t ConvFloats(const Config& c) {
+  return (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+}
+
+std::uint32_t RecurrentFloats(const Config& c) {
+  return c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
+}
+
+bool HeaderMatches(const SnapshotHeader& header, const Config& c,
+                   std::uint32_t max_context) {
+  return std::memcmp(header.magic, kSnapshotMagic, 4) == 0 &&
+         header.version == Session::kSnapshotPayloadVersion &&
+         header.max_context == max_context &&
+         header.num_layers == c.num_layers &&
+         header.full_attention_interval == c.full_attention_interval &&
+         c.full_attention_interval != 0 &&
+         header.conv_floats == ConvFloats(c) &&
+         header.recurrent_floats == RecurrentFloats(c) &&
+         header.kv_dim == c.AttentionKvDim() && header.vocab == c.vocab_size &&
+         header.hidden_size == c.hidden_size &&
+         header.ssm_conv_kernel == c.ssm_conv_kernel &&
+         header.ssm_num_v_heads == c.ssm_num_v_heads &&
+         header.ssm_head_dim == c.ssm_head_dim &&
+         header.num_kv_heads == c.num_kv_heads &&
+         header.head_dim == c.head_dim && header.position <= max_context;
+}
+
+std::size_t PayloadBytes(const SnapshotHeader& header) {
+  std::size_t bytes = sizeof(SnapshotHeader);
+  const std::size_t conv = std::size_t(header.conv_floats) * sizeof(float);
+  const std::size_t recurrent =
+      std::size_t(header.recurrent_floats) * sizeof(float);
+  const std::size_t kv_row = std::size_t(header.kv_dim) * sizeof(__half);
+  for (std::uint32_t layer = 0; layer < header.num_layers; ++layer) {
+    const bool linear = ((layer + 1) % header.full_attention_interval) != 0;
+    if (linear)
+      bytes += conv + recurrent;
+    else
+      bytes += 2 * std::size_t(header.position) * kv_row;
+  }
+  bytes += std::size_t(header.vocab) * sizeof(float);
+  return bytes;
+}
+
+SnapshotHeader MakeHeader(const Config& c, std::uint32_t position,
+                          std::uint32_t max_context) {
+  SnapshotHeader header{};
+  std::memcpy(header.magic, kSnapshotMagic, 4);
+  header.version = Session::kSnapshotPayloadVersion;
+  header.position = position;
+  header.max_context = max_context;
+  header.num_layers = c.num_layers;
+  header.full_attention_interval = c.full_attention_interval;
+  header.conv_floats = ConvFloats(c);
+  header.recurrent_floats = RecurrentFloats(c);
+  header.kv_dim = c.AttentionKvDim();
+  header.vocab = c.vocab_size;
+  header.hidden_size = c.hidden_size;
+  header.ssm_conv_kernel = c.ssm_conv_kernel;
+  header.ssm_num_v_heads = c.ssm_num_v_heads;
+  header.ssm_head_dim = c.ssm_head_dim;
+  header.num_kv_heads = c.num_kv_heads;
+  header.head_dim = c.head_dim;
+  return header;
 }
 
 }  // namespace
@@ -555,6 +646,16 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
       RunChunk(count, nullptr);
       if (want_all) {
         ProjectAllLogits(count);
+        // The snapshot and a later Step read logits_, which the batched head
+        // does not write. Keep that one row equal to the published last row.
+        if (last) {
+          Check(hipMemcpyAsync(
+                    logits_,
+                    logits_batch_ + std::size_t(count - 1) * c.vocab_size,
+                    std::size_t(c.vocab_size) * sizeof(float),
+                    hipMemcpyDeviceToDevice, stream_),
+                "prefill frontier logits");
+        }
         Check(
             hipMemcpyAsync(all_logits.data() + std::size_t(done) * c.vocab_size,
                            logits_batch_,
@@ -586,6 +687,183 @@ bool Session::Prefill(std::span<const std::int32_t> tokens,
       *error = e.what();
     return false;
   }
+}
+
+std::size_t Session::SnapshotPayloadBytes() const noexcept {
+  if (model_ == nullptr)
+    return 0;
+  return PayloadBytes(MakeHeader(model_->config(), position_, max_context_));
+}
+
+bool Session::SaveSnapshot(std::vector<std::uint8_t>* payload,
+                           std::string* error) const {
+  if (payload == nullptr || model_ == nullptr || failed_ ||
+      stream_ == nullptr) {
+    if (error != nullptr)
+      *error = "invalid snapshot (no destination or failed session)";
+    return false;
+  }
+  const auto& c = model_->config();
+  const SnapshotHeader header = MakeHeader(c, position_, max_context_);
+  if (!HeaderMatches(header, c, max_context_)) {
+    if (error != nullptr)
+      *error = "session configuration cannot be snapshotted";
+    return false;
+  }
+  std::vector<std::uint8_t> bytes(PayloadBytes(header));
+  std::memcpy(bytes.data(), &header, sizeof(header));
+  try {
+    Check(hipStreamSynchronize(stream_), "snapshot drain");
+    std::size_t offset = sizeof(header);
+    const std::size_t conv_bytes =
+        std::size_t(header.conv_floats) * sizeof(float);
+    const std::size_t recurrent_bytes =
+        std::size_t(header.recurrent_floats) * sizeof(float);
+    const std::size_t kv_bytes =
+        std::size_t(header.position) * header.kv_dim * sizeof(__half);
+    const auto copy_out = [&](void* dst, const void* src, std::size_t count,
+                              const char* what) {
+      if (count == 0)
+        return;
+      Check(hipMemcpyAsync(dst, src, count, hipMemcpyDeviceToHost, stream_),
+            what);
+    };
+    for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+      const auto& state = state_[layer];
+      if (c.IsLinearLayer(layer)) {
+        copy_out(bytes.data() + offset, state.conv, conv_bytes,
+                 "snapshot conv");
+        offset += conv_bytes;
+        copy_out(bytes.data() + offset, state.recurrent, recurrent_bytes,
+                 "snapshot recurrent");
+        offset += recurrent_bytes;
+      } else {
+        copy_out(bytes.data() + offset, state.k, kv_bytes, "snapshot K");
+        offset += kv_bytes;
+        copy_out(bytes.data() + offset, state.v, kv_bytes, "snapshot V");
+        offset += kv_bytes;
+      }
+    }
+    const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
+    Check(hipMemcpyAsync(bytes.data() + offset, logits_, logit_bytes,
+                         hipMemcpyDeviceToHost, stream_),
+          "snapshot logits");
+    offset += logit_bytes;
+    Check(hipStreamSynchronize(stream_), "snapshot");
+    if (offset != bytes.size())
+      throw std::runtime_error("snapshot size diverged");
+  } catch (const std::exception& e) {
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  *payload = std::move(bytes);
+  return true;
+}
+
+bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
+                              std::span<float> logits, std::string* error) {
+  if (model_ == nullptr || stream_ == nullptr) {
+    if (error != nullptr)
+      *error = "invalid snapshot restore";
+    return false;
+  }
+  const auto& c = model_->config();
+  SnapshotHeader header{};
+  if (payload.size() < sizeof(header)) {
+    if (error != nullptr)
+      *error = "snapshot payload is truncated";
+    return false;
+  }
+  std::memcpy(&header, payload.data(), sizeof(header));
+  if (!HeaderMatches(header, c, max_context_) ||
+      payload.size() != PayloadBytes(header) ||
+      (logits.size() != c.vocab_size && !logits.empty())) {
+    if (error != nullptr)
+      *error = "snapshot does not match this session";
+    return false;
+  }
+  try {
+    Check(hipStreamSynchronize(stream_), "restore drain");
+    std::size_t offset = sizeof(header);
+    const std::size_t conv_bytes =
+        std::size_t(header.conv_floats) * sizeof(float);
+    const std::size_t recurrent_bytes =
+        std::size_t(header.recurrent_floats) * sizeof(float);
+    const std::size_t kv_bytes =
+        std::size_t(header.position) * header.kv_dim * sizeof(__half);
+    const auto copy_in = [&](void* dst, const void* src, std::size_t count,
+                             const char* what) {
+      if (count == 0)
+        return;
+      Check(hipMemcpyAsync(dst, src, count, hipMemcpyHostToDevice, stream_),
+            what);
+    };
+    for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
+      auto& state = state_[layer];
+      if (c.IsLinearLayer(layer)) {
+        copy_in(state.conv, payload.data() + offset, conv_bytes,
+                "restore conv");
+        offset += conv_bytes;
+        copy_in(state.recurrent, payload.data() + offset, recurrent_bytes,
+                "restore recurrent");
+        offset += recurrent_bytes;
+      } else {
+        copy_in(state.k, payload.data() + offset, kv_bytes, "restore K");
+        offset += kv_bytes;
+        copy_in(state.v, payload.data() + offset, kv_bytes, "restore V");
+        offset += kv_bytes;
+      }
+    }
+    const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
+    const std::size_t logit_offset = offset;
+    copy_in(logits_, payload.data() + offset, logit_bytes, "restore logits");
+    offset += logit_bytes;
+    Check(hipStreamSynchronize(stream_), "restore");
+    if (offset != payload.size())
+      throw std::runtime_error("snapshot restore size diverged");
+    if (!logits.empty())
+      std::memcpy(logits.data(), payload.data() + logit_offset, logit_bytes);
+  } catch (const std::exception& e) {
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+  position_ = header.position;
+  failed_ = false;
+  return true;
+}
+
+bool Session::SnapshotRecurrentRegion(std::span<const std::uint8_t> payload,
+                                      std::uint32_t layer, std::size_t* offset,
+                                      std::size_t* bytes) {
+  if (offset == nullptr || bytes == nullptr ||
+      payload.size() < sizeof(SnapshotHeader))
+    return false;
+  SnapshotHeader header{};
+  std::memcpy(&header, payload.data(), sizeof(header));
+  if (std::memcmp(header.magic, kSnapshotMagic, 4) != 0 ||
+      header.version != kSnapshotPayloadVersion ||
+      header.full_attention_interval == 0 || layer >= header.num_layers ||
+      payload.size() != PayloadBytes(header))
+    return false;
+  if (((layer + 1) % header.full_attention_interval) == 0)
+    return false;
+  std::size_t cursor = sizeof(header);
+  const std::size_t conv_bytes =
+      std::size_t(header.conv_floats) * sizeof(float);
+  const std::size_t recurrent_bytes =
+      std::size_t(header.recurrent_floats) * sizeof(float);
+  const std::size_t kv_bytes =
+      std::size_t(header.position) * header.kv_dim * sizeof(__half);
+  for (std::uint32_t index = 0; index < layer; ++index) {
+    const bool linear = ((index + 1) % header.full_attention_interval) != 0;
+    cursor += linear ? conv_bytes + recurrent_bytes : 2 * kv_bytes;
+  }
+  *offset = cursor + conv_bytes;
+  *bytes = recurrent_bytes;
+  return cursor + conv_bytes + recurrent_bytes <= payload.size();
 }
 
 }  // namespace gufo::models::ornith15::rocm

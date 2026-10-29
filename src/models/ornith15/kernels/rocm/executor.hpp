@@ -52,6 +52,31 @@ public:
   std::uint32_t Position() const noexcept { return position_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
 
+  /// Host payload version of SaveSnapshot / RestoreSnapshot.
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  /// Bytes SaveSnapshot writes at the current position. KV is the valid
+  /// rows only; recurrent and convolution state are whole layers.
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
+  /// Device-to-host copy of everything Step and Prefill read: position,
+  /// gated-attention KV below that position, every DeltaNet recurrent and
+  /// short-convolution state, and the logits. A failed session returns false
+  /// and leaves `payload` unchanged.
+  [[nodiscard]] bool SaveSnapshot(std::vector<std::uint8_t>* payload,
+                                  std::string* error = nullptr) const;
+  /// Host-to-device restore into this session, fresh or already used.
+  /// `logits` receives the restored row when it holds one vocabulary row;
+  /// an empty span leaves that download to the caller. An invalid payload
+  /// returns false and does not modify this session.
+  [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
+                                     std::span<float> logits,
+                                     std::string* error = nullptr);
+  /// Offset and length of one linear layer's recurrent matrix inside a
+  /// version-1 payload. False when the payload is not that version or the
+  /// layer is not DeltaNet.
+  [[nodiscard]] static bool SnapshotRecurrentRegion(
+      std::span<const std::uint8_t> payload, std::uint32_t layer,
+      std::size_t* offset, std::size_t* bytes);
+
 private:
   Session() = default;
   void Dense(const DeviceTensor& w, const float* x, float* out);
