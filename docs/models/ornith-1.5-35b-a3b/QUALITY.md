@@ -189,3 +189,9 @@ at token 500, which is the server's stable-prefix cut, scored 20.8926 and
 cached position 477 chose `<tool_call>` by 0.2029. Prefill, 39 teacher-forced
 steps, then the suffix chose `<tool_call>` by 1.2751. Chunks of 64 stayed
 with the single 512-token prefill. Thresholds are unchanged.
+
+The width-48 routed prefill tile was scored with those same ratios.
+Oracle `ctest` of `^(ornith15|qwen38_flash_next)\.` was 30/30, including
+`ornith15.gpu_decode`, `ornith15.gpu_ops` and `ornith15.gpu_snapshot`.
+Held-out `ornith15.gpu_decode` passed. Chunk sizes stayed 16, 48, 64 and
+512. Thresholds were not changed.

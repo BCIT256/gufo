@@ -207,3 +207,47 @@ hits, so their TTFT is about 5 ms. Card TTFT is a cold prefill.
 | tool_round_trip | greedy | 6.5, 255.2, 214.9 | 39.7, 41.8, 39.6 | 351, 428, 505 |
 | two_turn_clamp | greedy | 5.1, 303.1 | 42.1, 41.6 | 50, 188 |
 | rectangle_area | greedy | 5.1 | 41.8 | 42 |
+
+## M3 prefill tile
+
+2026-10-29, gfx1151, release `Session::Prefill` only. The prompt is the M1
+English sentence, repeated. Context 4096. `Reset` is outside the timer.
+There is no decode and no host argmax, so these rates are not the M2
+`ornith15_bench` medians. Baseline is one measure of tile 80. Width 48 is
+the median of three measures after one warmup of each length.
+
+| | 20 s | 20 tok/s | 261 s | 261 tok/s | 2048 s | 2048 tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Tile 80 | 0.1238 | 161.5 | 0.4256 | 613.3 | 2.4654 | 830.7 |
+| Width 48, median | 0.1038 | 192.6 | 0.3852 | 677.6 | 2.3848 | 858.8 |
+
+The three width-48 measures, in order: 20 tokens 196.5, 192.6, 182.8;
+2048 tokens 880.4, 856.6, 858.8; 261 tokens 679.1, 677.0, 677.6.
+Lemonade's ~995 tok/s at about 2048 tokens was not reached.
+
+rocprof kernel time for those measured passes, in milliseconds. Sums add
+dispatch durations, so they can exceed the GPU span when launches overlap.
+The 2048 columns are the four 512-token chunks. Routed is `mul_mat_q`
+with grid z 256. After the change, IQ4 gate/up at 512 tokens launch
+`ntx=11`; IQ4 down stays at `ntx=86`.
+
+| Class | 20 before | 20 after | 261 before | 261 after | 2048 before | 2048 after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Routed IQ4_XS | 29.93 | 21.93 | 110.65 | 86.35 | 560.78 | 486.12 |
+| Routed Q6_K | 29.70 | 20.72 | 77.59 | 58.73 | 343.86 | 291.71 |
+| Routed Q5_K | 16.35 | 12.35 | 57.14 | 45.52 | 267.51 | 240.50 |
+| Dense Q6 projections | 13.63 | 13.31 | 81.47 | 77.41 | 513.49 | 497.62 |
+| Shared Q8_0 | 4.07 | 4.03 | 8.07 | 7.64 | 45.42 | 43.92 |
+| DeltaNet | 2.40 | 2.49 | 21.52 | 21.20 | 178.30 | 182.43 |
+| Attention | 0.32 | 0.37 | 3.51 | 3.40 | 117.65 | 114.76 |
+| F32 router/shexp | 2.40 | 2.37 | 17.27 | 16.77 | 130.46 | 126.77 |
+| MoE epilogue/SwiGLU | 0.73 | 0.70 | 12.38 | 11.94 | 135.96 | 128.32 |
+| Quantize and ids | 3.38 | 3.42 | 10.74 | 9.83 | 77.96 | 72.73 |
+| Norm, residual, embed | 1.00 | 1.09 | 3.54 | 3.37 | 25.08 | 24.76 |
+| Vocab GEMV | 1.92 | 1.85 | 1.88 | 1.89 | 1.89 | 1.88 |
+| Runtime fill/copy | 1.54 | 1.54 | 2.71 | 2.48 | 7.57 | 7.19 |
+
+Kernel sums: 20 tokens 107.4 to 86.2 ms, 261 tokens 408.5 to 346.5 ms,
+2048 tokens 2405.9 to 2218.7 ms. The 20-token rocprof pass idled 10.4 ms
+before and 11.6 ms after. Removing the per-chunk stream sync left the
+unprofiled 2048-token prefill at 2.4684 s.

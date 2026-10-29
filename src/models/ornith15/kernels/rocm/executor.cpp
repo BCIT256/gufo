@@ -315,6 +315,31 @@ void Session::Quantized(const DeviceTensor& w, const float* x,
     throw std::runtime_error("quantized projection failed");
 }
 
+// Routed prefill only. Width 48 beat the default 80-column tile at 20,
+// 261 and 2048 tokens on gfx1151. The column grid is capped at the
+// token count passed in: gate and up pass the chunk, so tiles past that
+// are not launched; down already passes one row per selected slot, and
+// the cap does not shrink it. Cleared on return. Dense projections and
+// decode keep the default selector.
+struct RoutedTileHint {
+  bool active = false;
+  RoutedTileHint(int tokens, int experts, int used) {
+    if (experts <= 1 || tokens <= 0 || used <= 0)
+      return;
+    qfn_mmq_set_routed_max_expert_rows(tokens);
+    qfn_mmq_set_routed_tile_cols(48);
+    active = true;
+  }
+  ~RoutedTileHint() {
+    if (!active)
+      return;
+    qfn_mmq_set_routed_max_expert_rows(0);
+    qfn_mmq_set_routed_tile_cols(0);
+  }
+  RoutedTileHint(const RoutedTileHint&) = delete;
+  RoutedTileHint& operator=(const RoutedTileHint&) = delete;
+};
+
 void Session::MoeRaw(const DeviceTensor& w, const float* x,
                      const std::int32_t* ids, float* out,
                      std::uint32_t n_tokens, std::uint32_t used) {
@@ -323,6 +348,7 @@ void Session::MoeRaw(const DeviceTensor& w, const float* x,
   const int n = static_cast<int>(n_tokens);
   const int experts = static_cast<int>(w.experts);
   const int slots = static_cast<int>(used);
+  const RoutedTileHint tile(n, experts, slots);
   int rc = -1;
   switch (w.type) {
     case GgmlType::kQ8_0:

@@ -1148,3 +1148,28 @@ gate in [QUALITY.md](QUALITY.md). Decode downloads logits only when requested
 and can take a device argmax. Plain decode may replay one HIP graph. Prefill
 runs chunks of up to 512 tokens on the batched MMQ, GatedDeltaNet and causal
 attention kernels. Measured rates are in [BENCHMARKS.md](BENCHMARKS.md).
+
+## M3
+
+Routed prefill (`experts > 1`) requests MMQ width 48 and caps the column
+grid at the token count passed into that call. Gate and up pass the chunk
+length. Down passes one row per selected slot, so the cap does not shrink
+it. Dense projections, shared experts and decode stay on the default
+selector. Policy B is unchanged. The probe is release `Session::Prefill`
+of the M1 sentence repeated to length, context 4096, `Reset` outside the
+timer. Rates are tok/s at 20 / 261 / 2048 tokens.
+
+- Width 16 with the cap, one fresh measure: 267.4 / 711.2 / 777.1.
+  Rejected; 2048 fell from 830.7.
+- Width 16 without the cap: 235.3 / 641.3 / 692.8. Rejected.
+- Cap only, tile 80: 161.2 / 625.0 / 848.3. Rejected; the 20-token
+  prefill did not move.
+- Per-chunk `hipStreamSynchronize` removed: 162.4 / 617.4 / 829.7.
+  Rejected; wall time did not change.
+- One process, shared warmup, not fresh: width 32 was 200.3 / 670.3 /
+  815.0, width 64 was 165.3 / 639.6 / 846.8, width 80 with the cap was
+  150.9 / 591.6 / 822.5. Rejected. That process's width-48 sample was
+  184.4 / 674.1 / 861.8 and is not the retained row.
+- Retained width 48, fresh process, median of three: 192.6 / 677.6 /
+  858.8. Baseline on the same probe: 161.5 / 613.3 / 830.7. Lemonade's
+  ~995 tok/s at 2048 tokens was not reached.
