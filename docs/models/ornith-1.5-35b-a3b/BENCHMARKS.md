@@ -487,3 +487,100 @@ DeltaNet prefix rollback) and is not the server path.
 The same binary's agent replay, at most 8 new tokens and cache off,
 matched autoregressive output on all 7 turns. No tool call was emitted;
 the budget ends first, and turn 6 stopped after one token.
+
+## M4 remedy: one launch per call, exact boundaries
+
+2026-10-29, gfx1151. The candidate is the nix package at `0daeb148`
+(`/nix/store/41mx15vg…-gufo-0-unstable-0daeb14`). The control is the nix
+package at `d005bfeb`. Both are release builds. Lemonade's llama-server
+(pid 3363206, state `Sl`, port 8003, MTP) stayed up and was not paused.
+Power was not logged with these runs; the machine was on its wall adapter.
+
+The M4 grid lost short prompts to extra forward passes. A prompt that
+ended on a short cell ran it as a second launch, and the server stopped
+prefill at every cache boundary. Each launch costs roughly 40–65 ms even
+for a few tokens, because they touch most routed expert weights. Now each
+call of up to 512 tokens is one launch, a one-token launch keeps the
+batched kernels, and the server grid is width 1. With a RAM cache the
+boundary image is frozen inside that launch (`Session::PrefillThrough`)
+and copied to the host in the background. With `--cache-disk` prefill
+still stops at the boundary.
+
+Same-preset A/B, 16:31–16:33. Order d005, candidate, three cycles. Fresh
+process per cycle, one warm-up request, then the four prompts.
+`cache_prompt` false, temperature 0, seed 41, thinking off, context 8192,
+at most 128 new tokens. The 18-token prompt is `Reply with the word OK.`
+(one new token), 69 is the short tool instruction, and 262 and 2052 are
+the sentence repeats.
+
+| Prompt tokens | d005 pp tok/s | Candidate pp tok/s | d005 TTFT ms | Candidate TTFT ms | d005 tg tok/s | Candidate tg tok/s |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 18 | 133.5, 131.8, 123.0 | 184.4, 177.5, 167.3 | 167.9, 167.3, 174.5 | 99.5, 103.9, 110.0 | — | — |
+| 69 | 275.7, 279.7, 266.7 | 349.7, 342.3, 331.8 | 282.7, 276.9, 288.3 | 198.6, 203.0, 209.8 | 40.64, 40.16, 39.91 | 40.90, 40.72, 39.76 |
+| 262 | 604.9, 598.2, 585.9 | 682.4, 690.7, 657.9 | 467.4, 467.4, 478.4 | 385.5, 380.6, 399.7 | 40.15, 40.71, 39.68 | 40.58, 39.92, 39.82 |
+| 2052 | 831.9, 827.5, 807.3 | 872.8, 853.9, 830.8 | 2517.3, 2523.7, 2585.0 | 2352.8, 2404.3, 2471.9 | 38.11, 38.15, 37.44 | 38.41, 38.04, 38.47 |
+
+Median prefill gains are 34.7%, 24.2%, 14.1% and 3.2%. Decode medians
+differ by +1.4%, −0.6% and +0.8%. Both columns drift down over the three cycles. On `d005bfeb`
+the first token arrives 28–51 ms after `prefill_ms` ends; on the candidate
+it is 1.3–2.5 ms.
+
+Gufo against llama.cpp `llama-b11580` on the GPU, 16:33–16:35, with the
+command lines and library path of the M4 llama.cpp section. Startup logged
+`offloaded 42/42 layers to GPU` and `ROCm0 model buffer size = 21353.95
+MiB`. Gufo used a RAM cache (no `--cache-disk`), context 16384. Fresh
+process per sample, Gufo then llama.cpp, two cycles, 64 new tokens.
+
+| Prompt tokens | Gufo pp tok/s | llama.cpp pp tok/s | Gufo tg tok/s | llama.cpp tg tok/s |
+| ---: | --- | --- | --- | --- |
+| 262 | 661.6, 662.7 | 591.3, 619.9 | 39.75, 40.17 | 39.82, 38.51 |
+| 2052 | 863.8, 861.5 | 1044.2, 1030.4 | 38.43, 38.14 | 37.52, 38.05 |
+
+llama.cpp's `predicted_per_second` divides by one token fewer than it
+generated. Gufo's rate divides by all completion tokens. Computed the
+same way as Gufo's, llama.cpp decode is 40.46, 39.12 and 38.12, 38.66
+tok/s, and the means differ by under 0.4%. llama.cpp prefill means are
+8.5% slower at 262 tokens and 20.2% faster at 2052.
+
+Agent replay, same processes: one per engine per pass, the short
+`read`/`edit` schema, at most 8 new tokens, `cache_prompt` true. Both
+passes start cold. Gufo columns are TTFT. llama.cpp columns are
+`timings.prompt_ms`.
+
+| Turn | Prompt | Gufo cached | Gufo prefill | Gufo TTFT | llama `cache_n` | llama prompt ms | Gufo TTFT again | llama prompt ms again |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 402 | 0 | 402 | 571.2 | 0 | 628.7 | 573.6 | 633.5 |
+| 1 | 467 | 402 | 65 | 194.5 | 409 | 189.4 | 188.8 | 189.4 |
+| 2 | 553 | 467 | 86 | 254.6 | 463 | 244.0 | 254.9 | 236.3 |
+| 3 | 608 | 553 | 55 | 206.5 | 560 | 187.1 | 208.4 | 182.7 |
+| 4 | 663 | 608 | 55 | 205.5 | 604 | 200.6 | 206.6 | 202.7 |
+| 5 | 749 | 663 | 86 | 246.2 | 670 | 215.6 | 254.8 | 221.8 |
+| 6 | 804 | 749 | 55 | 206.7 | 756 | 183.3 | 210.1 | 186.0 |
+
+Gufo now caches each previous prompt exactly and re-prefills the 55–86
+reply and tool-result tokens. Cached turns are 188.8–254.9 ms against
+llama.cpp's 182.7–244.0 ms. Gufo's cold turn 0 is 9% faster.
+`cache_snapshot_ms` was 6.7–8.0 ms on cached turns.
+
+Full-schema identity replay with the RAM cache, 16:09, release preset with
+the host-only cache change before it was committed as `0daeb148`. One
+process: the live cache-on conversation, then its message lists with cache
+off, then cache on again. Every turn matched the live pass on content,
+tool name, arguments, finish reason and completion tokens.
+
+| Turn | Prompt | Cached | Prefill | Live TTFT ms | Cold TTFT ms | Repeat TTFT ms | Repeat restore ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 438 | 0 | 438 | 602.2 | 627.0 | 9.7 | 8.7 |
+| 1 | 503 | 438 | 65 | 235.9 | 687.8 | 10.8 | 9.6 |
+| 2 | 589 | 503 | 86 | 261.9 | 923.4 | 11.0 | 9.8 |
+| 3 | 644 | 589 | 55 | 214.5 | 980.4 | 11.1 | 9.8 |
+| 4 | 699 | 644 | 55 | 212.0 | 1006.8 | 11.3 | 10.1 |
+| 5 | 785 | 699 | 86 | 267.4 | 1124.7 | 11.2 | 9.9 |
+| 6 | 840 | 785 | 55 | 211.0 | 1165.6 | 11.5 | 10.2 |
+
+Repeat restores now upload the host payload (8.7–10.2 ms). The 15:12 run
+of the same replay before that change kept a device image per entry and
+restored in 1.5–2.3 ms, but a long `cache-messages-loop` exhausted GPU
+memory with Lemonade resident. That 15:12 run used `--cache-disk`, where
+prefill stops at the boundary: cached turns were 255.0–330.2 ms, and the
+disk restore of 431 tokens after restart was 98.1 ms.

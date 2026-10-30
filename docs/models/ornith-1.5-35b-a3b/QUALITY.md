@@ -274,3 +274,98 @@ and arguments, finish reason, and completion-token count. The full
 `^(ornith15|qwen38_flash_next)\.` oracle was not re-run after the
 decode-step path. `RunChunk` with prefix rollback off is unchanged.
 Thresholds were not changed.
+
+## M4 remedy: exact boundaries
+
+The explicit Q6_K/Q5_K product from `75e04191` stays; Flash-Next still
+leaves it off. On a grid session a one-token launch now keeps the batched
+kernels instead of the decode dots, so a prefill row has the same bits
+wherever the prompt is split. The server grid is width 1. Each call of up
+to 512 tokens is one launch. The server reuses a cached prompt at its
+exact boundary and stores only frontiers that prefill produced. Decode
+uses other kernels, so the next turn re-prefills the generated reply.
+With a RAM cache, `Session::PrefillThrough` freezes the boundary inside the
+launch. DeltaNet conv and recurrent state are checkpointed at the boundary
+token in the same kernel. Gated-attention K/V below the boundary is copied
+after the launch. The boundary row's logits come from that row's hidden
+state through the output head. With `--cache-disk`, prefill stops at the
+boundary as before.
+
+`ornith15.gpu_chunk` covers both capture sets and the agent prefix,
+against 16-token reference cells. 207 schedules passed, none failed, and
+the logits and boundary snapshots were bit-identical. New schedules split
+off any grid: 37+rest, 5+11+rest, rest+3, rest+1, and whole cells with a
+lone final token. On the agent prompt, final cells are 1, 2, 3, 8, 9 and
+15 tokens. Five in-pass checks on a 448-token prompt (start 0 at
+boundaries 1, 37, 441 and 447; start 32 at boundary 443) required three
+things: the image payload byte-identical to the stop-at-boundary
+snapshot, equal last logits, and an equal continuation from the image.
+All passed. A column-dependent product diverged at token 0. Decode dots
+for a lone token diverged at token 96.
+
+On that tree (later committed as `8508275c` and `7d8a38b3`), the oracle
+`^(ornith15|qwen38_flash_next)\.` passed 34/34. Held-out `gpu_decode`,
+`gpu_snapshot`, `gpu_grid`, `gpu_chunk` and `gpu_mtp` passed 5/5. After
+the host-only cache change (`0daeb148`), `gpu_snapshot`, `gpu_grid` and
+`gpu_chunk` passed again. The full oracle was not re-run on that tree.
+Thresholds were not changed.
+
+Greedy (temperature 0, seed 41) tool-agent replay, 7 turns, full schemas,
+compared on content, tool name, arguments, finish reason and completion
+tokens. With `--cache-disk` at 15:12, before the host-only change (live,
+restart, then on, off, on, off), and with the RAM cache at 16:09 (live,
+off, on), every turn matched the live pass. Turn 0
+after the restart restored 431 tokens from disk.
+
+On `0daeb14`, 12 of the 13 upstream suites passed: `cache-edits`,
+`tool-agent`, `tool-agent-loop`, `cache-messages-loop`, `text-cancel`,
+`thinking-tool-cancel`, `legacy-tool-cancel`, `disk-spacing` and their
+`-disk` variants. `text-cancel` failed on the 16-token grid and now passes.
+`cache-messages-loop` had exhausted GPU memory before the host-only change.
+`tools` failed in `auto-tools`. Asked to omit the optional parameter, the
+model sent `{"value":"alpha","optional":1}`, as it did on the M3 release
+build.
+
+`ornith15-functional-v1` was scored unchanged on `0daeb14`. Greedy was
+5/5. Card was 4/5. Card `write_merge` reasoned for 2048 completion tokens,
+the suite's limit (`finish_reason` `length`). Its content was an opening
+python fence and `def`, so the answer was scored as a failure. The cut-off
+reasoning was coherent and already held a passing draft. It had 118
+non-empty lines, 82 of them distinct; the repeats are code drafts. At the
+frozen seed, earlier builds produced 380 (M2), 922 (M3), and 1367 and 1904
+(M4 MTP) completion tokens.
+
+A diagnostic on 2026-10-30, outside the scored suite, sampled the same
+prompt at card settings over the frozen seed and seeds 1000–1031. The
+builds were `d005bfeb` and `0daeb14`, and a private llama.cpp `b11580` on
+the GPU, which was sent `min_p` 0 as Gufo uses. Gufo builds alternated in
+blocks of five seeds.
+
+| Build | Seeds | Pass | `length` | Failed tests |
+| --- | ---: | ---: | ---: | ---: |
+| `d005bfeb` | 33 | 32 | 0 | 1 |
+| `0daeb14` | 33 | 22 | 5 | 6 |
+| llama.cpp | 13 | 9 | 3 | 1 |
+
+The failed tests were mostly `unsorted overlap`: the answer seeded the
+merge with the unsorted first pair. `release-m4` (`75e04191`) produced
+byte-identical content and reasoning to `0daeb14` on the five seeds
+compared, so this prompt's state predates the remedy. llama.cpp's sampler
+differs from Gufo's, so its seeds do not pair with Gufo's.
+
+Every seed of one build shares the same 110-token prefill state. Four
+rewordings of the same task, scored with the same tests, gave each build
+four more states, five seeds each (2000–2004).
+
+| Rewording | `d005bfeb` pass | `0daeb14` pass |
+| --- | ---: | ---: |
+| named | 5/5 | 5/5 |
+| context | 4/5 | 3/5 |
+| stdlib | 5/5 | 5/5 |
+| reordered | 5/5 | 5/5 |
+
+The rewordings do not separate the builds. On the frozen prompt,
+`0daeb14` matches llama.cpp's rate, and `d005bfeb` is above both. The card
+`write_merge` failure stays recorded as a failure. These samples do not
+show a systematic loss from the M4 prefill product. The suite, its seed
+and its 2048-token limit are unchanged.
