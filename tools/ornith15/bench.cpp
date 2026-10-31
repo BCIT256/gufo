@@ -23,6 +23,13 @@ constexpr int kGenerate = 128;
 constexpr int kWarmSteps = 16;
 constexpr int kSamples = 5;
 
+int EnvInt(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0')
+    return fallback;
+  return std::atoi(value);
+}
+
 constexpr std::string_view kCodingPrompt =
     "Write a C++17 function that merges overlapping half-open integer "
     "intervals. The input is a vector of pairs [start, end). Sort a copy, "
@@ -120,7 +127,8 @@ int main() {
     options.add_eos = false;
     options.parse_special_tokens = false;
     const auto encoded = tokenizer->Encode(kCodingPrompt, options);
-    const auto prompt_2048 = Fit(encoded, 2048);
+    const int want_len = EnvInt("GUFO_ORNITH15_BENCH_LEN", 0);
+    const auto prompt_2048 = Fit(encoded, want_len > 0 ? want_len : 2048);
     const auto prompt_261 = Fit(encoded, 261);
     const auto weights =
         orn::ModelWeights::Bind(*reader, orn::BindOptions{}, &error);
@@ -148,18 +156,30 @@ int main() {
       return std::pair<double, double>{
           tokens.size() / prefill_s, static_cast<double>(kGenerate) / decode_s};
     };
+    const int samples = EnvInt("GUFO_ORNITH15_BENCH_SAMPLES", kSamples);
+    const int warm_steps = EnvInt("GUFO_ORNITH15_BENCH_WARM_STEPS", kWarmSteps);
+    const bool decode = EnvInt("GUFO_ORNITH15_BENCH_DECODE", 1) != 0;
     const auto measure = [&](const std::vector<std::int32_t>& tokens) {
       Require(session->Reset(&error), error);
       Require(session->Prefill(tokens, last, &error), error);
       std::int32_t warm = HostArgmax(last);
-      for (int i = 0; i < kWarmSteps; ++i) {
+      for (int i = 0; i < warm_steps; ++i) {
         std::int32_t sampled = -1;
         Require(session->Step(warm, {}, &error, nullptr, &sampled), error);
         warm = sampled;
       }
       std::vector<double> pp;
       std::vector<double> tg;
-      for (int sample = 0; sample < kSamples; ++sample) {
+      for (int sample = 0; sample < samples; ++sample) {
+        if (!decode) {
+          Require(session->Reset(&error), error);
+          const double prefill_s = Seconds([&] {
+            Require(session->Prefill(tokens, last, &error), error);
+          });
+          pp.push_back(tokens.size() / prefill_s);
+          tg.push_back(0);
+          continue;
+        }
         const auto rates = run(tokens);
         pp.push_back(rates.first);
         tg.push_back(rates.second);
@@ -171,7 +191,8 @@ int main() {
       PrintSamples("tg_tok_s", tg);
     };
     measure(prompt_2048);
-    measure(prompt_261);
+    if (want_len == 0)
+      measure(prompt_261);
   } catch (const std::exception& ex) {
     std::cerr << "FAIL: " << ex.what() << '\n';
     return 1;
