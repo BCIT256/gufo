@@ -512,3 +512,27 @@ autoregressive (see M5 MTP), and on that case it ran past the suite's
 128-token limit before the coverage checks. `cache-compaction` failed
 in Grok's MTP run and passed in both of these. None of these suites ran
 in M4.
+
+## M6 review
+
+`VerifyForward` runs up to 8 tokens on the decode dots. `ornith15.gpu_mtp` now
+requires max abs 0 between each verified row and `Step` on the same token at
+widths 1, 2, 3, 4, 7 and 8, over the eager body, graph capture and replay, and
+between MTP-session and plain `Step` (was `< 1e-4`). This supersedes the
+verify-versus-decode gap and greedy differences in M5 MTP. On `4406552`, MTP
+greedy text equals autoregressive on the 262- and 2,052-token prompts in every
+cycle and on all 7 agent-replay turns.
+
+Gates at `44065526`: oracle 34/34 including `gpu_chunk` bit-identical and verify
+distribution PASS; held-out 5/5; host PR suite 67/67. `ornith15-functional-v1`
+unchanged on `4406552`: autoregressive greedy 5/5, card 4/5 (`write_merge`
+reasoned to the 2,048-token limit, the same failure as the M4 remedy, kept as a
+failure); MTP greedy 5/5, card 5/5. The MTP card pass is one seed and is not
+evidence that MTP fixes `write_merge`.
+
+Upstream suites, with and without MTP: `cache-compaction` passes.
+`cache-shared-prefix` fails on `ALPHA.`; llama.cpp `b11580` gave the same answer
+on that request. `cache-bridge` is unqualified: 64 side snapshots publish 9.03 GB
+against the 1.5x fill required of a 15.46 GB budget. `cache-growth` fails with
+`cached=2907, previous_prompt=2907, previous_completion=63, prefilled=262`, now
+the same way with MTP: the reply is re-prefilled next turn.

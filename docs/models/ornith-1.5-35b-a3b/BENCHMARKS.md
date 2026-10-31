@@ -833,3 +833,49 @@ full-prompt RAM repeats reached the first token in 9.5–10.6 ms (restore
 189–255 ms for autoregressive cached turns in the M4 remedy review. The
 disk hit after restart restored 431 tokens in 116.7 ms (first token
 252 ms).
+
+## M6 review
+
+2026-10-31, gfx1151, production `nix build` packages: `72e51cb` (M5 final)
+and `4406552` (M6). Same method as the M5 review: AC power, one process per
+engine per cycle, one warm-up, rotated order, cache off, temperature 0,
+every completion token in the rate. llama.cpp `b11580` logged
+`offloaded 42/42 layers to GPU` at each of its nine starts. Harness and rows:
+`artifacts/m6-review/`.
+
+Autoregressive, four cycles, median:
+
+| Prompt | `72e51cb` pp | `4406552` pp | llama.cpp pp | `72e51cb` tg | `4406552` tg | llama.cpp tg |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 18 | 189.4 | 193.5 | 192.5 | — | — | — |
+| 262 | 718.4 | 757.5 | 738.3 | 43.74 | 43.37 | 40.94 |
+| 2052 | 1087.4 | 1148.8 | 1071.6 | 40.91 | 40.57 | 40.14 |
+
+`Project` now launches an F32 matrix as one grouped grid instead of one launch
+per eight tokens. `4406552` led llama.cpp at 2,052 tokens on all four cycles
+(1205.9 vs 1112.7, 1182.8 vs 1068.5, 1114.7 vs 1074.6, 1112.3 vs 1063.8).
+18-token prefill is level with llama.cpp.
+
+MTP (`--speculative mtp --draft-tokens 7`) against autoregressive on
+`4406552` and llama.cpp `--spec-type draft-mtp`, three cycles, median tg:
+
+| Prompt | Gufo AR | Gufo MTP | llama.cpp MTP | Gufo accepted | llama.cpp accepted |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 262 | 41.12 | 48.20 | 37.21 | 28/41 | 28/101 |
+| 2052 | 40.01 | 45.88 | 37.62 | 28/40 | 29/99 |
+
+7-turn agent replay, cache off, at most 128 new tokens, summed completion
+tokens over decode milliseconds, two cycles: autoregressive 37.38 / 36.56,
+Gufo MTP 45.87 / 45.43 (117/142 accepted), llama.cpp MTP 42.50 / 42.18
+(148/366 accepted, 277 tokens rather than 235 because its output differs).
+
+One verification launch with the decode dots, host wall time on a working-tree
+release build at 261 / 2,052 prompt tokens (`GUFO_ORNITH15_BENCH_MTP=1`):
+decode step 25.2 / 26.8 ms, draft 2.8 / 2.9 ms, width 2 29.6 / 31.1 ms, width 4
+42.0 / 45.1 ms, width 8 72.8 / 75.5 ms. `kMtpRelativeCost` is the mean of those
+rounds over one step.
+
+MTP with `--cache-disk`, agent replay: cold, RAM repeat and disk after restart
+gave identical output on all 7 turns. RAM repeats reached the first token in
+9.7–14.6 ms; turns that prefill a new suffix took 289–364 ms, almost all suffix
+prefill (260–330 ms). No paired autoregressive run was taken on these turns.
