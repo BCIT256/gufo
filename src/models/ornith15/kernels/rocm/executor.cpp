@@ -1477,6 +1477,11 @@ bool Session::EnableMtp(std::string* error) {
       }
       gdn_rollback_ready_ = true;
     }
+    // The runner measures this session once, at the end of EnableMtp, and
+    // refuses a later restore whose resident size is larger. VerifyForward
+    // projects every row, so the logit batch has to exist before that
+    // measurement rather than on first use.
+    EnsureLogitsBatch();
     mtp_enabled_ = true;
     mtp_position_ = 0;
     mtp_chain_ = false;
