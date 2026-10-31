@@ -27,7 +27,10 @@ prefill stops at snapshot boundaries, as upstream requires for disk.
 drafts, and verifies that chain in one trunk launch on the decode dots, so
 greedy output equals autoregressive and each verified row is bit-identical
 to a decode step. It is faster than autoregressive decode on the measured
-prompts (see BENCHMARKS.md) and stays opt-in. The prefix cache accepts it. An MTP snapshot is version
+prompts (see BENCHMARKS.md) and stays opt-in. The prefix cache accepts it.
+After a reply, an idle server prefills it in bounded chunks, starting 100 ms
+after the response, so a later turn resumes past the reply on the frontier a
+cold prompt reaches. Any arrival preempts that work at the next chunk. An MTP snapshot is version
 2 and stores NextN K/V plus the trunk hidden carry. The draft chain is
 cold at a prefill frontier; it is not rebuilt from a side buffer. The
 draft-length controller resets at each request and is not in the

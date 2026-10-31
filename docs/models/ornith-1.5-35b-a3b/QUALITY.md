@@ -536,3 +536,21 @@ on that request. `cache-bridge` is unqualified: 64 side snapshots publish 9.03 G
 against the 1.5x fill required of a 15.46 GB budget. `cache-growth` fails with
 `cached=2907, previous_prompt=2907, previous_completion=63, prefilled=262`, now
 the same way with MTP: the reply is re-prefilled next turn.
+
+## Idle reply refill
+
+The refill prefills the reply with the prefill kernels, so a later turn repeats
+a cold prefill. Decode state is never published. In the resend test, 8 requests
+on one conversation matched a cache-off run in text, tool name and arguments on
+every pass, at gaps of 0, 50, 300 and 1,000 ms, with and without MTP. Gates at
+`6116b0d7`: oracle 34/34, held-out 5/5, host PR suite 67/67 with two new
+scheduler tests. On production `6116b0d`, MTP cache identity holds for RAM repeat
+and disk after restart. `ornith15-functional-v1` unchanged: autoregressive greedy
+5/5, card 4/5 (`write_merge`, kept as a failure); MTP greedy 5/5, card 5/5.
+
+`cache-growth` still fails, unchanged: `cached=2907, previous_prompt=2907,
+previous_completion=63, prefilled=262`. The suite sends the next turn at once,
+inside the 100 ms delay. A build with no delay covered the reply at a 0 ms gap in
+the resend test, but cost about 100 ms to first token there, and it was not run
+through this suite. The suite is not changed.
+

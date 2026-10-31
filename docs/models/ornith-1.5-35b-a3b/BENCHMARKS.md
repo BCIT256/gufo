@@ -879,3 +879,25 @@ MTP with `--cache-disk`, agent replay: cold, RAM repeat and disk after restart
 gave identical output on all 7 turns. RAM repeats reached the first token in
 9.7–14.6 ms; turns that prefill a new suffix took 289–364 ms, almost all suffix
 prefill (260–330 ms). No paired autoregressive run was taken on these turns.
+
+## Idle reply refill
+
+2026-10-31, gfx1151, AC power, cache on, temperature 0, thinking off. A client
+resends each actual reply over 8 requests on a growing conversation with tool
+calls (`artifacts/m6/refill_ab.py`). `4406552` has no refill. The refill rows
+at 0, 50 and 300 ms are a working-tree release build of `6116b0d7`, two cycles;
+the 150 and 1,000 ms rows are production `6116b0d`, one cycle. Time to first
+token in milliseconds, median then maximum, over the 7 requests after the first
+in each pass (each cycle one pass):
+
+| Gap between requests | `4406552` | Refill | `4406552` MTP | Refill MTP |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 ms | 254 / 377 | 267 / 380 | 273 / 384 | 270 / 386 |
+| 50 ms | 260 / 421 | 268 / 442 | 296 / 424 | 282 / 417 |
+| 150 ms | 255 / 382 | 326 / 446 | 262 / 386 | 329 / 454 |
+| 300 ms | 241 / 368 | 182 / 328 | 247 / 390 | 196 / 335 |
+| 1,000 ms | 235 / 344 | 127 / 141 | 246 / 348 | 128 / 144 |
+
+A request that lands during the refill pays for two short launches, which is
+the 150 ms row. Starting the refill with no delay measured 257 → 353 ms at a
+0 ms gap, so it waits 100 ms. A gap under that costs the old re-prefill.
