@@ -2974,6 +2974,9 @@ public:
     canonical_.reset();
     have_logits_ = false;
     position_ = 0;
+    // The length controller is not in the snapshot. A reused session must
+    // not keep another request's draft beliefs.
+    draft_policy_.Reset();
     std::string error;
     reset_failed_ = !session_->Reset(&error);
   }
@@ -3523,8 +3526,11 @@ public:
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     // Autoregressive serving does not preview. MTP publishes the anchor
     // before the prompt snapshot; DecodeStep samples that same draw.
+    // A cache hit skips Invalidate, so this is the request boundary for
+    // the draft-length controller.
     if (!use_mtp_)
       return std::nullopt;
+    RequireOrnithState(state).draft_policy().Reset();
     return SelectNext(state, sampler);
   }
 
