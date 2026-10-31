@@ -1,5 +1,7 @@
 // gfx1151 prefill and greedy decode rates for one Ornith session.
 // Not part of ctest. Set GUFO_ORNITH15_APEX_MTP_MODEL to the pinned GGUF.
+// GUFO_ORNITH15_BENCH_MTP=1 instead times one decode step, one draft, and
+// one verification launch per width at the end of the prompt.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -101,6 +103,71 @@ void PrintSamples(const char* name, const std::vector<double>& samples) {
   std::cout << '\n';
 }
 
+// Host wall milliseconds of each MTP piece, synchronised as the server
+// calls them. Every verification restores the frontier it started from.
+void MeasureMtp(orn::rocm::Session& session,
+                const std::vector<std::int32_t>& prompt, std::uint32_t vocab,
+                int samples) {
+  std::string error;
+  std::vector<float> logits(vocab);
+  Require(session.Reset(&error), error);
+  Require(session.Prefill(prompt, logits, &error), error);
+  std::int32_t next = HostArgmax(logits);
+  // Warm the decode graph and every verification graph.
+  for (int i = 0; i < 4; ++i) {
+    Require(session.Step(next, logits, &error), error);
+    next = HostArgmax(logits);
+  }
+  std::vector<double> step_ms;
+  for (int i = 0; i < samples; ++i) {
+    step_ms.push_back(1e3 * Seconds([&] {
+                        Require(session.Step(next, logits, &error), error);
+                      }));
+    next = HostArgmax(logits);
+  }
+  const double step = Median(step_ms);
+  std::cout << "prompt_tokens=" << prompt.size() << ' ';
+  PrintSamples("step_ms", step_ms);
+  const auto frontier = session.StageSnapshot(&error);
+  Require(frontier != nullptr, error);
+  std::vector<float> draft(vocab);
+  std::vector<double> draft_ms;
+  for (int i = 0; i < samples; ++i) {
+    draft_ms.push_back(1e3 * Seconds([&] {
+                         Require(session.DraftToken(next, draft, &error),
+                                 error);
+                       }));
+    session.RewindMtp(session.Position());
+  }
+  PrintSamples("draft_ms", draft_ms);
+  for (std::uint32_t width = 1;
+       width <= orn::rocm::Session::kMaxVectorRows; ++width) {
+    // Distinct prompt tokens, so rows route to different experts as real
+    // drafts do.
+    std::vector<std::int32_t> chain(width);
+    for (std::uint32_t i = 0; i < width; ++i)
+      chain[i] = prompt[(7 * i + 3) % prompt.size()];
+    std::vector<float> rows(std::size_t(width) * vocab);
+    std::vector<double> verify_ms;
+    for (int i = 0; i < samples + 2; ++i) {
+      const double ms = 1e3 * Seconds([&] {
+                          Require(session.VerifyForward(chain, rows, &error),
+                                  error);
+                        });
+      if (i >= 2)
+        verify_ms.push_back(ms);
+      Require(session.RestoreStagedSnapshot(*frontier, logits, &error), error);
+      session.RewindMtp(session.Position());
+    }
+    std::cout << "width=" << width << ' ';
+    PrintSamples("verify_ms", verify_ms);
+    // One round drafts width-1 tokens and verifies the anchor with them.
+    const double round = Median(verify_ms) + (width - 1) * Median(draft_ms);
+    std::cout << "width=" << width << " round_over_step=" << round / step
+              << '\n';
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -130,9 +197,10 @@ int main() {
     const int want_len = EnvInt("GUFO_ORNITH15_BENCH_LEN", 0);
     const auto prompt_2048 = Fit(encoded, want_len > 0 ? want_len : 2048);
     const auto prompt_261 = Fit(encoded, 261);
+    const bool mtp = EnvInt("GUFO_ORNITH15_BENCH_MTP", 0) != 0;
     const auto weights =
-        orn::ModelWeights::Bind(*reader, orn::BindOptions{}, &error);
-    Require(weights.has_value() && !weights->mtp, error);
+        orn::ModelWeights::Bind(*reader, orn::BindOptions{.mtp = mtp}, &error);
+    Require(weights.has_value() && weights->mtp.has_value() == mtp, error);
     const auto device =
         orn::rocm::DeviceModel::Upload(*weights, *reader, &error);
     Require(device != nullptr, error);
@@ -140,6 +208,14 @@ int main() {
     auto session = orn::rocm::Session::Create(*device, kContext, &error);
     Require(session != nullptr, error);
     std::vector<float> last(vocab);
+    if (mtp) {
+      Require(session->EnableMtp(&error), error);
+      const int samples = EnvInt("GUFO_ORNITH15_BENCH_SAMPLES", 9);
+      MeasureMtp(*session, prompt_261, vocab, samples);
+      if (want_len > 0)
+        MeasureMtp(*session, prompt_2048, vocab, samples);
+      return 0;
+    }
 
     const auto run = [&](const std::vector<std::int32_t>& tokens) {
       Require(session->Reset(&error), error);

@@ -12,10 +12,12 @@ namespace gufo::models::ornith15 {
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 
 // Cost of one MTP cycle relative to one autoregressive decode. Index 0 is
-// the plain decode. These stand-ins keep the first drafts short; a measured
-// width sweep replaces them. They are not Flash-Next's cycle table.
+// the plain decode; index k is k drafts plus one decode-dot verification of
+// k + 1 tokens. Measured with tools/ornith15/bench.cpp
+// (GUFO_ORNITH15_BENCH_MTP) on gfx1151 at 261 and 2,052 prompt tokens, mean of
+// the two.
 inline constexpr float kMtpRelativeCost[8] = {
-    1.00F, 1.55F, 2.40F, 3.30F, 4.20F, 5.10F, 6.00F, 6.90F,
+    1.00F, 1.28F, 1.64F, 2.00F, 2.43F, 2.77F, 3.20F, 3.61F,
 };
 
 struct MtpLengthState {

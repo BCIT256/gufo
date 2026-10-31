@@ -134,7 +134,7 @@ int main() {
     Require(device != nullptr && device->has_mtp(), "upload: " + error);
     constexpr std::uint32_t kContext = 256;
     constexpr int kPrompt = 32;
-    constexpr int kCompare = 4;
+    constexpr int kCompare = 8;
     constexpr int kGreedy = 12;
     constexpr int kDrafts = 3;
     auto spec = orn::rocm::Session::Create(*device, kContext, &error);
@@ -166,27 +166,37 @@ int main() {
       const float step_gap =
           MaxAbs(spec_logits.data(), plain_logits.data(), vocab);
       std::cout << "step_trunk_max_abs[" << i << "]=" << step_gap << '\n';
-      Require(step_gap < 1e-4F, "MTP step changed trunk logits");
+      Require(step_gap == 0.0F, "MTP step changed trunk logits");
       std::copy(spec_logits.begin(), spec_logits.end(),
                 stepped.begin() + static_cast<std::size_t>(i) * vocab);
     }
 
-    Require(spec->Reset(&error), "reset: " + error);
-    Require(spec->SetCanonicalGrid(16), "grid after reset");
-    Require(spec->Prefill(prompt, spec_logits, &error), "reprefill: " + error);
-    auto image = spec->StageSnapshot(&error);
-    Require(image != nullptr, "snapshot: " + error);
-    std::vector<float> batch(static_cast<std::size_t>(kCompare) * vocab);
-    Require(spec->VerifyForward(fed, batch, &error), "verify: " + error);
-    float verify_gap = 0;
-    for (int i = 0; i < kCompare; ++i) {
-      verify_gap = std::max(
-          verify_gap,
-          MaxAbs(batch.data() + static_cast<std::size_t>(i) * vocab,
-                 stepped.data() + static_cast<std::size_t>(i) * vocab, vocab));
+    // Each verification row must equal Step on the same token. Three passes
+    // per width cover the eager body, the graph capture and its replay.
+    for (const int width : {1, 2, 3, 4, 7, 8}) {
+      for (int pass = 0; pass < 3; ++pass) {
+        Require(spec->Reset(&error), "reset: " + error);
+        Require(spec->SetCanonicalGrid(16), "grid after reset");
+        Require(spec->Prefill(prompt, spec_logits, &error),
+                "reprefill: " + error);
+        std::vector<float> batch(static_cast<std::size_t>(width) * vocab);
+        Require(spec->VerifyForward(
+                    std::span<const std::int32_t>(fed.data(), width), batch,
+                    &error),
+                "verify: " + error);
+        float verify_gap = 0;
+        for (int i = 0; i < width; ++i) {
+          verify_gap = std::max(
+              verify_gap,
+              MaxAbs(batch.data() + static_cast<std::size_t>(i) * vocab,
+                     stepped.data() + static_cast<std::size_t>(i) * vocab,
+                     vocab));
+        }
+        std::cout << "verify_vs_step_max_abs=" << verify_gap
+                  << " width=" << width << " pass=" << pass << '\n';
+        Require(verify_gap == 0.0F, "verification row differs from Step");
+      }
     }
-    std::cout << "verify_vs_step_max_abs=" << verify_gap
-              << " tokens=" << kCompare << '\n';
 
     Require(spec->Reset(&error) && plain->Reset(&error), "greedy reset");
     Require(spec->SetCanonicalGrid(16) && plain->SetCanonicalGrid(16),

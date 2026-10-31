@@ -50,6 +50,8 @@ public:
   /// 4096 covers a 2,052-token prompt in one launch. A 2,048 cap leaves a
   /// short tail that reads every routed expert again.
   static constexpr std::uint32_t kMaxPrefillChunk = 4096;
+  /// Widest verification batch that runs on the decode dots.
+  static constexpr std::uint32_t kMaxVectorRows = 8;
 
   ~Session();
   Session(const Session&) = delete;
@@ -133,7 +135,9 @@ public:
   /// Trunk forward of a decode-time verification batch. Not grid-aligned.
   /// Does not write the NextN cache (the draft already did). Updates the
   /// carried trunk hidden from the last token. A batch of 2 to 8 tokens
-  /// also stores DeltaNet prefixes for RollbackMtpBatch.
+  /// also stores DeltaNet prefixes for RollbackMtpBatch. Up to
+  /// kMaxVectorRows tokens use the decode dots, so each row's logits and
+  /// state are bit-identical to Step on the same token.
   [[nodiscard]] bool VerifyForward(std::span<const std::int32_t> tokens,
                                    std::span<float> all_logits,
                                    std::string* error = nullptr);
@@ -255,6 +259,12 @@ private:
               bool write_head);
   void CaptureTrunkHidden(std::uint32_t n);
   void Moe(const DeviceLayer& l, std::uint32_t n);
+  /// A decode step, or a verification batch: each row takes the vector dot
+  /// a lone decode token takes. Prefill and grid launches use the batched
+  /// kernels.
+  [[nodiscard]] bool DecodeDots(std::uint32_t n) const noexcept {
+    return (n == 1 && !grid_rows_) || vector_rows_;
+  }
   void RunChunk(std::uint32_t n, LayerTrace* trace);
   void DecodeBody(LayerTrace* trace);
   void ProjectLastLogits(std::uint32_t n);
@@ -288,6 +298,8 @@ private:
   bool chunk_dependent_reduction_{false};
   /// Set while a grid prefill runs: n == 1 keeps the batched kernels.
   bool grid_rows_{false};
+  /// Set during VerifyForward of at most kMaxVectorRows tokens.
+  bool vector_rows_{false};
   bool lone_token_decode_dots_{false};
   /// Set during PrefillThrough: linear layers write their boundary state
   /// into this image. Offsets are per layer; zero for attention layers.

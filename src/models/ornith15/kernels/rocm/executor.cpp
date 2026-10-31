@@ -337,9 +337,17 @@ void Session::Dense(const DeviceTensor& w, const float* x, float* out) {
 
 void Session::Project(const DeviceTensor& w, const float* x, float* out,
                       std::uint32_t n) {
-  if (n == 1 && !grid_rows_) {
-    Dense(w, x, out);
-    return;
+  if (DecodeDots(n)) {
+    if (n == 1) {
+      Dense(w, x, out);
+      return;
+    }
+    // Verification rows: each row takes the dot Dense gives one token.
+    // F32 below already keeps each token's FMA order at any width.
+    if (w.type != GgmlType::kF32) {
+      Quantized(w, x, zero_ids_, out, n, 1);
+      return;
+    }
   }
   if (w.type == GgmlType::kF32) {
     // Groups of eight stay on the width that keeps each token's FMA order.
@@ -464,7 +472,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
   const auto& c = model_->config();
   Project(l.ssm_qkv, xn_, qkv_, n);
   Project(l.ssm_gate, xn_, z_, n);
-  if (n == 1 && !grid_rows_) {
+  if (n == 1 && DecodeDots(n)) {
     Dense(l.ssm_alpha, xn_, ab_);
     Dense(l.ssm_beta, xn_, ab_ + c.ssm_num_v_heads);
   } else {
@@ -523,12 +531,15 @@ void Session::Attention(const DeviceLayer& l, State& state, std::uint32_t n) {
                 device_pos_, c.num_heads, c.num_kv_heads, c.head_dim, 1,
                 stream_);
   fn::SigmoidMul(ctx_, gate_, std::size_t(n) * c.AttentionQDim(), stream_);
-  if (n == 1 && !grid_rows_) {
+  if (DecodeDots(n)) {
     // Keep this input in F32: quantizing both V and the gated context can
     // amplify activation rounding through the attention value path. This dot
     // reads the original packed weights once, without a residual pass.
-    DenseMatVecF32(l.attn_out.type, l.attn_out.data, ctx_, block_out_,
-                   l.attn_out.rows, l.attn_out.cols, stream_);
+    for (std::uint32_t row = 0; row < n; ++row)
+      DenseMatVecF32(l.attn_out.type, l.attn_out.data,
+                     ctx_ + std::size_t(row) * l.attn_out.cols,
+                     block_out_ + std::size_t(row) * l.attn_out.rows,
+                     l.attn_out.rows, l.attn_out.cols, stream_);
   } else {
     Project(l.attn_out, ctx_, block_out_, n);
   }
@@ -539,18 +550,18 @@ void Session::Moe(const DeviceLayer& l, std::uint32_t n) {
   Project(l.router, xn_, router_, n);
   fn::RouterTopK(router_, c.num_experts, ids_, route_weights_, n, c.num_experts,
                  c.num_experts_used, stream_);
-  if (n == 1 && !grid_rows_) {
-    Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, 1, c.num_experts_used);
-    Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, 1, c.num_experts_used);
+  if (DecodeDots(n)) {
+    Quantized(l.ffn_gate_exps, xn_, ids_, expert_gate_, n, c.num_experts_used);
+    Quantized(l.ffn_up_exps, xn_, ids_, expert_up_, n, c.num_experts_used);
   } else {
     MoeRaw(l.ffn_gate_exps, xn_, ids_, expert_gate_, n, c.num_experts_used);
     MoeRaw(l.ffn_up_exps, xn_, ids_, expert_up_, n, c.num_experts_used);
   }
   fn::Swiglu(expert_gate_, expert_up_,
              std::size_t(n) * c.num_experts_used * c.expert_ff, stream_);
-  if (n == 1 && !grid_rows_) {
+  if (DecodeDots(n)) {
     Quantized(l.ffn_down_exps, expert_gate_, ids_, expert_down_,
-              c.num_experts_used, 1);
+              n * c.num_experts_used, 1);
   } else {
     MoeRaw(l.ffn_down_exps, expert_gate_, ids_, expert_down_,
            n * c.num_experts_used, 1, n);
@@ -612,6 +623,11 @@ void Session::ProjectAllLogits(std::uint32_t n) {
   EnsureLogitsBatch();
   fn::RmsNormRows(res_, model_->output_norm().f32(), xn_, n, c.hidden_size, 1,
                   c.rms_eps, stream_);
+  if (DecodeDots(n) && model_->output().type != GgmlType::kF32) {
+    // Each verification row takes the decode head's dot.
+    Quantized(model_->output(), xn_, zero_ids_, logits_batch_, n, 1);
+    return;
+  }
   // One path for every position. The last-logit head stays on the decode dot.
   MoeRaw(model_->output(), xn_, zero_ids_, logits_batch_, n, 1);
 }
@@ -727,12 +743,13 @@ bool Session::Step(std::int32_t token, std::span<float> logits,
     Check(hipMemcpyAsync(token_ids_, &token, sizeof(token),
                          hipMemcpyHostToDevice, stream_),
           "token upload");
-    if (plain && !mtp_enabled_ && graph_exec_ != nullptr) {
+    // The graph is the trunk only; NextN consumes the token after it.
+    if (plain && graph_exec_ != nullptr) {
       Check(hipGraphLaunch(graph_exec_, stream_), "graph launch");
     } else {
       DecodeBody(trace);
       Check(hipGetLastError(), "AR launch");
-      if (plain && !mtp_enabled_) {
+      if (plain) {
         const bool capture =
             warmed_ && graph_exec_ == nullptr && !graph_failed_;
         warmed_ = true;
@@ -1687,6 +1704,7 @@ bool Session::VerifyForward(std::span<const std::int32_t> tokens,
   mtp_batch_tokens_ = 0;
   const bool snap = gdn_rollback_ready_ && n > 1 && n <= 8;
   gdn_rollback_ = snap;
+  vector_rows_ = n <= kMaxVectorRows;
   try {
     Check(hipMemcpyAsync(device_pos_, &position_, sizeof(position_),
                          hipMemcpyHostToDevice, stream_),
@@ -1706,6 +1724,7 @@ bool Session::VerifyForward(std::span<const std::int32_t> tokens,
         verify_warmed_[n] = true;
     }
     gdn_rollback_ = false;
+    vector_rows_ = false;
     Check(hipMemcpyAsync(logits_,
                          logits_batch_ + std::size_t(n - 1) * c.vocab_size,
                          std::size_t(c.vocab_size) * sizeof(float),
@@ -1727,6 +1746,7 @@ bool Session::VerifyForward(std::span<const std::int32_t> tokens,
   } catch (const std::exception& e) {
     mtp_suspend_ = false;
     gdn_rollback_ = false;
+    vector_rows_ = false;
     (void)hipStreamSynchronize(stream_);
     failed_ = true;
     if (error != nullptr)
