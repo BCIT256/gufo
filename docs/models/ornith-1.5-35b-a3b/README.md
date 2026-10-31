@@ -11,7 +11,7 @@ rows that are already the live prefix; a disk payload uploads every region.
 On a grid session (`Session::SetCanonicalGrid`; the server uses width 1)
 prefill gives the same bits for a token wherever the prompt is split: batched
 Q6_K and Q5_K products use a fixed order, and a one-token launch keeps the
-batched kernels instead of the decode dots. Each call of up to 512 tokens is one
+batched kernels instead of the decode dots. Each call of up to 4096 tokens is one
 launch. The server reuses a cached prompt at its exact boundary, but stores
 only frontiers that prefill produced; decode steps use other kernels, so the
 next turn re-prefills the generated reply. Cached and cold greedy output are
@@ -26,7 +26,7 @@ autoregressive output; it is slower than autoregressive decode on the
 measured prompts and cannot be combined with the prefix cache (see
 BENCHMARKS.md). Vision and YaRN are absent. Other `--speculative` backends,
 `--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
-in chunks of at most 512 tokens. `Session::Step` advances one token. A plain decode step
+in chunks of at most 4096 tokens. `Session::Step` advances one token. A plain decode step
 may replay a HIP graph. Pass a vocabulary-sized buffer to receive logits, or
 an empty buffer plus a sampled id to take a device argmax without downloading
 logits. Invalid calls leave state untouched. A device execution failure

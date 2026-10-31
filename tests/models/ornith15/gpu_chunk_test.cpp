@@ -1,8 +1,10 @@
 // Wide prefill must match consecutive 16-token cells bit for bit.
-// One call at chunk 512, a 16-token cell schedule, and grid-aligned splits
-// (32+rest, 400+112, 16 + middle + tail, whole cells + lone tail) publish the
-// same logits at every position and the same snapshot at every shared
-// boundary; a sweep covers final cells of 1, 2, 3, 8, 9 and 15 tokens.
+// One call at the prompt width, including a 2,048-token launch, a 16-token
+// cell schedule, and off-grid splits (32+rest, 400+112, 16 + middle + tail,
+// whole cells + lone tail) publish the same logits at every position and the
+// same snapshot at every shared boundary; a sweep covers final cells of 1, 2,
+// 3, 8, 9 and 15 tokens. In-pass capture is also checked inside a 2,048-token
+// launch.
 // Sessions run the server's one-token grid, so off-grid splits are included.
 // PrefillThrough's boundary image must equal a stop-at-boundary snapshot.
 // A test-only column-dependent GEMM must make the wide call disagree, and so
@@ -47,7 +49,8 @@ namespace {
 constexpr std::uint32_t kGrid = 16;
 constexpr std::uint32_t kServerGrid = 1;
 constexpr std::uint32_t kWide = 512;
-constexpr std::uint32_t kContext = 1024;
+constexpr std::uint32_t kLaunch = 2048;
+constexpr std::uint32_t kContext = 4096;
 
 void Require(bool ok, const std::string& why) {
   if (!ok)
@@ -272,8 +275,10 @@ bool ScorePrompt(const orn::rocm::DeviceModel& device, const std::string& name,
   schedules.push_back({"one", {n}});
   if (n > 32)
     schedules.push_back({"split_32_rest", {32, n - 32}});
-  if (n >= 512)
+  if (n == 512)
     schedules.push_back({"split_400_112", {400, 112}});
+  else if (n > 512)
+    schedules.push_back({"split_400_112", {400, 112, n - 512}});
   if (n > 40) {
     schedules.push_back({"split_37_rest", {37, n - 37}});
     schedules.push_back({"split_5_11_rest", {5, 11, n - 16}});
@@ -426,6 +431,10 @@ int main() {
     if (agent.size() < kWide)
       ok = ScorePrompt(*device, "agent/wide", RepeatTo(agent, kWide), vocab) &&
            ok;
+    if (orn::rocm::Session::kMaxPrefillChunk >= kLaunch)
+      ok = ScorePrompt(*device, "agent/chunk2048", RepeatTo(agent, kLaunch),
+                       vocab) &&
+           ok;
 
     // Every short-cell length class: one token, the two-row attention
     // group, the saved-history convolution, and the wider entries.
@@ -445,6 +454,11 @@ int main() {
              {0, static_cast<std::uint32_t>(agent.size()) - 1},
              {32, static_cast<std::uint32_t>(agent.size()) - 5}}) {
       ok = InPassCheck(*device, agent, vocab, start, boundary) && ok;
+    }
+    if (orn::rocm::Session::kMaxPrefillChunk >= kLaunch) {
+      const auto wide = RepeatTo(agent, kLaunch);
+      ok = InPassCheck(*device, wide, vocab, 0, 1000) && ok;
+      ok = InPassCheck(*device, wide, vocab, 400, 1500) && ok;
     }
 
     auto mutation_tokens = agent;

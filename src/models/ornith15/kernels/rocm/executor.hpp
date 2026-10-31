@@ -47,7 +47,9 @@ struct StagedSnapshot {
 /// requires Reset.
 class Session {
 public:
-  static constexpr std::uint32_t kMaxPrefillChunk = 512;
+  /// 4096 covers a 2,052-token prompt in one launch. A 2,048 cap leaves a
+  /// short tail that reads every routed expert again.
+  static constexpr std::uint32_t kMaxPrefillChunk = 4096;
 
   ~Session();
   Session(const Session&) = delete;
