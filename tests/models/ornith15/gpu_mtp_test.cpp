@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <span>
@@ -17,8 +19,12 @@
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace orn = gufo::models::ornith15;
+namespace fs = std::filesystem;
 
 namespace {
+
+constexpr double kMeanKlRatio = 2.0;
+constexpr double kOutlierRatio = 3.0;
 
 void Require(bool ok, const std::string& why) {
   if (!ok)
@@ -42,6 +48,56 @@ std::int32_t Argmax(const std::vector<float>& logits) {
       best = i;
   }
   return static_cast<std::int32_t>(best);
+}
+
+struct Capture {
+  std::vector<std::int32_t> tokens;
+  std::uint32_t vocab{0};
+  std::vector<float> logits;
+
+  [[nodiscard]] const float* Row(std::size_t t) const {
+    return logits.data() + t * vocab;
+  }
+};
+
+Capture LoadCapture(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  char magic[4] = {};
+  std::uint32_t header[3] = {};
+  in.read(magic, 4);
+  in.read(reinterpret_cast<char*>(header), sizeof(header));
+  Require(in && std::string(magic, 4) == "ORNL" && header[0] == 1,
+          "not a version-1 .ologits file: " + path.string());
+  Capture capture;
+  capture.tokens.resize(header[1]);
+  capture.vocab = header[2];
+  capture.logits.resize(static_cast<std::size_t>(header[1]) * header[2]);
+  in.read(reinterpret_cast<char*>(capture.tokens.data()),
+          static_cast<std::streamsize>(capture.tokens.size() *
+                                       sizeof(std::int32_t)));
+  in.read(reinterpret_cast<char*>(capture.logits.data()),
+          static_cast<std::streamsize>(capture.logits.size() * sizeof(float)));
+  Require(in && in.peek() == EOF, "truncated or oversized " + path.string());
+  return capture;
+}
+
+std::vector<double> LogSoftmax(const float* x, std::size_t n) {
+  const double peak = *std::max_element(x, x + n);
+  double sum = 0.0;
+  for (std::size_t i = 0; i < n; ++i)
+    sum += std::exp(static_cast<double>(x[i]) - peak);
+  const double log_sum = peak + std::log(sum);
+  std::vector<double> out(n);
+  for (std::size_t i = 0; i < n; ++i)
+    out[i] = static_cast<double>(x[i]) - log_sum;
+  return out;
+}
+
+double Kl(const std::vector<double>& left, const std::vector<double>& right) {
+  double kl = 0.0;
+  for (std::size_t i = 0; i < left.size(); ++i)
+    kl += std::exp(left[i]) * (left[i] - right[i]);
+  return kl;
 }
 
 // 1-based count of logits strictly above `token`. Vocab-sized, called a few
@@ -182,12 +238,9 @@ int main() {
         ++keep;
       }
       if (keep < chain.size()) {
-        Require(spec->RestoreStagedSnapshot(*rollback, spec_logits, &error),
-                "restore: " + error);
-        spec->RestoreMtpCarry();
-        const auto kept = std::span<const std::int32_t>(chain).first(keep);
-        rows.resize(static_cast<std::size_t>(keep) * vocab);
-        Require(spec->VerifyForward(kept, rows, &error), "replay: " + error);
+        Require(spec->mtp_prefix_rollback() && chain.size() <= 8,
+                "rollback window");
+        Require(spec->RollbackMtpBatch(keep, &error), "rollback: " + error);
       }
       if (keep == chain.size()) {
         Require(spec->DraftToken(chain.back(), draft_row, &error),
@@ -303,13 +356,10 @@ int main() {
         ++printed;
       }
       if (keep < chain.size()) {
-        Require(spec->RestoreStagedSnapshot(*rollback, spec_logits, &error),
-                "text restore: " + error);
-        spec->RestoreMtpCarry();
-        const auto kept = std::span<const std::int32_t>(chain).first(keep);
-        rows.resize(static_cast<std::size_t>(keep) * vocab);
-        Require(spec->VerifyForward(kept, rows, &error),
-                "text replay: " + error);
+        Require(spec->mtp_prefix_rollback() && chain.size() <= 8,
+                "text rollback window");
+        Require(spec->RollbackMtpBatch(keep, &error),
+                "text rollback: " + error);
       }
       if (keep == chain.size()) {
         Require(spec->DraftToken(chain.back(), draft_row, &error),
@@ -339,6 +389,102 @@ int main() {
     // A disconnected head accepts nothing on this sentence. The rate itself
     // is printed; this floor is only that failure.
     Require(drafted > 0 && accepted > 0, "MTP draft head accepted nothing");
+
+    // VerifyForward rows against the capture set. Unset means this process
+    // did not request the gate; ctest sets the directory. A skip is not a
+    // pass of the gate.
+    const char* logits_dir = std::getenv("GUFO_ORNITH15_LLAMA_LOGITS");
+    if (logits_dir == nullptr || logits_dir[0] == '\0') {
+      std::cout << "verify_distribution=not_requested\n";
+    } else {
+      Require(fs::is_directory(logits_dir),
+              "GUFO_ORNITH15_LLAMA_LOGITS is not a directory");
+      std::vector<std::string> prompts;
+      for (const auto& entry : fs::directory_iterator(logits_dir)) {
+        const auto name = entry.path().filename().string();
+        if (name.ends_with(".ologits") &&
+            !name.ends_with(".sequential.ologits"))
+          prompts.push_back(name.substr(0, name.size() - 8));
+      }
+      std::sort(prompts.begin(), prompts.end());
+      Require(!prompts.empty(), "no .ologits captures");
+      double self_max = 0;
+      for (const auto& prompt : prompts) {
+        const auto batch =
+            LoadCapture(fs::path(logits_dir) / (prompt + ".ologits"));
+        const auto sequential = LoadCapture(fs::path(logits_dir) /
+                                            (prompt + ".sequential.ologits"));
+        Require(batch.tokens == sequential.tokens &&
+                    batch.vocab == weights->config.vocab_size &&
+                    sequential.vocab == batch.vocab &&
+                    batch.tokens.size() <= kContext,
+                "verify capture does not match this model");
+        for (std::size_t t = 0; t < batch.tokens.size(); ++t) {
+          self_max = std::max(self_max,
+                              Kl(LogSoftmax(batch.Row(t), batch.vocab),
+                                 LogSoftmax(sequential.Row(t), batch.vocab)));
+        }
+      }
+      bool distribution_ok = true;
+      constexpr std::uint32_t kVerifyChunk = 4;
+      for (const auto& prompt : prompts) {
+        const auto batch =
+            LoadCapture(fs::path(logits_dir) / (prompt + ".ologits"));
+        const auto sequential = LoadCapture(fs::path(logits_dir) /
+                                            (prompt + ".sequential.ologits"));
+        Require(spec->Reset(&error), "verify distribution reset: " + error);
+        double llama_sum = 0, floor_sum = 0, llama_max = 0;
+        std::size_t outliers = 0;
+        std::vector<float> got(static_cast<std::size_t>(kVerifyChunk) *
+                               batch.vocab);
+        for (std::size_t done = 0; done < batch.tokens.size();) {
+          const auto count = static_cast<std::uint32_t>(
+              std::min<std::size_t>(kVerifyChunk, batch.tokens.size() - done));
+          got.resize(static_cast<std::size_t>(count) * batch.vocab);
+          Require(spec->VerifyForward(std::span<const std::int32_t>(
+                                          batch.tokens.data() + done, count),
+                                      got, &error),
+                  "verify distribution forward: " + error);
+          for (std::uint32_t row = 0; row < count; ++row) {
+            const std::size_t t = done + row;
+            const auto lq = LogSoftmax(
+                got.data() + std::size_t(row) * batch.vocab, batch.vocab);
+            const auto ll = LogSoftmax(batch.Row(t), batch.vocab);
+            const double lk = Kl(ll, lq);
+            const double floor =
+                Kl(ll, LogSoftmax(sequential.Row(t), batch.vocab));
+            Require(std::isfinite(lk) && std::isfinite(floor),
+                    "non-finite verify KL");
+            llama_sum += lk;
+            floor_sum += floor;
+            llama_max = std::max(llama_max, lk);
+            if (!(lk <= kOutlierRatio * self_max)) {
+              ++outliers;
+              std::cout << "verify_outlier prompt=" << prompt << " t=" << t
+                        << " llama_kl=" << lk << " self_kl=" << floor << '\n';
+            }
+          }
+          done += count;
+        }
+        const bool pass =
+            outliers == 0 && llama_sum <= kMeanKlRatio * floor_sum;
+        const double mean_llama = llama_sum / batch.tokens.size();
+        const double mean_self = floor_sum / batch.tokens.size();
+        std::cout << "verify_distribution prompt=" << prompt
+                  << " positions=" << batch.tokens.size()
+                  << " mean_kl_llama=" << mean_llama
+                  << " llama_self_mean=" << mean_self << " mean_ratio="
+                  << (mean_self == 0 ? (mean_llama == 0 ? 0 : INFINITY)
+                                     : mean_llama / mean_self)
+                  << " max_kl_llama=" << llama_max
+                  << " set_max_self_kl=" << self_max
+                  << " outlier_failures=" << outliers
+                  << (pass ? " PASS" : " FAIL") << '\n';
+        distribution_ok = distribution_ok && pass;
+      }
+      Require(distribution_ok,
+              "verify-launch logits failed the distribution gate");
+    }
   } catch (const std::exception& exception) {
     std::cerr << exception.what() << '\n';
     return 1;

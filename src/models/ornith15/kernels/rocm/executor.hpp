@@ -85,11 +85,13 @@ public:
                              std::span<float> all_logits = {});
   /// Prefill in one launch that also freezes the state at absolute position
   /// `boundary` into a staged image, as StageSnapshot would after a prefill
-  /// that stopped there. Requires a grid session without MTP and
+  /// that stopped there. Requires a grid session. An MTP session must already
+  /// be in lockstep: no open draft chain, and the NextN cursor on the trunk.
   /// Position() < boundary < Position() + tokens.size() <= Position() +
   /// kMaxPrefillChunk. The live session continues to the end of `tokens`.
-  /// When no device memory is left for the image, the prefill still runs and
-  /// `*staged` is null.
+  /// An MTP image also stores NextN K/V through `boundary` and the trunk
+  /// hidden that pairs with the next token. When no device memory is left
+  /// for the image, the prefill still runs and `*staged` is null.
   [[nodiscard]] bool PrefillThrough(std::span<const std::int32_t> tokens,
                                     std::span<float> last_logits,
                                     std::uint32_t boundary,
@@ -151,6 +153,10 @@ public:
   /// Drops speculative NextN positions above `position` and the draft chain.
   /// Trunk state is unchanged. `position` is the trunk length to keep.
   void RewindMtp(std::uint32_t position) noexcept;
+  /// Replaces the device logit row a snapshot would store. The host buffer
+  /// the caller sampled is separate.
+  [[nodiscard]] bool StoreFrontierLogits(std::span<const float> logits,
+                                         std::string* error = nullptr);
   /// Device copy of the carried trunk hidden, so a rejected batch can replay
   /// from the same seed the draft used.
   void SaveMtpCarry();
@@ -159,10 +165,14 @@ public:
   std::uint32_t Position() const noexcept { return position_; }
   std::size_t resident_bytes() const noexcept { return bytes_; }
 
-  /// Host payload version of SaveSnapshot / RestoreSnapshot.
+  /// Host payload version of SaveSnapshot / RestoreSnapshot. Version 1 is the
+  /// trunk frontier. Version 2 appends the NextN K/V prefix and the carried
+  /// trunk hidden, and is written only by a session that called EnableMtp.
   static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  static constexpr std::uint32_t kMtpSnapshotPayloadVersion = 2;
   /// Bytes SaveSnapshot writes at the current position. KV is the valid
-  /// rows only; recurrent and convolution state are whole layers.
+  /// rows only; recurrent and convolution state are whole layers. An MTP
+  /// session also stores its NextN cache.
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
   /// Payload size of a snapshot at `position`.
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
@@ -262,8 +272,8 @@ private:
   /// `skip_kv` leaves gated-attention K/V untouched. `base` is the payload
   /// address, including the 64-byte header the caller fills separately.
   void TransferPayload(std::uint8_t* base, bool into_base, hipMemcpyKind kind,
-                       hipStream_t stream, bool skip_kv,
-                       std::uint32_t position) const;
+                       hipStream_t stream, bool skip_kv, std::uint32_t position,
+                       std::uint32_t version) const;
 
   const DeviceModel* model_{nullptr};
   hipStream_t stream_{nullptr};
@@ -284,6 +294,10 @@ private:
   struct InPassImage {
     std::uint8_t* base = nullptr;
     std::uint32_t tokens = 0;
+    std::uint32_t boundary = 0;
+    std::size_t mtp_k = 0;
+    std::size_t mtp_carry = 0;
+    bool mtp = false;
     std::vector<std::size_t> conv;
     std::vector<std::size_t> recurrent;
   } in_pass_;

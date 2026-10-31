@@ -102,6 +102,50 @@ void CheckSampledFrequencies() {
   }
 }
 
+// Two verification rows in one chain. Each marginal must still match the
+// target row. The tolerance is the single-row gate.
+void CheckTwoRowChain() {
+  const std::array<float, 5> row0{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
+  const std::array<float, 5> row1{-0.4F, 0.9F, 0.2F, -0.1F, 0.5F};
+  qfn::MtpCandidateLogits first;
+  first.size = 3;
+  first.ids = {3, 1, 4};
+  first.logits = {1.2F, 0.1F, -0.7F};
+  qfn::MtpCandidateLogits second;
+  second.size = 3;
+  second.ids = {1, 4, 0};
+  second.logits = {0.4F, 0.8F, -0.2F};
+  constexpr unsigned trials = 40000;
+  constexpr double tolerance = 0.015;
+  sampling::SamplerState sampler({.temperature = 1.0F, .seed = 73});
+  const auto target0 = sampler.Distribution(row0);
+  const auto target1 = sampler.Distribution(row1);
+  std::array<unsigned, 5> counts0{};
+  std::array<unsigned, 5> counts1{};
+  for (unsigned trial = 0; trial < trials; ++trial) {
+    (void)trial;
+    auto draft_rng = sampling::NextRandom(sampler.mutable_rng_state());
+    const auto proposal0 = qfn::SampleMtpProposal(first, sampler, &draft_rng);
+    const auto token0 = qfn::VerifyMtpProposal(row0, proposal0, sampler).token;
+    draft_rng = sampling::NextRandom(sampler.mutable_rng_state());
+    const auto proposal1 = qfn::SampleMtpProposal(second, sampler, &draft_rng);
+    const auto token1 = qfn::VerifyMtpProposal(row1, proposal1, sampler).token;
+    Require(token0 < counts0.size() && token1 < counts1.size(),
+            "two-row verification left the vocabulary");
+    ++counts0[token0];
+    ++counts1[token1];
+  }
+  for (unsigned token = 0; token < counts0.size(); ++token) {
+    const double got0 = static_cast<double>(counts0[token]) / trials;
+    const double got1 = static_cast<double>(counts1[token]) / trials;
+    if (std::abs(got0 - target0.probability(token)) >= tolerance ||
+        std::abs(got1 - target1.probability(token)) >= tolerance) {
+      throw std::runtime_error(
+          "two-row MTP verification distorts the target distribution");
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -109,6 +153,7 @@ int main() {
     CheckCertainAcceptance();
     CheckGreedyRoundTrip();
     CheckSampledFrequencies();
+    CheckTwoRowChain();
   } catch (const std::exception& exception) {
     std::cerr << exception.what() << '\n';
     return 1;

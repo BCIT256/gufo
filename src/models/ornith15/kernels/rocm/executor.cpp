@@ -59,7 +59,8 @@ std::uint32_t RecurrentFloats(const Config& c) {
 bool HeaderMatches(const SnapshotHeader& header, const Config& c,
                    std::uint32_t max_context) {
   return std::memcmp(header.magic, kSnapshotMagic, 4) == 0 &&
-         header.version == Session::kSnapshotPayloadVersion &&
+         (header.version == Session::kSnapshotPayloadVersion ||
+          header.version == Session::kMtpSnapshotPayloadVersion) &&
          header.max_context == max_context &&
          header.num_layers == c.num_layers &&
          header.full_attention_interval == c.full_attention_interval &&
@@ -88,15 +89,20 @@ std::size_t PayloadBytes(const SnapshotHeader& header) {
     else
       bytes += 2 * std::size_t(header.position) * kv_row;
   }
+  if (header.version == Session::kMtpSnapshotPayloadVersion) {
+    bytes += 2 * std::size_t(header.position) * kv_row;
+    bytes += std::size_t(header.hidden_size) * sizeof(float);
+  }
   bytes += std::size_t(header.vocab) * sizeof(float);
   return bytes;
 }
 
 SnapshotHeader MakeHeader(const Config& c, std::uint32_t position,
-                          std::uint32_t max_context) {
+                          std::uint32_t max_context, bool mtp) {
   SnapshotHeader header{};
   std::memcpy(header.magic, kSnapshotMagic, 4);
-  header.version = Session::kSnapshotPayloadVersion;
+  header.version = mtp ? Session::kMtpSnapshotPayloadVersion
+                       : Session::kSnapshotPayloadVersion;
   header.position = position;
   header.max_context = max_context;
   header.num_layers = c.num_layers;
@@ -883,7 +889,8 @@ std::size_t Session::SnapshotPayloadBytes(
     std::uint32_t position) const noexcept {
   if (model_ == nullptr)
     return 0;
-  return PayloadBytes(MakeHeader(model_->config(), position, max_context_));
+  return PayloadBytes(
+      MakeHeader(model_->config(), position, max_context_, mtp_enabled_));
 }
 
 bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
@@ -892,15 +899,18 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
                              std::shared_ptr<StagedSnapshot>* staged,
                              std::string* error) {
   if (model_ == nullptr || staged == nullptr || failed_ ||
-      canonical_grid_ == 0 || mtp_enabled_ || boundary <= position_ ||
+      canonical_grid_ == 0 || boundary <= position_ ||
       tokens.size() > kMaxPrefillChunk ||
-      std::uint64_t{boundary} >= std::uint64_t{position_} + tokens.size()) {
+      std::uint64_t{boundary} >= std::uint64_t{position_} + tokens.size() ||
+      (mtp_enabled_ && (mtp_chain_ || mtp_position_ != position_))) {
     if (error != nullptr)
-      *error = "invalid in-pass checkpoint (grid, MTP, boundary or width)";
+      *error =
+          "invalid in-pass checkpoint (grid, MTP chain, boundary or width)";
     return false;
   }
   const auto& c = model_->config();
-  const SnapshotHeader header = MakeHeader(c, boundary, max_context_);
+  const SnapshotHeader header =
+      MakeHeader(c, boundary, max_context_, mtp_enabled_);
   if (!HeaderMatches(header, c, max_context_)) {
     if (error != nullptr)
       *error = "session configuration cannot be snapshotted";
@@ -921,6 +931,8 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
   InPassImage layout;
   layout.conv.assign(c.num_layers, 0);
   layout.recurrent.assign(c.num_layers, 0);
+  layout.boundary = boundary;
+  layout.mtp = mtp_enabled_;
   std::vector<std::pair<std::size_t, std::uint32_t>> kv;  // offset, layer
   std::size_t offset = sizeof(SnapshotHeader);
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
@@ -933,6 +945,12 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
       kv.emplace_back(offset, layer);
       offset += 2 * kv_bytes;
     }
+  }
+  if (mtp_enabled_) {
+    layout.mtp_k = offset;
+    offset += 2 * kv_bytes;
+    layout.mtp_carry = offset;
+    offset += std::size_t(c.hidden_size) * sizeof(float);
   }
   const std::size_t logit_offset = offset;
   if (logit_offset + std::size_t(c.vocab_size) * sizeof(float) !=
@@ -983,10 +1001,30 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
             "in-pass V");
     }
     const std::uint32_t row = boundary - start - 1;
-    fn::RmsNormRows(res_ + std::size_t(row) * c.hidden_size,
-                    model_->output_norm().f32(), xn_, 1, c.hidden_size, 1,
-                    c.rms_eps, stream_);
-    Dense(model_->output(), xn_, reinterpret_cast<float*>(base + logit_offset));
+    if (in_pass_.mtp) {
+      // MtpConsume has overwritten res_ with the NextN residual. h_rows_
+      // still holds this chunk's trunk output-norm, and NextN K/V through
+      // the live end includes the boundary prefix.
+      const float* carry = h_rows_ + std::size_t(row) * c.hidden_size;
+      Check(hipMemcpyAsync(base + in_pass_.mtp_k, mtp_state_.k, kv_bytes,
+                           hipMemcpyDeviceToDevice, stream_),
+            "in-pass mtp K");
+      Check(hipMemcpyAsync(base + in_pass_.mtp_k + kv_bytes, mtp_state_.v,
+                           kv_bytes, hipMemcpyDeviceToDevice, stream_),
+            "in-pass mtp V");
+      Check(hipMemcpyAsync(base + in_pass_.mtp_carry, carry,
+                           std::size_t(c.hidden_size) * sizeof(float),
+                           hipMemcpyDeviceToDevice, stream_),
+            "in-pass mtp carry");
+      Dense(model_->output(), carry,
+            reinterpret_cast<float*>(base + logit_offset));
+    } else {
+      fn::RmsNormRows(res_ + std::size_t(row) * c.hidden_size,
+                      model_->output_norm().f32(), xn_, 1, c.hidden_size, 1,
+                      c.rms_eps, stream_);
+      Dense(model_->output(), xn_,
+            reinterpret_cast<float*>(base + logit_offset));
+    }
     Check(hipEventRecord(image->ready, stream_), "in-pass event record");
     Check(hipGetLastError(), "in-pass launch");
   } catch (const std::exception& e) {
@@ -1002,9 +1040,11 @@ bool Session::PrefillThrough(std::span<const std::int32_t> tokens,
 
 void Session::TransferPayload(std::uint8_t* base, bool into_base,
                               hipMemcpyKind kind, hipStream_t stream,
-                              bool skip_kv, std::uint32_t position) const {
-  // Layout is the version-1 payload. Callers have already checked that the
-  // header matches this session, so the live config describes `base`.
+                              bool skip_kv, std::uint32_t position,
+                              std::uint32_t version) const {
+  // Callers have already checked that the header matches this session, so
+  // the live config describes `base`. Version 2 inserts NextN K/V and the
+  // carried trunk hidden before the logits.
   const auto& c = model_->config();
   std::size_t offset = sizeof(SnapshotHeader);
   const std::size_t conv_bytes = std::size_t(ConvFloats(c)) * sizeof(float);
@@ -1038,10 +1078,26 @@ void Session::TransferPayload(std::uint8_t* base, bool into_base,
       offset += 2 * kv_bytes;
     }
   }
+  if (version == kMtpSnapshotPayloadVersion) {
+    if (!skip_kv) {
+      copy(mtp_state_.k, kv_bytes,
+           into_base ? "snapshot mtp K" : "restore mtp K");
+      offset += kv_bytes;
+      copy(mtp_state_.v, kv_bytes,
+           into_base ? "snapshot mtp V" : "restore mtp V");
+      offset += kv_bytes;
+    } else {
+      offset += 2 * kv_bytes;
+    }
+    copy(h_carry_, std::size_t(c.hidden_size) * sizeof(float),
+         into_base ? "snapshot mtp carry" : "restore mtp carry");
+    offset += std::size_t(c.hidden_size) * sizeof(float);
+  }
   const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
   copy(logits_, logit_bytes, into_base ? "snapshot logits" : "restore logits");
   offset += logit_bytes;
-  if (offset != PayloadBytes(MakeHeader(c, position, max_context_)))
+  if (offset != PayloadBytes(MakeHeader(c, position, max_context_,
+                                        version == kMtpSnapshotPayloadVersion)))
     throw std::runtime_error("snapshot size diverged");
 }
 
@@ -1054,7 +1110,8 @@ bool Session::SaveSnapshot(std::vector<std::uint8_t>* payload,
     return false;
   }
   const auto& c = model_->config();
-  const SnapshotHeader header = MakeHeader(c, position_, max_context_);
+  const SnapshotHeader header =
+      MakeHeader(c, position_, max_context_, mtp_enabled_);
   if (!HeaderMatches(header, c, max_context_)) {
     if (error != nullptr)
       *error = "session configuration cannot be snapshotted";
@@ -1063,9 +1120,11 @@ bool Session::SaveSnapshot(std::vector<std::uint8_t>* payload,
   std::vector<std::uint8_t> bytes(PayloadBytes(header));
   std::memcpy(bytes.data(), &header, sizeof(header));
   try {
+    if (mtp_stream_ != nullptr)
+      Check(hipStreamSynchronize(mtp_stream_), "snapshot mtp drain");
     Check(hipStreamSynchronize(stream_), "snapshot drain");
     TransferPayload(bytes.data(), true, hipMemcpyDeviceToHost, stream_, false,
-                    position_);
+                    position_, header.version);
     Check(hipStreamSynchronize(stream_), "snapshot");
   } catch (const std::exception& e) {
     if (error != nullptr)
@@ -1083,7 +1142,8 @@ std::shared_ptr<StagedSnapshot> Session::StageSnapshot(std::string* error) {
     return nullptr;
   }
   const auto& c = model_->config();
-  const SnapshotHeader header = MakeHeader(c, position_, max_context_);
+  const SnapshotHeader header =
+      MakeHeader(c, position_, max_context_, mtp_enabled_);
   if (!HeaderMatches(header, c, max_context_)) {
     if (error != nullptr)
       *error = "session configuration cannot be snapshotted";
@@ -1101,8 +1161,11 @@ std::shared_ptr<StagedSnapshot> Session::StageSnapshot(std::string* error) {
     Check(hipMemcpyAsync(staged->device, staged->header_bytes, sizeof(header),
                          hipMemcpyHostToDevice, stream_),
           "snapshot header");
+    if (mtp_stream_ != nullptr)
+      Check(hipStreamSynchronize(mtp_stream_), "snapshot mtp drain");
     TransferPayload(static_cast<std::uint8_t*>(staged->device), true,
-                    hipMemcpyDeviceToDevice, stream_, false, position_);
+                    hipMemcpyDeviceToDevice, stream_, false, position_,
+                    header.version);
     Check(hipEventRecord(staged->ready, stream_), "snapshot event record");
   } catch (const std::exception& e) {
     if (error != nullptr)
@@ -1187,6 +1250,7 @@ bool Session::RestoreStagedSnapshot(const StagedSnapshot& staged,
   if (!HeaderMatches(header, c, max_context_) ||
       header.position != staged.position ||
       staged.bytes != PayloadBytes(header) ||
+      (header.version == kMtpSnapshotPayloadVersion) != mtp_enabled_ ||
       (logits.size() != c.vocab_size && !logits.empty())) {
     if (error != nullptr)
       *error = "staged snapshot does not match this session";
@@ -1198,7 +1262,8 @@ bool Session::RestoreStagedSnapshot(const StagedSnapshot& staged,
     Check(hipEventSynchronize(staged.ready), "staged restore wait");
     Check(hipStreamSynchronize(stream_), "staged restore drain");
     TransferPayload(static_cast<std::uint8_t*>(staged.device), false,
-                    hipMemcpyDeviceToDevice, stream_, skip_kv, staged.position);
+                    hipMemcpyDeviceToDevice, stream_, skip_kv, staged.position,
+                    header.version);
     const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
     const std::size_t logit_offset = staged.bytes - logit_bytes;
     if (!logits.empty()) {
@@ -1217,6 +1282,11 @@ bool Session::RestoreStagedSnapshot(const StagedSnapshot& staged,
     return false;
   }
   position_ = staged.position;
+  if (header.version == kMtpSnapshotPayloadVersion) {
+    mtp_position_ = staged.position;
+    mtp_chain_ = false;
+    mtp_draft_inflight_ = false;
+  }
   if (!skip_kv) {
     lineage_ = staged.lineage == 0 ? NextLineage() : staged.lineage;
     kv_high_water_ = staged.position;
@@ -1243,6 +1313,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   std::memcpy(&header, payload.data(), sizeof(header));
   if (!HeaderMatches(header, c, max_context_) ||
       payload.size() != PayloadBytes(header) ||
+      (header.version == kMtpSnapshotPayloadVersion) != mtp_enabled_ ||
       (logits.size() != c.vocab_size && !logits.empty())) {
     if (error != nullptr)
       *error = "snapshot does not match this session";
@@ -1262,7 +1333,8 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   try {
     Check(hipStreamSynchronize(stream_), "restore drain");
     TransferPayload(const_cast<std::uint8_t*>(payload.data()), false,
-                    hipMemcpyHostToDevice, stream_, false, header.position);
+                    hipMemcpyHostToDevice, stream_, false, header.position,
+                    header.version);
     Check(hipStreamSynchronize(stream_), "restore");
     if (!logits.empty()) {
       const std::size_t logit_bytes = std::size_t(c.vocab_size) * sizeof(float);
@@ -1281,6 +1353,11 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   if (pinned)
     (void)hipHostUnregister(registered);
   position_ = header.position;
+  if (header.version == kMtpSnapshotPayloadVersion) {
+    mtp_position_ = header.position;
+    mtp_chain_ = false;
+    mtp_draft_inflight_ = false;
+  }
   lineage_ = NextLineage();
   kv_high_water_ = header.position;
   last_restore_skipped_kv_ = false;
@@ -1297,7 +1374,8 @@ bool Session::SnapshotRecurrentRegion(std::span<const std::uint8_t> payload,
   SnapshotHeader header{};
   std::memcpy(&header, payload.data(), sizeof(header));
   if (std::memcmp(header.magic, kSnapshotMagic, 4) != 0 ||
-      header.version != kSnapshotPayloadVersion ||
+      (header.version != kSnapshotPayloadVersion &&
+       header.version != kMtpSnapshotPayloadVersion) ||
       header.full_attention_interval == 0 || layer >= header.num_layers ||
       payload.size() != PayloadBytes(header))
     return false;
@@ -1747,6 +1825,28 @@ bool Session::RollbackMtpBatch(std::uint32_t keep, std::string* error) {
 void Session::RewindMtp(std::uint32_t position) noexcept {
   mtp_position_ = position;
   mtp_chain_ = false;
+}
+
+bool Session::StoreFrontierLogits(std::span<const float> logits,
+                                  std::string* error) {
+  if (model_ == nullptr || failed_ || stream_ == nullptr ||
+      logits.size() != model_->config().vocab_size) {
+    if (error != nullptr)
+      *error = "invalid frontier logits";
+    return false;
+  }
+  try {
+    Check(hipMemcpyAsync(logits_, logits.data(), logits.size_bytes(),
+                         hipMemcpyHostToDevice, stream_),
+          "frontier logits");
+    Check(hipStreamSynchronize(stream_), "frontier logits");
+    return true;
+  } catch (const std::exception& e) {
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
 }
 
 void Session::SaveMtpCarry() {
