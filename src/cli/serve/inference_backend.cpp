@@ -2903,7 +2903,8 @@ private:
 constexpr std::string_view kOrnith15StateAbi = "ornith15-rocm-session-v1";
 /// Ornith prefill gives the same bits at any split, so every boundary is a
 /// cell. Checkpoints still come only from prefill: decode steps use other
-/// kernels and are re-prefilled next turn.
+/// kernels. The scheduler prefills a finished reply while idle, or the next
+/// turn does, so a cached turn always repeats a cold prefill.
 constexpr std::uint32_t kOrnithPrefillGrid = 1;
 
 std::vector<std::uint8_t> OrnithCompatibilityIdentity(
@@ -3225,6 +3226,7 @@ public:
                 .partial_prefill_retention = true,
                 .prefill_rollback = false,
                 .prefill_grid = kOrnithPrefillGrid,
+                .idle_reply_refill = true,
             },
         .persistence = persistence_,
     };
@@ -3916,6 +3918,12 @@ public:
                                  .piece = tokenizer_->DecodeTokenCopy(token)});
     }
     return step;
+  }
+
+  void KeepPrefillFrontier(TextRunnerState& state) const override {
+    auto& ornith = RequireOrnithState(state);
+    std::string error;
+    ornith.RememberCanonical(ornith.session().StageSnapshot(&error));
   }
 
   [[nodiscard]] bool RewindToCanonicalPrefix(

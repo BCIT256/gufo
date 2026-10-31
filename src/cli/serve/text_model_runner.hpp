@@ -138,6 +138,10 @@ struct TextRunnerCapabilities {
   /// that prefill produced, so a cached suffix repeats a cold prefill; above
   /// one, snapshot targets are also rounded down to a multiple of the width.
   std::size_t prefill_grid{0};
+  /// With a nonzero prefill_grid, an idle scheduler prefills a finished reply
+  /// after its response, so the next turn resumes past the reply on the same
+  /// frontier a cold prompt reaches.
+  bool idle_reply_refill{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -470,6 +474,9 @@ public:
   /// Retain a safe executed frontier when cancellation interrupts publication
   /// of a completed speculative block. Called with cancellation checks cleared.
   virtual void PrepareCancellation(TextRunnerState&) const {}
+  /// Retains the live prefill frontier as the one RewindToCanonicalPrefix
+  /// restores. Called between idle reply-refill chunks.
+  virtual void KeepPrefillFrontier(TextRunnerState&) const {}
   /// Restores the last prefill-produced grid frontier, dropping decode steps
   /// and a partial final cell. False means `state` was invalidated and must
   /// not be published. Runners without a prefill grid leave state unchanged.
@@ -612,6 +619,11 @@ public:
     /// can already restore before it waits for a peer or captures an extra
     /// checkpoint for later requests. Shorter gaps cost less to prefill again.
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
+
+    /// Prompt and generated tokens of a turn that generated a reply, as the
+    /// prompt of an idle refill. Call before Commit.
+    [[nodiscard]] std::optional<TextPreparedPrompt> ReplyRefillPrompt() const;
+    void KeepPrefillFrontier();
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);

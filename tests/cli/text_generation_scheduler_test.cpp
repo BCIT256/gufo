@@ -207,6 +207,9 @@ struct FakeControl {
   bool batched_multi_token_decode{false};
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
+  bool idle_reply_refill{false};
+  /// The prefill gate waits for a chunk starting at or past this offset.
+  std::size_t block_prefill_offset{0};
   bool preview_first_token{false};
   std::vector<std::string> output_pieces;
   std::uint32_t max_context{128};
@@ -232,6 +235,7 @@ public:
   TextRunnerToken label{0};
   std::size_t position{0};
   std::size_t decode_count{0};
+  std::size_t prefilled{0};
   std::optional<TextRunnerToken> frontier;
 };
 
@@ -275,6 +279,8 @@ public:
                     control_->batched_multi_token_decode,
                 .batched_multi_token_decode_max_width = 4,
                 .prefix_reuse = control_->prefix_reuse,
+                .prefill_grid = control_->idle_reply_refill ? 1U : 0U,
+                .idle_reply_refill = control_->idle_reply_refill,
             },
         .persistence = std::nullopt,
     };
@@ -377,6 +383,7 @@ public:
           .count = consumed,
       });
       if (control_->block_prefill_label == fake.label &&
+          fake.position >= control_->block_prefill_offset &&
           !control_->prefill_gate_entered) {
         control_->prefill_gate_entered = true;
         control_->prefill_gate_label = fake.label;
@@ -390,6 +397,7 @@ public:
     }
 
     fake.position += consumed;
+    fake.prefilled = fake.position;
     const bool ready = fake.position == prompt.size();
     if (ready) {
       fake.frontier = fake.label * 100;
@@ -464,6 +472,15 @@ public:
     restored.position = saved.position;
     restored.decode_count = saved.decode_count;
     restored.frontier = saved.frontier;
+  }
+
+  [[nodiscard]] bool RewindToCanonicalPrefix(
+      TextRunnerState& state) const override {
+    auto& fake = RequireFakeState(state);
+    fake.position = fake.prefilled;
+    fake.decode_count = 0;
+    fake.frontier = fake.label * 100;
+    return true;
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -887,6 +904,70 @@ void TestIdlePrefillUsesBulkWorkUnit() {
              result.physical_execution_width == 1 &&
              result.execution_plan == "serial-c1",
          "C=1 telemetry reports immediate serial dispatch");
+}
+
+bool WaitForPrefillAt(FakeControl& control, TextRunnerToken label,
+                      std::size_t index) {
+  const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    for (const auto& event : control.Events()) {
+      if (event.kind == EventKind::kPrefill && event.label == label &&
+          event.index == index)
+        return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
+void TestIdleReplyRefillCoversTheNextTurn() {
+  auto control = std::make_shared<FakeControl>();
+  control->idle_reply_refill = true;
+  auto scheduler = MakeScheduler(control, 1);
+
+  const auto first = scheduler->Submit({7, 70}, 2, 0.0F).Wait();
+  Expect(first.tokens == ExpectedTokens(7, 2), "first turn keeps its output");
+  Expect(WaitForPrefillAt(*control, 7, 2),
+         "idle scheduler prefills the reply after the response");
+
+  std::vector<TextRunnerToken> next{7, 70};
+  next.insert(next.end(), first.tokens.begin(), first.tokens.end());
+  next.push_back(71);
+  const auto second = scheduler->Submit(next, 1, 0.0F).Wait();
+  Expect(second.cached_prompt_tokens == 4 && second.prefill_tokens == 1,
+         "next turn resumes past the refilled reply");
+}
+
+void TestArrivalPreemptsIdleReplyRefill() {
+  auto control = std::make_shared<FakeControl>();
+  control->idle_reply_refill = true;
+  control->block_prefill_label = 7;
+  control->block_prefill_offset = 2;
+  auto scheduler = MakeScheduler(control, 1, {.decode_active_tokens = 1});
+
+  const auto first = scheduler->Submit({7, 70}, 3, 0.0F).Wait();
+  Expect(first.tokens == ExpectedTokens(7, 3),
+         "the response does not wait for its refill");
+  {
+    std::unique_lock<std::mutex> lock(control->mutex);
+    Expect(
+        control->condition.wait_for(
+            lock, kTestTimeout, [&] { return control->prefill_gate_entered; }),
+        "refill starts while idle");
+  }
+  auto arrival = scheduler->Submit({9}, 1, 0.0F);
+  {
+    std::lock_guard<std::mutex> lock(control->mutex);
+    control->release_prefill = true;
+  }
+  control->condition.notify_all();
+  const auto served = arrival.Wait();
+  Expect(served.tokens == ExpectedTokens(9, 1), "arrival is served");
+  for (const auto& event : control->Events()) {
+    Expect(!(event.kind == EventKind::kPrefill && event.label == 7 &&
+             event.index > 2),
+           "refill stops at the chunk boundary");
+  }
 }
 
 void TestRunnerCanSkipUnusedFinalAdvance() {
@@ -3068,6 +3149,8 @@ int main() {
       TestPrefillYieldsToEveryDueDecoder(multi_token, batched);
     }
   }
+  TestIdleReplyRefillCoversTheNextTurn();
+  TestArrivalPreemptsIdleReplyRefill();
   TestNonIncrementalRunnerFallsBackSafely();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();
