@@ -369,3 +369,30 @@ The rewordings do not separate the builds. On the frozen prompt,
 `write_merge` failure stays recorded as a failure. These samples do not
 show a systematic loss from the M4 prefill product. The suite, its seed
 and its 2048-token limit are unchanged.
+
+## M5 prefill
+
+ExplicitContract stays on. A 2048-token prefill is one launch, and a routed
+chunk of at least 1024 tokens uses a 64-column tile. Shorter chunks stay at
+48, including every 16-token reference cell. A 400+112+rest split therefore
+mixes tile 48 and tile 64 against a one-shot tile 64. The bits still match.
+
+On `3f5bce75` (4096-token launch, tile 48), `ornith15.gpu_chunk` passed in
+381.54 s. The log reports `chunk identity bit-identical`, the 2048-token
+one-shot and both in-pass captures, and the two mutations diverging
+(`artifacts/m5/gpu-chunk-4096-detail.log`). The oracle and held-out
+distribution filters were not re-run on that commit alone.
+
+On `f88b29e2` (tile 64 from 1024 tokens), the same test passed again inside
+both filters below. The oracle run's `gpu_chunk` log (314.90 s) reports
+`agent/chunk2048 one PASS`, `in_pass start=0 boundary=1000 end=2048 PASS`,
+`in_pass start=400 boundary=1500 end=2048 PASS`, `mutation DIVERGED
+first_bad_token=0`, `mutation_lone_token DIVERGED first_bad_token=96`, and
+`chunk identity bit-identical`.
+
+Held-out `GUFO_ORNITH15_LLAMA_LOGITS` pointed at `artifacts/reference/heldout`.
+`ctest --preset gpu-full -R '^ornith15\.(gpu_decode|gpu_snapshot|gpu_grid|gpu_chunk|gpu_mtp)$'`
+passed 5/5 in 604.35 s. Oracle logits, `ctest --preset gpu-full -R
+'^(ornith15|qwen38_flash_next)\.'`, passed 34/34 in 782.44 s, including
+every `qwen38_flash_next` test. Thresholds were not changed. The shared MMQ
+default was not edited. Log: `artifacts/m5/gates-tile64.log`.

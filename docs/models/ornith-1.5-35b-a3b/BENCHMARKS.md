@@ -584,3 +584,120 @@ restored in 1.5–2.3 ms, but a long `cache-messages-loop` exhausted GPU
 memory with Lemonade resident. That 15:12 run used `--cache-disk`, where
 prefill stops at the boundary: cached turns were 255.0–330.2 ms, and the
 disk restore of 431 tokens after restart was 98.1 ms.
+
+## M5 prefill launch and routed tile
+
+2026-10-31, gfx1151. Release preset. Power: `AC0/online=1`,
+`BAT0/status=Not charging`. Lemonade's llama-server (pid 3363206, state
+`Sl`, port 8003) stayed up and was not paused. Two kept changes, measured
+separately. `3f5bce75` raises `Session::kMaxPrefillChunk` from 512 to 4096.
+`f88b29e2` uses a 64-column routed MMQ tile when the prefill chunk has at
+least 1024 tokens and 48 columns below that. The down projection follows
+the chunk length, not its expanded expert-row count. ExplicitContract stays
+on. Frozen binaries: `build/release-m5-base/gufo` at `001a6290`,
+`build/release-m5-c4096/gufo` (4096, tile 48). The tile binary is
+`build/release/gufo`.
+
+rocprofv3 through `tools/prof/prof.py`, one warm `ornith15_bench` prefill
+(`GUFO_ORNITH15_BENCH_SAMPLES=1`, `WARM_STEPS=0`, `DECODE=0`). Class times
+are sums of dispatch durations and can exceed the GPU span. The 2048
+"before" span is the sum of four 512-token chunk spans. The warm pass is
+the second launch. Raw tables: `artifacts/m5/prof-classes.txt`.
+
+| Class | 262 chunk 512 | 262 chunk 4096 | 2048 × 512 | 2048 one launch |
+| --- | ---: | ---: | ---: | ---: |
+| Routed IQ4_XS | 99.58 | 94.07 | 607.97 | 380.59 |
+| Routed Q6_K | 71.84 | 67.00 | 394.20 | 230.07 |
+| Routed Q5_K | 51.11 | 49.54 | 322.61 | 194.82 |
+| Dense Q6 projections | 76.93 | 72.87 | 491.59 | 351.34 |
+| Shared Q8_0 | 8.83 | 8.32 | 52.47 | 38.13 |
+| DeltaNet | 18.63 | 17.42 | 169.61 | 152.81 |
+| Attention | 4.74 | 4.55 | 149.17 | 137.25 |
+| F32 router/shexp | 18.45 | 17.34 | 142.24 | 149.90 |
+| MoE epilogue/SwiGLU | 11.89 | 11.60 | 122.04 | 140.06 |
+| Quantize and ids | 10.91 | 10.51 | 81.87 | 101.09 |
+| Norm, residual, embed | 3.24 | 3.04 | 25.36 | 25.44 |
+| Vocab GEMV | 1.97 | 1.87 | 1.98 | 1.97 |
+| Runtime fill/copy | 2.23 | 2.15 | 6.55 | 1.79 |
+| GPU span | 366.4 | 365.9 | 2016.5 | 1425.1 |
+
+The tile-64 profile uses the same classes. At 262 tokens the routed kernels
+are still tile 48. At 2048 they are tile 64. Dense Q6 stays tile 80.
+
+| Class | 262 (tile 48) | 2048 (tile 64) |
+| --- | ---: | ---: |
+| Routed IQ4_XS | 93.04 | 324.74 |
+| Routed Q6_K | 66.66 | 193.01 |
+| Routed Q5_K | 48.95 | 168.39 |
+| Dense Q6 projections | 67.80 | 337.48 |
+| Shared Q8_0 | 8.13 | 37.83 |
+| DeltaNet | 22.63 | 177.38 |
+| Attention | 4.58 | 128.21 |
+| F32 router/shexp | 18.36 | 181.73 |
+| MoE epilogue/SwiGLU | 11.74 | 138.91 |
+| Quantize and ids | 10.81 | 100.78 |
+| Norm, residual, embed | 3.64 | 27.56 |
+| Vocab GEMV | 1.89 | 1.94 |
+| Runtime fill/copy | 2.61 | 2.40 |
+| GPU span | 374.2 | 1448.1 |
+
+Routed IQ4_XS + Q6_K + Q5_K at 2048 tokens is 805.48 ms with tile 48 and
+686.14 ms with tile 64. The GPU span did not fall with the kernel sum
+(1425.1 ms to 1448.1 ms).
+
+Server rates are interleaved, two cycles, fresh process per sample, same
+prompts, temperature 0, seed 41, thinking off, `cache_prompt` false, 64 new
+tokens except the 18-token prompt. Both engines use
+`prefill_tokens / prefill_ms` and `predicted_n / predicted_ms`.
+llama.cpp's `predicted_per_second` divides by `predicted_n - 1` and is not
+this column. The 18-token Gufo completion is 1 token; llama.cpp reports
+`predicted_n` 2, so that row is not a sustained decode rate. Harness:
+`artifacts/m5/llama_m5.py`. Prompts: `Reply with the word OK.` (18), and
+the M1 sentence repeated to 262 and 2052 tokens.
+
+```
+build/release-m5-base/gufo serve --host 127.0.0.1 --port PORT llm --model Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --context 16384 --sessions 1 --served-model-name ornith-m5
+```
+
+The 4096 and tile binaries use the same arguments. llama.cpp:
+
+```
+LD_LIBRARY_PATH=<therock gfx1151 lib>:<therock llvm lib>:<llama-b11580> llama-server -m Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --host 127.0.0.1 --port PORT --ctx-size 16384 --jinja --parallel 1 -ngl 99 -lv 4
+```
+
+Every llama.cpp start logged `offloaded 42/42 layers to GPU`,
+`ROCm0 model buffer size = 21353.95 MiB`,
+`ROCm_Host model buffer size = 397.85 MiB`,
+`ROCm0 KV buffer size = 320.00 MiB`,
+`ROCm0 RS buffer size = 62.81 MiB`, device AMD Radeon 8060S Graphics
+(`0000:c4:00.0`).
+
+Order base (`001a6290`), 4096 with tile 48, llama.cpp:
+
+| Prompt | Base pp | 4096 pp | llama.cpp pp | Base tg | 4096 tg | llama.cpp tg |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 18 | 140.7, 143.1 | 141.9, 137.3 | 120.8, 120.7 | — | — | — |
+| 262 | 698.1, 669.2 | 677.5, 672.2 | 655.5, 637.5 | 40.38, 40.40 | 40.93, 40.56 | 44.41, 44.35 |
+| 2052 | 904.1, 903.3 | 1053.9, 1041.8 | 1092.2, 1066.0 | 38.46, 38.42 | 39.20, 38.48 | 37.97, 38.30 |
+
+2052 prefill means are 903.7, 1047.8 and 1079.1 tok/s. The 4096 launch is
+faster than `001a6290` on both cycles and still short of llama.cpp. At 262
+tokens the first cycle is 677.5 against 698.1 and the second is 672.2
+against 669.2 (means 674.8 and 683.6). Decode is not slower. The 18-token
+prefill stays with the baseline.
+
+Order 4096 with tile 48, tile 64 from 1024 tokens, llama.cpp. The 18-token
+path was not repeated: a chunk under 1024 tokens stays on tile 48.
+
+| Prompt | Tile 48 pp | Tile 64 pp | llama.cpp pp | Tile 48 tg | Tile 64 tg | llama.cpp tg |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 262 | 678.5, 688.1 | 678.3, 674.4 | 585.0, 622.4 | 41.82, 46.03 | 41.23, 40.35 | 40.22, 44.52 |
+| 2052 | 1052.7, 1053.3 | 1076.8, 1079.2 | 1066.0, 1064.6 | 39.03, 38.75 | 38.98, 38.88 | 37.91, 39.59 |
+
+2052 prefill means are 1053.0, 1078.0 and 1065.3 tok/s. Tile 64 is ahead of
+llama.cpp on both cycles (1076.8 vs 1066.0, then 1079.2 vs 1064.6) and
+ahead of tile 48. At 262 tokens the first cycle matches (678.3 vs 678.5)
+and the second is 674.4 vs 688.1. Decode at 2052 matches. The 46.03 tok/s
+tile-48 sample is one short decode interval (1390 ms); the other 262 decode
+samples sit at 40–42 tok/s. Raw rows: `artifacts/m5/m5-length.json` and
+`artifacts/m5/m5-tile.json`.

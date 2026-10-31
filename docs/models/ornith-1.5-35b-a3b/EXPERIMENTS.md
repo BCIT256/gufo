@@ -1173,3 +1173,32 @@ timer. Rates are tok/s at 20 / 261 / 2048 tokens.
 - Retained width 48, fresh process, median of three: 192.6 / 677.6 /
   858.8. Baseline on the same probe: 161.5 / 613.3 / 830.7. Lemonade's
   ~995 tok/s at 2048 tokens was not reached.
+
+## M5
+
+`Session::kMaxPrefillChunk` is 4096, so a 2048-token prefill is one launch.
+The server grid stays width 1. ExplicitContract stays on for Q6_K and Q5_K.
+Routed prefill (`experts > 1`) still caps the column grid at the token count
+passed into the call. From a prefill chunk of 1024 tokens the requested tile
+is 64 columns; below that it stays 48. Gate and up pass the chunk. Down
+passes the chunk length separately from its expanded row count (`n * 8`),
+so a 262-token chunk does not switch its down projection to 64. Dense
+projections and decode do not set the hint. Measured server rates are in
+[BENCHMARKS.md](BENCHMARKS.md).
+
+The tile probe is release `ornith15_bench`, `Session::Prefill`, context
+4096, chunk 4096, three samples, decode off. It is sequential in one
+process, not an interleaved server run. Power: `AC0/online=1`,
+`BAT0/status=Not charging`. Lemonade's llama-server stayed up.
+
+- Uniform tile 64 at 2048 tokens, median 1090.4
+  (1123.3, 1090.4, 1075.5). Tile 48 before it was 1060.9
+  (1094.5, 1060.9, 1037.8). Tile 48 after the sweep was 1021.5
+  (1053.1, 1021.5, 1018.1).
+- Uniform tile 80 at 2048 tokens, median 1061.2
+  (1117.3, 1061.2, 1051.8). Rejected; it did not beat tile 64.
+- Uniform tile 64 at 262 tokens, median 700.2
+  (692.4, 708.6, 700.2), after tile 48 at 729.5
+  (731.8, 724.5, 729.5). Rejected. A constant 64 slows the short prefill.
+- Retained: 64 columns only when the prefill chunk is at least 1024 tokens.
+  The interleaved server comparison is the M5 table in BENCHMARKS.md.

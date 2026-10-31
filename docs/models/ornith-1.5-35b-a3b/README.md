@@ -12,7 +12,9 @@ On a grid session (`Session::SetCanonicalGrid`; the server uses width 1)
 prefill gives the same bits for a token wherever the prompt is split: batched
 Q6_K and Q5_K products use a fixed order, and a one-token launch keeps the
 batched kernels instead of the decode dots. Each call of up to 4096 tokens is one
-launch. The server reuses a cached prompt at its exact boundary, but stores
+launch. Routed prefill uses a 64-column MMQ tile when that chunk has at least
+1024 tokens and a 48-column tile below that; dense projections keep the
+default tile. The server reuses a cached prompt at its exact boundary, but stores
 only frontiers that prefill produced; decode steps use other kernels, so the
 next turn re-prefills the generated reply. Cached and cold greedy output are
 therefore identical. The direct session API leaves the grid off, so an
