@@ -23,10 +23,14 @@ freezes the cache boundary into a staged image inside the same launch and the
 host copy runs in the background, so the boundary costs no second forward
 pass. The host payload is the disk cache when `--cache-disk` is set; then
 prefill stops at snapshot boundaries, as upstream requires for disk.
-`--speculative mtp` drafts with the bundled NextN block and keeps
-autoregressive output; it is slower than autoregressive decode on the
-measured prompts and cannot be combined with the prefix cache (see
-BENCHMARKS.md). Vision and YaRN are absent. Other `--speculative` backends,
+`--speculative mtp` drafts with the bundled NextN block, at most 7
+drafts, and verifies that chain in one trunk launch. It is slower than
+autoregressive decode on the measured prompts, so it stays opt-in (see
+BENCHMARKS.md). The prefix cache accepts it. An MTP snapshot is version
+2 and stores NextN K/V plus the trunk hidden carry. The draft chain is
+cold at a prefill frontier; it is not rebuilt from a side buffer. The
+draft-length controller resets at each request and is not in the
+snapshot. Vision and YaRN are absent. Other `--speculative` backends,
 `--mmproj` and `--enable-yarn` are rejected. `Session::Prefill` runs a prompt
 in chunks of at most 4096 tokens. `Session::Step` advances one token. A plain decode step
 may replay a HIP graph. Pass a vocabulary-sized buffer to receive logits, or
@@ -34,10 +38,13 @@ an empty buffer plus a sampled id to take a device argmax without downloading
 logits. Invalid calls leave state untouched. A device execution failure
 requires `Reset` before reuse. `SaveSnapshot` copies the position, the
 gated-attention KV below it, every DeltaNet recurrent and short-conv state,
-and the logits into a version-1 host payload. `StageSnapshot` queues that
+and the logits into a version-1 host payload. With MTP enabled the
+same call writes version 2, which adds NextN K/V and the trunk carry.
+`StageSnapshot` queues that
 copy into a private device image and returns without a host sync.
-`ExportStagedSnapshot` writes the version-1 payload from the image after the
-session has moved on. `RestoreSnapshot` loads a host payload into a fresh or
+`ExportStagedSnapshot` writes that payload from the image after the
+session has moved on. Version 1 is the autoregressive image; version 2
+is the MTP image. `RestoreSnapshot` loads a host payload into a fresh or
 already used session. `RestoreStagedSnapshot` loads the device image and
 skips KV when the destination still holds that prefix. `SnapshotPayloadBytes`
 reports the size. A prefill that returns every row also stores its last row in the

@@ -701,3 +701,87 @@ and the second is 674.4 vs 688.1. Decode at 2052 matches. The 46.03 tok/s
 tile-48 sample is one short decode interval (1390 ms); the other 262 decode
 samples sit at 40–42 tok/s. Raw rows: `artifacts/m5/m5-length.json` and
 `artifacts/m5/m5-tile.json`.
+
+## M5 final prefill, same formula
+
+2026-10-31, after `c6e64988`. The autoregressive kernels are the tile-64
+launch above. `a5e5feff` and `fd08363f` do not change them; this table
+was taken on `build/release/gufo` before those two rebuilds. Baseline is
+`build/release-m5-base/gufo` at `001a6290`. Fresh process per sample, two
+cycles, order base, final, llama.cpp. Same prompts, temperature 0, seed
+41, thinking off, `cache_prompt` false, 64 new tokens except the
+18-token prompt. Rates are `prefill_tokens / prefill_ms` and
+`completion_tokens / decode_ms` (llama.cpp `predicted_n / predicted_ms`).
+`predicted_per_second` is not this column. The 18-token Gufo completion
+is 1 token. Harness: `artifacts/m5/llama_m5.py`. Rows:
+`artifacts/m5/m5-final-prefill.json`.
+
+```
+build/release-m5-base/gufo serve --host 127.0.0.1 --port PORT llm --model Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --context 16384 --sessions 1 --served-model-name ornith-m5
+```
+
+The final binary uses the same arguments. llama.cpp is the command in
+the section above (`-ngl 99 -lv 4`, no `--spec-type`). Every llama.cpp
+start in this table logged `offloaded 42/42 layers to GPU` and
+`ROCm0 model buffer size = 21353.95 MiB`.
+
+| Prompt | Base pp | Final pp | llama.cpp pp | Base tg | Final tg | llama.cpp tg |
+| ---: | --- | --- | --- | --- | --- | --- |
+| 18 | 141.8, 138.5 | 135.7, 138.4 | 121.9, 121.7 | — | — | — |
+| 262 | 687.3, 677.8 | 683.8, 696.3 | 645.0, 630.4 | 40.73, 41.46 | 40.68, 46.01 | 44.59, 44.70 |
+| 2052 | 914.8, 911.2 | 1094.2, 1082.6 | 1088.2, 1072.5 | 38.96, 38.80 | 38.98, 38.61 | 37.81, 38.34 |
+
+2052 prefill means are 913.0, 1088.4 and 1080.4 tok/s. The final binary
+is ahead of llama.cpp on both cycles and ahead of `001a6290`. At 262
+tokens the first cycle is 683.8 against 687.3 and the second is 696.3
+against 677.8. The 46.01 tok/s sample is one short decode (1391 ms); the
+other final 262 decode is 40.68, next to the baseline. The 18-token
+prefill is 135.7 then 138.4, against 141.8 and 138.5.
+
+## M5 MTP decode
+
+Same day, release `build/release/gufo` with the provisional
+`kMtpRelativeCost` table, before the claim fix and the per-request
+policy reset. Fresh process, two cycles, order Gufo autoregressive, Gufo
+`--speculative mtp --draft-tokens 7`, llama.cpp `--spec-type draft-mtp`.
+Cache off. Temperature 0, seed 41, thinking off, 64 new tokens. Same
+262- and 2052-token prompts. Formula as above, every completion token.
+Acceptance is `draft_tokens_accepted/draft_tokens`. Rows:
+`artifacts/m5/m5-mtp-speed.json`.
+
+```
+build/release/gufo serve --host 127.0.0.1 --port PORT llm --model Ornith-1.5-35B-A3B-APEX-MTP-Quality.gguf --context 16384 --sessions 1 --served-model-name ornith-m5 --speculative mtp --draft-tokens 7
+```
+
+llama.cpp adds `--spec-type draft-mtp` and logged `offloaded 42/42 layers
+to GPU`, `ROCm0 model buffer size = 22211.31 MiB`.
+
+| Prompt | Gufo AR tg | Gufo MTP tg | llama.cpp MTP tg | Gufo accepted | llama.cpp accepted |
+| ---: | --- | --- | --- | --- | --- |
+| 262 | 41.01, 40.63 | 33.77, 33.53 | 38.28, 41.20 | 14/19, 14/19 | 28/101, 28/101 |
+| 2052 | 39.66, 38.56 | 32.49, 32.76 | 36.64, 36.19 | 14/19, 14/19 | 29/99, 29/99 |
+
+Gufo MTP is slower than Gufo autoregressive and slower than llama.cpp
+MTP on both prompts and both cycles. It is not the default.
+
+A fixed-width sweep on a temporary cost table (every entry 0.05, not the
+shipped binary; the table was restored afterward) did not find a faster
+width. Accepted draft tokens stayed near 28–30 while the draft count
+grew. Rows: `artifacts/m5/m5-mtp-sweep.json`.
+
+| Prompt | AR tg | k=1 tg | k=2 tg | k=4 tg | k=7 tg |
+| ---: | --- | --- | --- | --- | --- |
+| 262 | 40.34, 40.73 | 32.40, 32.21 | 30.00, 29.77 | 24.94, 24.79 | 20.59, 20.59 |
+| 2052 | 39.09, 38.67 | 30.76, 30.53 | 27.71, 27.56 | 22.95, 22.74 | 18.78, 18.78 |
+
+Acceptance, same order of cycles: 262 tokens k=1 29/34, k=2 30/66, k=4
+30/130, k=7 30/221; 2052 tokens k=1 28/35, k=2 28/70, k=4 28/138, k=7
+28/236. Both cycles repeated those counts.
+
+The 7-turn agent replay, cache off, at most 128 new tokens, same
+interleave (`artifacts/m5/m5-agent-speed.json`). Summed completion
+tokens over decode milliseconds: cycle 0 is 37.19 autoregressive,
+31.72 Gufo MTP (106/125) and 41.34 llama.cpp MTP (148/366); cycle 1 is
+37.32, 31.40 (106/125) and 42.16 (148/366). Gufo MTP matched
+autoregressive tool calls. llama.cpp MTP did not match the edit
+arguments. Greedy prose on the speed prompts diverges; see QUALITY.md.

@@ -1202,3 +1202,19 @@ process, not an interleaved server run. Power: `AC0/online=1`,
   (731.8, 724.5, 729.5). Rejected. A constant 64 slows the short prefill.
 - Retained: 64 columns only when the prefill chunk is at least 1024 tokens.
   The interleaved server comparison is the M5 table in BENCHMARKS.md.
+
+MTP verification is one prefill launch of the chain (at most 8 rows).
+The provisional `kMtpRelativeCost` table was left in place. Forcing every
+cost to 0.05, so the controller always drafted the cap, was measured and
+reverted. No width from 1 to 7 beat autoregressive decode. Accepted
+tokens stayed near 28–30 at temperature 0 while wider drafts only added
+rejections. That sweep is not a shipped binary. Rates are in
+BENCHMARKS.md.
+
+The split of one k=1 cycle is a calculation, not a rocprof trace. At 262
+tokens a k=1 round was about 58 ms (64 tokens, 34 rounds, 32.4 tok/s).
+One autoregressive step on the same interleave was about 25 ms. Each
+extra drafted position added about 6 ms. The remaining ~52 ms is the
+2-token verify. Past the first draft, acceptance on these prompts was
+about zero, so the verify launch dominates. A faster draft does not
+close that gap. Prompt-lookup drafts were not started.

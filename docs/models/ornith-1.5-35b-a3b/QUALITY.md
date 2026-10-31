@@ -250,13 +250,13 @@ Held-out `ornith15.gpu_decode` passed. Chunk sizes stayed 16, 48, 64 and
 
 ## MTP
 
-`--speculative mtp` drafts with the bundled NextN block and commits each
-kept token with one decode-dot step, the same graph as autoregressive
-`Step`. The draft runs on its own stream and scratch. A rejected draft
-stops the chain. Other speculative backends are rejected. A different
-`--mtp-model` is rejected. `--cache-disk` and a RAM cache capacity are
-rejected with `Ornith MTP does not support the prefix cache`. The load
-line is `event=ornith_mtp draft_tokens=N cache=off`.
+This record is the earlier server, which committed each kept token with
+one decode-dot step. M5 verifies the chain in one launch and keeps the
+prefix cache; see M5 MTP below. On the earlier server `--cache-disk` and
+a RAM cache were rejected with `Ornith MTP does not support the prefix
+cache`. The loader still prints `event=ornith_mtp draft_tokens=N
+cache=off`; that string is not a rejection. Other speculative backends
+are rejected. A different `--mtp-model` is rejected.
 
 Sampled acceptance is the Flash-Next rule. `ornith15.gpu_mtp` passed on
 this tree: trunk logits with the NextN consume stayed at max abs 0
@@ -396,3 +396,82 @@ passed 5/5 in 604.35 s. Oracle logits, `ctest --preset gpu-full -R
 '^(ornith15|qwen38_flash_next)\.'`, passed 34/34 in 782.44 s, including
 every `qwen38_flash_next` test. Thresholds were not changed. The shared MMQ
 default was not edited. Log: `artifacts/m5/gates-tile64.log`.
+
+## M5 MTP
+
+One round drafts serially from the NextN block, at most 7 tokens
+(`kMaxMtpDraftTokens`). `VerifyForward` then scores the anchor plus those
+drafts in one trunk launch, using the prefill kernels (`RunChunk` and
+`ProjectAllLogits`), so the rows are not decode-step logits. A partial
+accept calls `RollbackMtpBatch(keep)` and does not run the trunk again.
+A full accept drafts the last token while the chain is still hot, then
+`RewindMtp`. The version-2 snapshot stores NextN K/V and the trunk carry
+(`h_carry`). The chain is cold at a prefill frontier. The draft-length
+controller is not in the snapshot. It resets in `Invalidate` and at the
+start of `PreviewFirstToken`, which is the request boundary when a cache
+hit skips `Invalidate`.
+
+`ornith15.gpu_mtp` on this path
+(`artifacts/m5/gpu-mtp-batched-oracle.log`): a 4-token `VerifyForward`
+differed from four `Step`s by max abs 0.85989475. Greedy argmax agreed
+12/12 on that chain (0 of 30 synthetic drafts accepted) and 24/24 on an
+81-token sentence (9 of 41 drafts accepted). Verify-row distribution
+against the captures passed on `reasoning_history`, `tool_round_trip`
+and `user_turn` (mean KL ratios 1.154, 1.105 and 0.719; outlier
+failures 0). Thresholds were not changed.
+
+On `c6e64988`, before the logit-batch claim fix, held-out
+`gpu_decode`, `gpu_snapshot`, `gpu_grid`, `gpu_chunk` and `gpu_mtp`
+passed 5/5 (`artifacts/m5/gates-mtp-heldout.log`). The oracle filter
+`^(ornith15|qwen38_flash_next)\.` passed 34/34
+(`artifacts/m5/gates-mtp-oracle.log`), including `gpu_chunk`
+bit-identical. Those two GPU filters were not re-run after `a5e5feff`
+or `fd08363f`. Neither commit changes kernel math: the first allocates
+the verify logit batch inside `EnableMtp`, before the resource claim;
+the second resets the draft-length controller per request. The host
+`pr` preset, outside `nix develop`, passed 67/67 after `fd08363f`.
+
+`ornith15-functional-v1` on the MTP server (`--speculative mtp
+--draft-tokens 7`, context 8192) passed card and greedy, 5/5 each.
+An autoregressive greedy run also passed 5/5. Tool calls still parse.
+Greedy message text is not all identical to autoregressive text:
+`rectangle_area` matches; `tool_round_trip` turns 0 and 1 match on
+content, tool name and arguments; turn 2 differs at the first comma
+versus a newline. `fix_median` differs at `median_ms()` versus
+`median_ms`. `two_turn_clamp` uses `max(lo, min(value, hi))` on the
+autoregressive server and `min(max(value, lo), hi)` with MTP. `write_merge`
+unpacks the interval on the autoregressive server and indexes
+`interval[0]` and `interval[1]` with MTP. Both forms passed the suite.
+Answers: `artifacts/m5/functional-v1-mtp/` and `functional-v1-ar/`.
+
+Temperature 0 on the 7-turn agent replay, cache off, matched
+autoregressive content, tool name, arguments and finish on all 7 turns
+in both cycles. The prose speed prompts do not: the 262-token completion
+first differs at character 73, the 2052-token completion at character
+217, the same place in both cycles.
+
+Cached-versus-cold identity at temperature 0 on that agent replay held
+on the claim-fix binary, before the per-request policy reset. RAM hits
+restored the full prompt (`prefill_ms` 0, cached tokens 438, 503, 589,
+644, 699, 785, 840) and the completion matched. After restart the first
+turn was a disk hit: cached 431 of 438, 7 tokens prefilled,
+`cache_restore_ms` 110.6, completion matched. Later turns in that
+process were RAM prefix hits (`min_step` skips further disk
+checkpoints). The disk payload of the 431-token checkpoint was
+76574784 bytes. This identity was not re-measured after `fd08363f`.
+
+Upstream cache suites, tier `pr`, `--record-baseline`, one session,
+context 32768, `--speculative mtp --draft-tokens 7`, on the post-reset
+release binary (`artifacts/m5/cache-mtp-32k/report.json`). Passed:
+`cache-edits`, `cache-depth`, `cache-rotation`, `text-cancel`,
+`thinking-tool-cancel`, `legacy-tool-cancel`, `disk-spacing` and the
+four `-disk` variants. Failed: `cache-growth` (cold greedy, empty text,
+`finish` `length`, 128 completion tokens, never `BETA`);
+`cache-shared-prefix` (reply `ALPHA.` where the suite requires the bare
+code; miss `prefix_changed`, common prefix 4); `cache-compaction`
+(shared probe text `GAMMA` with cached tokens 0, miss `prefix_changed`,
+common prefix 2263 of checkpoint 2277); `cache-bridge` (unqualified:
+64 fills published 7374985728 of 10224906240 budget bytes).
+`cache-concurrency` was not run. Thresholds and the suites were not
+edited. A context-8192 run of the same suites is an earlier setup miss
+and is not this result.
