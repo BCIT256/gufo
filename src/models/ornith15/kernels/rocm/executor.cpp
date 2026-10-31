@@ -350,15 +350,10 @@ void Session::Project(const DeviceTensor& w, const float* x, float* out,
     }
   }
   if (w.type == GgmlType::kF32) {
-    // Groups of eight stay on the width that keeps each token's FMA order.
-    std::uint32_t done = 0;
-    while (done < n) {
-      const std::uint32_t rows = std::min<std::uint32_t>(8, n - done);
-      fn::SmallGemm(
-          w.data, fn::WeightType::kF32, x + std::size_t(done) * w.cols,
-          out + std::size_t(done) * w.rows, rows, w.rows, w.cols, stream_);
-      done += rows;
-    }
+    // Every full group of eight tokens is one grid; each token keeps the
+    // FMA order a lone token takes.
+    fn::SmallGemm(w.data, fn::WeightType::kF32, x, out, n, w.rows, w.cols,
+                  stream_);
     return;
   }
   if (w.type == GgmlType::kQ8_0 && w.experts == 1) {
