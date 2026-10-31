@@ -233,7 +233,8 @@ private:
   void Quantized(const DeviceTensor& w, const float* x, const std::int32_t* ids,
                  float* out, std::uint32_t rows, std::uint32_t used);
   void MoeRaw(const DeviceTensor& w, const float* x, const std::int32_t* ids,
-              float* out, std::uint32_t n_tokens, std::uint32_t used);
+              float* out, std::uint32_t n_tokens, std::uint32_t used,
+              std::uint32_t chunk_tokens = 0);
   void LinearAttention(const DeviceLayer& l, std::size_t layer,
                        std::uint32_t n);
   void Attention(const DeviceLayer& l, State& state, std::uint32_t n);

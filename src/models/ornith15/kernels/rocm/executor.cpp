@@ -383,19 +383,20 @@ struct ExplicitContract {
   ExplicitContract& operator=(const ExplicitContract&) = delete;
 };
 
-// Routed prefill only. Width 48 beat the default 80-column tile at 20,
-// 261 and 2048 tokens on gfx1151. The column grid is capped at the
-// token count passed in: gate and up pass the chunk, so tiles past that
-// are not launched; down already passes one row per selected slot, and
-// the cap does not shrink it. Cleared on return. Dense projections and
-// decode keep the default selector.
+// Routed prefill only. Below 1,024 tokens the tile is 48 columns; a longer
+// chunk uses 64. The column grid is capped at the token count passed in:
+// gate and up pass the chunk, so tiles past that are not launched; down
+// already passes one row per selected slot, and the cap does not shrink it.
+// Down's tile follows the prefill chunk, not its expanded row count.
+// Cleared on return. Dense projections and decode keep the default selector.
 struct RoutedTileHint {
   bool active = false;
-  RoutedTileHint(int tokens, int experts, int used) {
+  RoutedTileHint(int tokens, int experts, int used, int chunk_tokens) {
     if (experts <= 1 || tokens <= 0 || used <= 0)
       return;
     qfn_mmq_set_routed_max_expert_rows(tokens);
-    qfn_mmq_set_routed_tile_cols(48);
+    const int rows = chunk_tokens > 0 ? chunk_tokens : tokens;
+    qfn_mmq_set_routed_tile_cols(rows >= 1024 ? 64 : 48);
     active = true;
   }
   ~RoutedTileHint() {
@@ -410,14 +411,15 @@ struct RoutedTileHint {
 
 void Session::MoeRaw(const DeviceTensor& w, const float* x,
                      const std::int32_t* ids, float* out,
-                     std::uint32_t n_tokens, std::uint32_t used) {
+                     std::uint32_t n_tokens, std::uint32_t used,
+                     std::uint32_t chunk_tokens) {
   const int m = static_cast<int>(w.rows);
   const int k = static_cast<int>(w.cols);
   const int n = static_cast<int>(n_tokens);
   const int experts = static_cast<int>(w.experts);
   const int slots = static_cast<int>(used);
   const ExplicitContract contract(!chunk_dependent_reduction_);
-  const RoutedTileHint tile(n, experts, slots);
+  const RoutedTileHint tile(n, experts, slots, static_cast<int>(chunk_tokens));
   int rc = -1;
   switch (w.type) {
     case GgmlType::kQ8_0:
@@ -545,7 +547,7 @@ void Session::Moe(const DeviceLayer& l, std::uint32_t n) {
               c.num_experts_used, 1);
   } else {
     MoeRaw(l.ffn_down_exps, expert_gate_, ids_, expert_down_,
-           n * c.num_experts_used, 1);
+           n * c.num_experts_used, 1, n);
   }
   Project(l.shexp_gate, xn_, shared_gate_, n);
   Project(l.shexp_up, xn_, shared_up_, n);
