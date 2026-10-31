@@ -785,3 +785,51 @@ tokens over decode milliseconds: cycle 0 is 37.19 autoregressive,
 37.32, 31.40 (106/125) and 42.16 (148/366). Gufo MTP matched
 autoregressive tool calls. llama.cpp MTP did not match the edit
 arguments. Greedy prose on the speed prompts diverges; see QUALITY.md.
+
+## M5 review
+
+2026-10-31, gfx1151, production `nix build` packages: `0daeb14` (M4
+remedy, the same kernels as `001a6290`) and `72e51cb` (M5 final).
+Power: `AC0/online=1`, `BAT0/status=Not charging`. Lemonade's
+llama-server (pid 3363206, port 8003) stayed `Sl`. One process per
+engine per cycle, one 8-token warm-up request, then the prompts in
+order; engine order rotates each cycle. Cache off, temperature 0, seed
+41, thinking off, 64 new tokens. Rates use every completion token on
+both engines. llama.cpp `b11580` ran `-ngl 99 -lv 4` with Lemonade's
+ROCm libraries and logged `offloaded 42/42 layers to GPU` at every
+start. Harness: `artifacts/m5-review/review_ab.py` (reuses
+`artifacts/m5/m5_mtp_speed.py`). Rows: `artifacts/m5-review/review-ar.json`
+and `review-mtp.json`.
+
+Autoregressive, four cycles, median (per-cycle values in the rows):
+
+| Prompt | `0daeb14` pp | `72e51cb` pp | llama.cpp pp | `0daeb14` tg | `72e51cb` tg | llama.cpp tg |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 18 | 183.8 | 183.6 | 171.1 | — | — | — |
+| 262 | 706.2 | 699.3 | 697.2 | 39.91 | 39.55 | 36.72 |
+| 2052 | 859.0 | 1035.2 | 1046.9 | 37.76 | 38.04 | 36.97 |
+
+2,052-token prefill rose 20.5% over the M4 remedy. llama.cpp was ahead
+on all four cycles (1077.0 vs 1075.5, 1054.8 vs 1051.6, 1039.0 vs
+1011.2, 1038.0 vs 1018.9), so the M5 section's "ahead of llama.cpp" is
+not reproduced: the two are level within about 1%. 18- and 262-token
+prefill and decode are unchanged against `0daeb14`.
+
+MTP (`--speculative mtp --draft-tokens 7`) against autoregressive on the
+same `72e51cb` binary and llama.cpp `--spec-type draft-mtp`, three
+cycles, median tg (accepted/drafted were identical every cycle):
+
+| Prompt | Gufo AR | Gufo MTP | llama.cpp MTP | Gufo accepted | llama.cpp accepted |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 262 | 39.16 | 34.85 | 35.57 | 14/19 | 28/101 |
+| 2052 | 37.55 | 33.84 | 35.91 | 14/19 | 29/99 |
+
+Gufo MTP is 11% and 10% slower than Gufo autoregressive, which is faster
+than llama.cpp MTP on both prompts.
+
+MTP with `--cache-disk`, 7-turn agent replay (`m5_agent.py identity`):
+full-prompt RAM repeats reached the first token in 9.5–10.6 ms (restore
+8.3–9.4 ms); turns that prefill a new suffix took 282–340 ms, against
+189–255 ms for autoregressive cached turns in the M4 remedy review. The
+disk hit after restart restored 431 tokens in 116.7 ms (first token
+252 ms).

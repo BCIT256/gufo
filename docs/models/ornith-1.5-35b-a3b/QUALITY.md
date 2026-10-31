@@ -475,3 +475,40 @@ common prefix 2263 of checkpoint 2277); `cache-bridge` (unqualified:
 `cache-concurrency` was not run. Thresholds and the suites were not
 edited. A context-8192 run of the same suites is an earlier setup miss
 and is not this result.
+
+## M5 review
+
+On `72e51cbd` (after `a5e5feff` and `fd08363f`), rebuilt `gpu-test`:
+held-out `gpu_decode`, `gpu_snapshot`, `gpu_grid`, `gpu_chunk`,
+`gpu_mtp` 5/5; oracle `^(ornith15|qwen38_flash_next)\.` 34/34,
+including `gpu_chunk` bit-identical. Thresholds unchanged. Logs:
+`artifacts/m5-review/gates-*.log`.
+
+MTP cache identity on the production `72e51cb` binary, temperature 0,
+7-turn agent replay with `--cache-disk`: a cache-on pass, a full repeat
+in the same process (every turn a full-prompt RAM hit) and a pass after
+restart (turn 0 a disk hit of 431 tokens) gave the same content, tool
+name, arguments and finish on all 7 turns. The repeat pass is where the
+pre-`a5e5feff` server returned HTTP 500 (`text runner measured state
+exceeds its resource claim`); it completed.
+
+The four upstream suites that failed with MTP, re-run on `72e51cb` with
+and without MTP (tier `pr`, `--record-baseline`, context 32768, one
+session, inside `nix develop`; `artifacts/m5-review/suites-{ar,mtp}/`):
+
+| Suite | Autoregressive | MTP |
+| --- | --- | --- |
+| `cache-compaction` | passed | passed |
+| `cache-shared-prefix` | failed: reply `ALPHA.`, not the bare code | failed, same reply |
+| `cache-bridge` | unqualified: 9,030,868,992 of 15,459,983,360 budget bytes | unqualified: 9,079,234,560 of 10,099,662,848 |
+| `cache-growth` | failed: `keep_thinking` turns 1–3, cache did not cover the replayed reply | failed earlier: a thinking turn used all 128 tokens without answering `BETA` |
+
+`cache-shared-prefix` and `cache-bridge` fail the same way with and
+without MTP. The autoregressive `cache-growth` failure is the design
+recorded under the M4 remedy: only prefill frontiers are stored, so the
+previous reply (63, 7, ... tokens) is re-prefilled; the suite requires
+the cache to cover it. With MTP, greedy reasoning differs from
+autoregressive (see M5 MTP), and on that case it ran past the suite's
+128-token limit before the coverage checks. `cache-compaction` failed
+in Grok's MTP run and passed in both of these. None of these suites ran
+in M4.
