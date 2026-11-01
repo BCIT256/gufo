@@ -29,6 +29,11 @@ drafts and verifies that chain in one trunk launch on the decode dots, so
 greedy output equals autoregressive and each verified row is bit-identical
 to a decode step. It is faster than autoregressive decode on the measured
 prompts (see BENCHMARKS.md). The prefix cache accepts it.
+Prompt lookup adds proposals copied from the request's own prompt and output
+(`speculative::PromptLookup`, the Flash-Next rules), and the same verification
+checks them. `Session::CatchUpMtp` then writes NextN K/V for the copied tokens, bit-identical to
+drafting them one at a time. The index is rebuilt from each request's prompt, so
+it is not in the snapshot.
 After a reply, an idle server prefills it in bounded chunks, starting 100 ms
 after the response, so a later turn resumes past the reply on the frontier a
 cold prompt reaches. Any arrival preempts that work at the next chunk. An MTP snapshot is version

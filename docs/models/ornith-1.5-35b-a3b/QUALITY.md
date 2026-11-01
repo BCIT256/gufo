@@ -554,3 +554,51 @@ inside the 100 ms delay. A build with no delay covered the reply at a 0 ms gap i
 the resend test, but cost about 100 ms to first token there, and it was not run
 through this suite. The suite is not changed.
 
+## MTP by default and prompt lookup
+
+Rule fixed before scoring: the five `ornith15-functional-v1` tasks at the frozen
+seed plus seeds 1000-1009 (55 runs per mode), and `write_merge` through seed 1031
+(33 runs). MTP holds if its total is within 3 of autoregressive, no task is worse
+by more than 2 of 11, and `write_merge` is within 4. Suite prompts and tests are
+unchanged; card sampling.
+
+| Build | 55 runs | `write_merge`, 33 seeds |
+| --- | ---: | ---: |
+| Autoregressive, `7e2268e2` | 51 | 22 |
+| MTP, `7e2268e2` | 51 | 27 |
+| MTP + lookup, production `2f4e1d0` | 51 | 27 |
+
+The other four tasks passed 11/11 in every row. All 55-run failures are
+`write_merge`, recorded as failures. Sampled output differs by seed between
+modes, so these are rates. The lookup row ran in a later session, against the
+earlier autoregressive row.
+
+Greedy and seeded (temperature 0.6) output on production, 5 turns with tool
+calls and whole-file replies: gap 0, gap 1,000 ms, disk and disk after restart
+all matched cache off. Lookup counters were not recorded on these turns.
+`ornith15.gpu_mtp` checks that a draft after `CatchUpMtp` is bit-identical to one
+built token by token, with all copies kept, a rejected copy, and a neural draft
+followed by copies, and that the trunk is untouched.
+
+A server with no `--speculative` drafts when the GGUF bundles NextN. A copy of
+the APEX file with its metadata set to no NextN block loaded autoregressively, and
+`--speculative mtp` on that copy failed at load.
+
+Gates at `2f4e1d05`: oracle 34/34, held-out 5/5, host PR suite 67/67 with one new
+scheduler test. `ornith15-functional-v1` on production with no flag: greedy 5/5,
+card 5/5 on the frozen seed.
+
+Upstream suites, same list and order on `6116b0d` and `2f4e1d0` with `--speculative
+mtp`: `cache-edits`, `tool-agent`, `tool-agent-loop`, `cache-messages-loop` and
+`long-context` pass on both. `tools` (`auto-tools`), `cache-growth`,
+`cache-shared-prefix`, `cache-compaction` and `cache-bridge` fail on both the same
+way. `cache-compaction` passes alone on both. After the other suites on one server
+its retry resumes at 27,525 of 27,542 tokens and fails its unchanged-retry check;
+this is not explained. `run.py` reads a missing `--speculative` as
+autoregressive and fails on the drafts it then sees, so MTP runs must pass the
+flag. The suites are not changed.
+
+`tests/functional/pi_agent.py` pins Pi 0.87.0. A local copy with the pin moved to
+the installed Pi 1.3.0 passed all 8 cases, one pass, on the production default. Its
+prompts are French: it covers the tool loop, not the English product workflow.
+

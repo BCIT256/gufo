@@ -901,3 +901,45 @@ in each pass (each cycle one pass):
 A request that lands during the refill pays for two short launches, which is
 the 150 ms row. Starting the refill with no delay measured 257 → 353 ms at a
 0 ms gap, so it waits 100 ms. A gap under that costs the old re-prefill.
+
+## MTP by default and prompt lookup
+
+2026-10-31, gfx1151, AC power, interleaved, temperature 0, thinking off, rate over
+every completion token. Autoregressive runs now need `--speculative off`.
+
+Work that repeats its context (`artifacts/m7/lookup_ab.py`), release build of
+`2f4e1d05`, three cycles, median tok/s. The control is MTP without lookup
+(`7e2268e2`):
+
+| Task | Tokens | Autoregressive | MTP | MTP + lookup | llama.cpp MTP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rename a function, whole file | 1,015 | 40.4 | 50.1 | 80.3 | 42.3 |
+| One-line docstring, whole file | 581 | 41.1 | 52.6 | 87.9 | 42.8 |
+| 300-word prose control | 460 | 41.8 | 43.2 | 43.1 | 36.0 |
+
+Lookup proposed 811 and 485 tokens on the two edits and 800 and 477 were kept. It
+proposed none on prose. Gufo's three modes produced the same text on every task.
+
+Production `2f4e1d0`, llama.cpp `b11580` (42/42 layers), three cycles, median:
+
+| Prompt tokens | Decode: AR / MTP / llama.cpp | Prefill: AR / MTP / llama.cpp |
+| ---: | --- | --- |
+| 262 | 43.2 / 50.1 / 37.6 | 770 / 765 / 568 |
+| 2,052 | 40.6 / 47.4 / 38.1 | 1,178 / 1,144 / 1,007 |
+
+llama.cpp's 262-token prefill was 738 tok/s in the M6 session, so compare within
+a session. Drafting costs prefill about 3% at 2,052 tokens because NextN runs too.
+
+Agent replay, 7 turns, cache off, two cycles: autoregressive 38.6 / 38.2, default
+49.9 / 50.0, llama.cpp MTP 43.1 / 43.3. Text and tool calls match autoregressive.
+
+Cached first token on longer replies, 9 requests per pass including whole-file
+replies, two cycles, median ms for `--speculative off` / default / `6116b0d` MTP:
+650 / 659 / 657 at a 0 ms gap, 715 / 724 / 744 at 300 ms, 389 / 391 / 399 at
+1,000 ms. These turns re-prefill longer replies than the refill table's, so the
+two tables do not compare.
+
+Risk: on the upstream suites lookup added 446 proposals and 102 accepted drafts
+(3,019/1,889 against 2,573/1,787), and `cache-messages-loop` took 322 s against
+308 s in one run each. Rejected copies cost verification rows; this was not
+measured on its own.
