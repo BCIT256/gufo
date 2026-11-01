@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -424,6 +425,50 @@ int main() {
                   << " prefill_vs_step_mean_kl=" << kl_sum / n
                   << " prefill_vs_step_max_kl=" << kl_max << std::endl;
         ok = ok && pre_pass;
+      }
+      // An agent loop on the server's grid: prefill resumes on decode state.
+      struct Turn {
+        std::uint32_t prefill;
+        std::uint32_t decode;
+      };
+      for (const Turn turn : {Turn{64, 16}, Turn{16, 4}, Turn{1, 1}}) {
+        auto session = orn::rocm::Session::Create(*device, n, &error);
+        Require(session != nullptr && session->SetCanonicalGrid(1),
+                "resume session: " + error);
+        std::vector<float> last(vocab), got(std::size_t(n) * vocab);
+        std::uint32_t at = 0;
+        while (at < n) {
+          const auto count = std::min(turn.prefill, n - at);
+          Require(session->Prefill(
+                      std::span<const std::int32_t>(&batch.tokens[at], count),
+                      last, &error, count,
+                      std::span(got).subspan(std::size_t(at) * vocab,
+                                             std::size_t(count) * vocab)),
+                  "resume prefill: " + error);
+          at += count;
+          for (std::uint32_t t = 0; t < turn.decode && at < n; ++t, ++at) {
+            Require(session->Step(batch.tokens[at], actual, &error),
+                    "resume step: " + error);
+            std::copy(actual.begin(), actual.end(),
+                      got.begin() + std::size_t(at) * vocab);
+          }
+        }
+        GateStats resume;
+        for (std::uint32_t t = 0; t < n; ++t) {
+          const auto lq =
+              LogSoftmax(got.data() + std::size_t(t) * vocab, vocab);
+          const auto ll = LogSoftmax(batch.Row(t), vocab);
+          const double lk = Kl(ll, lq);
+          resume.llama_sum += lk;
+          resume.floor_sum += Kl(ll, LogSoftmax(sequential.Row(t), vocab));
+          resume.llama_max = std::max(resume.llama_max, lk);
+          resume.outliers += !(lk <= kOutlierRatio * self_max);
+          ++resume.positions;
+        }
+        std::cout << prompt << " resume_prefill=" << turn.prefill
+                  << " resume_decode=" << turn.decode << " ";
+        PrintGate(resume, self_max);
+        ok = ok && MeanPass(resume) && OutlierPass(resume);
       }
     }
     Require(ok, "one or more prompts failed the distribution contract");

@@ -209,6 +209,7 @@ struct FakeControl {
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
   bool idle_reply_refill{false};
+  bool publish_decode_frontier{false};
   /// The prefill gate waits for a chunk starting at or past this offset.
   std::size_t block_prefill_offset{0};
   bool preview_first_token{false};
@@ -280,7 +281,11 @@ public:
                     control_->batched_multi_token_decode,
                 .batched_multi_token_decode_max_width = 4,
                 .prefix_reuse = control_->prefix_reuse,
-                .prefill_grid = control_->idle_reply_refill ? 1U : 0U,
+                .prefill_grid = control_->idle_reply_refill ||
+                                        control_->publish_decode_frontier
+                                    ? 1U
+                                    : 0U,
+                .publish_decode_frontier = control_->publish_decode_frontier,
                 .idle_reply_refill = control_->idle_reply_refill,
             },
         .persistence = std::nullopt,
@@ -945,6 +950,21 @@ void TestBeginDecodeSeesTheFullPromptOnACacheHit() {
              control->decode_prompts[0] == prompt &&
              control->decode_prompts[1] == next,
          "each request's decode begins with its whole prompt");
+}
+
+void TestDecodedFrontierCoversTheNextTurnAtOnce() {
+  auto control = std::make_shared<FakeControl>();
+  control->publish_decode_frontier = true;
+  auto scheduler = MakeScheduler(control, 1);
+  const std::vector<TextRunnerToken> prompt{7, 70};
+  const auto first = scheduler->Submit(prompt, 2, 0.0F).Wait();
+  std::vector<TextRunnerToken> next = prompt;
+  next.insert(next.end(), first.tokens.begin(), first.tokens.end());
+  const auto reply_end = next.size();
+  next.push_back(71);
+  const auto second = scheduler->Submit(next, 1, 0.0F).Wait();
+  Expect(second.cached_prompt_tokens == reply_end,
+         "the next turn resumes through the executed reply");
 }
 
 void TestIdleReplyRefillCoversTheNextTurn() {
@@ -3177,6 +3197,7 @@ int main() {
     }
   }
   TestBeginDecodeSeesTheFullPromptOnACacheHit();
+  TestDecodedFrontierCoversTheNextTurnAtOnce();
   TestIdleReplyRefillCoversTheNextTurn();
   TestArrivalPreemptsIdleReplyRefill();
   TestNonIncrementalRunnerFallsBackSafely();

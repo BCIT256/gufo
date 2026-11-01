@@ -138,6 +138,11 @@ struct TextRunnerCapabilities {
   /// that prefill produced, so a cached suffix repeats a cold prefill; above
   /// one, snapshot targets are also rounded down to a multiple of the width.
   std::size_t prefill_grid{0};
+  /// With a nonzero prefill_grid, a finished request still publishes its
+  /// decoded frontier, so the next turn resumes through the reply at once. A
+  /// cached suffix then follows decode rows instead of a cold prefill. Passes
+  /// the model's distribution gate, not bit identity with a cold prompt.
+  bool publish_decode_frontier{false};
   /// With a nonzero prefill_grid, an idle scheduler prefills a finished reply
   /// after its response, so the next turn resumes past the reply on the same
   /// frontier a cold prompt reaches.

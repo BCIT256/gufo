@@ -1839,7 +1839,12 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   }
   // Publish a prefill-produced frontier, not decode steps or a partial cell.
   // The first token is already out; this restore is not on the TTFT path.
-  if (capabilities.prefill_grid > 0 &&
+  // A stop inside an accepted block leaves state past the reply; rewind that.
+  const bool decoded_frontier =
+      capabilities.publish_decode_frontier &&
+      impl_->runner->CheckpointPosition(state) <=
+          impl_->prompt.size() + impl_->generated.size();
+  if (capabilities.prefill_grid > 0 && !decoded_frontier &&
       !impl_->runner->RewindToCanonicalPrefix(state)) {
     CommitMetrics metrics = impl_->snapshot_metrics;
     impl_->lease.Invalidate();
