@@ -165,6 +165,11 @@ Request decoding leaves EOS and later speculative tokens out of the reusable
 checkpoint. Fixed-length benchmarks may continue through EOS.
 See the [DS4 benchmark and quality contract](models/deepseek-v4-flash/BENCHMARKS.md).
 
+Ornith-1.5 drafts with the NextN block its GGUF bundles unless
+`--speculative off` is explicit; a file without the block decodes
+autoregressively. See the
+[Ornith model notes](models/ornith-1.5-35b-a3b/README.md).
+
 Qwen3.8-Flash-Next uses the same scheduler, with independent recurrent, KV,
 indexer, sampling and MTP state per session. Prefix snapshots retain complete
 state; `--cache-disk` adds restart-safe reuse. MTP draft length adapts within the

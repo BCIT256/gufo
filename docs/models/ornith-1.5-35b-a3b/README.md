@@ -23,11 +23,12 @@ freezes the cache boundary into a staged image inside the same launch and the
 host copy runs in the background, so the boundary costs no second forward
 pass. The host payload is the disk cache when `--cache-disk` is set; then
 prefill stops at snapshot boundaries, as upstream requires for disk.
-`--speculative mtp` drafts with the bundled NextN block, at most 7
-drafts, and verifies that chain in one trunk launch on the decode dots, so
+The server drafts with the bundled NextN block when the file has one, unless
+`--speculative off` is given; `--speculative mtp` requires it. It runs at most 7
+drafts and verifies that chain in one trunk launch on the decode dots, so
 greedy output equals autoregressive and each verified row is bit-identical
 to a decode step. It is faster than autoregressive decode on the measured
-prompts (see BENCHMARKS.md) and stays opt-in. The prefix cache accepts it.
+prompts (see BENCHMARKS.md). The prefix cache accepts it.
 After a reply, an idle server prefills it in bounded chunks, starting 100 ms
 after the response, so a later turn resumes past the reply on the frontier a
 cold prompt reaches. Any arrival preempts that work at the next chunk. An MTP snapshot is version

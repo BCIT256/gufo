@@ -1382,6 +1382,7 @@ int RunServe(std::span<const char* const> args) {
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
       speculative_backend = "dspark";
     }
+    speculative_config.automatic = speculative_backend.empty();
     if (speculative_backend.empty() || speculative_backend == "off") {
       speculative_config.backend = server::TextSpeculativeBackend::kDisabled;
     } else if (speculative_backend == "dflash2") {

@@ -41,6 +41,9 @@ enum class TextSpeculativeBackend : std::uint8_t {
 
 struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
+  /// No --speculative option: a model whose file bundles a draft head uses it.
+  /// An explicit `off` clears this.
+  bool automatic{false};
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};

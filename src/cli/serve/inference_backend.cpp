@@ -46,6 +46,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/ornith15/chat_template.hpp"
+#include "src/models/ornith15/config.hpp"
 #include "src/models/ornith15/kernels/rocm/device_model.hpp"
 #include "src/models/ornith15/kernels/rocm/executor.hpp"
 #include "src/models/ornith15/mtp_policy.hpp"
@@ -4271,7 +4272,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
   if (architecture == "qwen35moe") {
-    const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
+    const auto bundled = models::ornith15::Config::FromGguf(*reader);
+    const bool mtp =
+        speculative_config.backend == TextSpeculativeBackend::kMtp ||
+        (speculative_config.automatic && bundled && bundled->HasMtp());
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         !mtp) {
       SetError(error, "Ornith supports only --speculative mtp");
@@ -4382,8 +4386,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       if (mtp) {
         Logger::Info("loader",
                      "event=ornith_mtp draft_tokens=" +
-                         std::to_string(speculative_config.max_draft_tokens) +
-                         " cache=off");
+                         std::to_string(speculative_config.max_draft_tokens));
       }
       auto runner = std::make_shared<Ornith15TextRunner>(
           std::move(device),
