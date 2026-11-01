@@ -640,3 +640,21 @@ real tests or an exact check. Gufo 50/50, llama.cpp 48/50; both failures are
 tool errors 35 and 36. Optional `read` arguments 4 of 92 and 5 of 104, so the
 `auto-tools` near-tie does not appear as different behavior in this work.
 Capability is accepted. Five seeds cannot separate 5/5 from 3/5 on one task.
+
+## Reply reuse from decode state
+
+Rules fixed on 2026-11-01 before any result, for publishing a finished reply's
+decode frontier. Cached turns then follow decode rows, so they stop being
+bit-identical to a cold prompt. Baselines are `2f4e1d0`. The change stays only
+if all of these hold; otherwise it is reverted and the result recorded.
+
+1. `ornith15.gpu_decode` passes on the oracle and held-out captures at unchanged
+   thresholds, with a new agent-loop row: prefill resumes on decode state at
+   turns of 64+16, 16+4 and 1+1 tokens. Other gates and the host PR suite pass.
+2. `ornith15-functional-v1` on one seed 10/10. The sampled rule at no less than
+   its baseline minus 2: at least 49 of 55 runs, and `write_merge` at least 25
+   of 33 seeds, both with MTP and lookup.
+3. `continuation` passes. `cache-growth` is reported.
+4. `ornith-workflow-v1` with its harness unchanged: capability and latency
+   accepted against llama.cpp, and Gufo's first-token sum at most 170 s (205.1 s
+   before, 135.2 s on llama.cpp, so at least half the gap).
