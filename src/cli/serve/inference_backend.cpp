@@ -4014,12 +4014,6 @@ public:
     return step;
   }
 
-  void KeepPrefillFrontier(TextRunnerState& state) const override {
-    auto& ornith = RequireOrnithState(state);
-    std::string error;
-    ornith.RememberCanonical(ornith.session().StageSnapshot(&error));
-  }
-
   [[nodiscard]] bool RewindToCanonicalPrefix(
       TextRunnerState& state) const override {
     auto& ornith = RequireOrnithState(state);

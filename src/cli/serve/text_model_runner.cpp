@@ -1500,27 +1500,6 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   return position;
 }
 
-std::optional<TextPreparedPrompt> TextRunnerPool::Request::ReplyRefillPrompt()
-    const {
-  if (!impl_ || impl_->generated.empty())
-    return std::nullopt;
-  TextPreparedPrompt prepared;
-  prepared.tokens.reserve(impl_->prompt.size() + impl_->generated.size());
-  prepared.tokens.insert(prepared.tokens.end(), impl_->prompt.begin(),
-                         impl_->prompt.end());
-  prepared.tokens.insert(prepared.tokens.end(), impl_->generated.begin(),
-                         impl_->generated.end());
-  prepared.context = impl_->context;
-  return prepared;
-}
-
-void TextRunnerPool::Request::KeepPrefillFrontier() {
-  if (!impl_)
-    throw std::logic_error("text runner request is empty");
-  impl_->runner->KeepPrefillFrontier(
-      dynamic_cast<TextRunnerState&>(impl_->lease.state()));
-}
-
 void TextRunnerPool::Request::PrepareBatchExecution() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");

@@ -543,8 +543,6 @@ struct TextGenerationScheduler::Impl {
     incremental_text_is_exact = runner_pool->runner()
                                     .Descriptor()
                                     .capabilities.incremental_text_is_exact;
-    idle_reply_refill =
-        runner_pool->runner().Descriptor().capabilities.idle_reply_refill;
     multi_token_decode =
         runner_pool->runner().Descriptor().capabilities.multi_token_decode;
     batched_multi_token_decode = runner_pool->runner()
@@ -961,14 +959,6 @@ struct TextGenerationScheduler::Impl {
     request->result.ngram_dedup_rows = ngram.dedup_rows;
     request->result.ngram_cache_hits = ngram.cache_hits;
     request->result.ngram_disk_reads = ngram.disk_reads;
-    // A stop sequence cuts the reply short of what the client will resend.
-    auto refill_prompt =
-        idle_reply_refill && request->cache_prompt &&
-                finish_reason !=
-                    TextGenerationBackend::FinishReason::kStopSequence
-            ? request->runner_request.ReplyRefillPrompt()
-            : std::nullopt;
-    const std::size_t refill_cached = request->runner_request.prompt_tokens();
     const auto cache_commit =
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
@@ -989,61 +979,6 @@ struct TextGenerationScheduler::Impl {
     // before reading the result still counts.
     RecordRequestMetrics(request->result);
     PublishTerminal(request);
-    if (refill_prompt && refill_prompt->tokens.size() <
-                             runner_pool->runner().Descriptor().max_context) {
-      reply_refill.emplace(ReplyRefill{
-          .tokens = std::move(refill_prompt->tokens),
-          .context = std::move(refill_prompt->context),
-          .cached_tokens = refill_cached,
-          .not_before = Clock::now() + kReplyRefillDelay,
-      });
-    }
-  }
-
-  /// One bounded chunk of the finished reply. Runs only while the scheduler
-  /// is otherwise idle. Its failure belongs to no client: the next turn
-  /// prefills the reply itself.
-  void StepReplyRefill(const std::stop_token& stop_token) noexcept {
-    auto& refill = *reply_refill;
-    try {
-      if (!refill.request) {
-        refill.request = runner_pool->Acquire(
-            std::move(refill.tokens), sampling::SamplingConfig{},
-            [stop_token] { return stop_token.stop_requested(); },
-            std::move(refill.context));
-        // Only continue the turn that just finished, from its own frontier.
-        if (!refill.request ||
-            refill.request.cached_prompt_tokens() < refill.cached_tokens) {
-          PreemptReplyRefill();
-          return;
-        }
-      }
-      if (!refill.request.prefill_complete())
-        (void)refill.request.Prefill(prefill_policy.decode_active_tokens);
-      if (refill.request.prefill_complete()) {
-        (void)refill.request.Commit();
-        reply_refill.reset();
-      } else {
-        refill.request.KeepPrefillFrontier();
-      }
-    } catch (const std::exception& error) {
-      Logger::Log(LogLevel::kWarn, "scheduler",
-                  std::string("idle reply refill failed: ") + error.what());
-      refill.request.Invalidate();
-      reply_refill.reset();
-    } catch (...) {
-      refill.request.Invalidate();
-      reply_refill.reset();
-    }
-  }
-
-  /// Gives the session back. Completed chunks stay usable as a prefix.
-  void PreemptReplyRefill() noexcept {
-    if (!reply_refill)
-      return;
-    if (reply_refill->request)
-      (void)reply_refill->request.Cancel();
-    reply_refill.reset();
   }
 
   void ProcessQueuedCancellations() {
@@ -1255,7 +1190,6 @@ struct TextGenerationScheduler::Impl {
       if (request == nullptr) {
         return;
       }
-      PreemptReplyRefill();
       try {
         if (CompleteIfStopped(request)) {
           continue;
@@ -2015,13 +1949,6 @@ struct TextGenerationScheduler::Impl {
       Admit(prefilling, decoding, capturing, waiting, stop_token);
       if (device_lost.load(std::memory_order_acquire))
         break;
-      if (reply_refill && Clock::now() >= reply_refill->not_before &&
-          prefilling.empty() && decoding.empty() && capturing.empty() &&
-          waiting.empty()) {
-        progress.fetch_add(1, std::memory_order_relaxed);
-        StepReplyRefill(stop_token);
-        continue;
-      }
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
@@ -2034,15 +1961,11 @@ struct TextGenerationScheduler::Impl {
           // no clock checks or device polling are added to active work units.
           while (!wake()) {
             loop_working.store(false, std::memory_order_relaxed);
-            const bool woken =
-                reply_refill
-                    ? queue_condition.wait_until(lock, reply_refill->not_before,
-                                                 wake)
-                    : queue_condition.wait_for(
-                          lock, scheduler_policy.device_probe_interval, wake);
+            const bool woken = queue_condition.wait_for(
+                lock, scheduler_policy.device_probe_interval, wake);
             progress.fetch_add(1, std::memory_order_relaxed);
             loop_working.store(true, std::memory_order_relaxed);
-            if (woken || reply_refill)
+            if (woken)
               break;
             lock.unlock();
             try {
@@ -2158,26 +2081,11 @@ struct TextGenerationScheduler::Impl {
         }
       }
     }
-    PreemptReplyRefill();
     for (auto& request : capturing)
       decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding, waiting);
   }
 
-  /// A client that answers within this time finds the session free: the
-  /// refill and that request would otherwise pay for two short launches.
-  static constexpr std::chrono::milliseconds kReplyRefillDelay{100};
-
-  struct ReplyRefill {
-    std::vector<TextRunnerToken> tokens;
-    std::shared_ptr<const TextPromptContext> context;
-    std::size_t cached_tokens{0};
-    Clock::time_point not_before{};
-    TextRunnerPool::Request request{};
-  };
-
-  std::optional<ReplyRefill> reply_refill;
-  bool idle_reply_refill{false};
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
