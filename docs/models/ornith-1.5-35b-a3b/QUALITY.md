@@ -631,3 +631,12 @@ agent work is what `scripts/workflow_eval.py` reports, not this row.
 the installed Pi 1.3.0 passed all 8 cases, one pass, on the production default. Its
 prompts are French: it covers the tool loop, not the English product workflow.
 
+## English coding evaluation
+
+`ornith-workflow-v1`, rules frozen before scoring: ten tasks driven by Pi 1.3.0,
+five seeds, Gufo `2f4e1d0` against llama.cpp b11580 ROCm, each task scored by
+real tests or an exact check. Gufo 50/50, llama.cpp 48/50; both failures are
+`write_tests`, where its tests missed the planted fault. Tool calls 299 and 313,
+tool errors 35 and 36. Optional `read` arguments 4 of 92 and 5 of 104, so the
+`auto-tools` near-tie does not appear as different behavior in this work.
+Capability is accepted. Five seeds cannot separate 5/5 from 3/5 on one task.

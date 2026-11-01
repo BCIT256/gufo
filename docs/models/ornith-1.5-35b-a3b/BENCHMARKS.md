@@ -943,3 +943,27 @@ Risk: on the upstream suites lookup added 446 proposals and 102 accepted drafts
 (3,019/1,889 against 2,573/1,787), and `cache-messages-loop` took 322 s against
 308 s in one run each. Rejected copies cost verification rows; this was not
 measured on its own.
+
+## English coding evaluation
+
+2026-11-01, gfx1151, AC power, `ornith-workflow-v1`: 100 Pi 1.3.0 sessions,
+production `2f4e1d0` against llama.cpp b11580 ROCm with `offloaded 42/42`, order
+alternating by seed, server restarted per seed and engine. Over all requests:
+
+| | Gufo | llama.cpp |
+| --- | ---: | ---: |
+| Sum of per-task median wall | 253.2 s | 255.5 s |
+| Total wall | 1,316.0 s | 1,315.8 s |
+| First token, median | 512 ms | 293 ms |
+| First token, sum | 205.1 s | 135.2 s |
+| Stream rate | 42.0 tok/s | 40.7 tok/s |
+| Prompt tokens re-read | 122,350 | 67,138 |
+| Follow-ups resuming through the reply | 25 of 241 | 230 of 243 |
+| New-session tokens re-read | 51,420 | 30,075 |
+
+The latency rule is accepted, but this is a tie. The re-read tokens are the
+known reply re-prefill: decode state is never published, and the idle refill
+starts 100 ms after a response. Pi's next request arrives a median of 10 ms
+later (p90 80 ms, 474 gaps from session timestamps), so the refill rarely runs.
+Whole-file edit rates from lookup do not carry over to this mix, where output
+is mostly reasoning and short tool calls.
