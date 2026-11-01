@@ -606,6 +606,27 @@ retry costs one 17-token prefill (220 ms). `run.py` reads a missing `--speculati
 as autoregressive and fails on the drafts it then sees, so MTP runs must pass the
 flag. The suites are not changed.
 
+`auto-tools` fails on `auto_chat_thinking_high`: told to omit `optional`, the model
+reasons that it will, then sends `{"value":"alpha","optional":1}`. The suite requires
+exactly `{"value":"alpha"}`. Greedy gives this with and without drafting. Sampled at
+temperature 0.7, top_p 0.85, top_k 20, 150 seeds, same scorer, with the suite's tool
+definition / llama.cpp's rendering of it (no `strict`, empty `description`), Gufo
+omits it 27 / 4 times autoregressive and 33 / 1 by default; llama.cpp `b11580` on
+ROCm omits it 81 of 150 on both, since it renders them identically. Raw `/completion`
+on one prompt, no tools or grammar, min_p 0: 5 of 150 against 57 of 150. Forced to
+the decision point: 0 of 100 against 33 of 100.
+
+The difference is one near-tie, between `<` (`<parameter=optional>`) and `</`
+(`</function>`). logit(`<`) minus logit(`</`) at that row: llama.cpp ROCm 0.40 (its
+`n_probs`), scalar reference about 0.9 (solved from its KL against the batch capture,
+two tokens only), Gufo 2.1 ± 0.7 (temperature-2 samples, 300), llama.cpp CPU sequential
+2.48, CPU batch 4.41. Every one prefers `<`, and llama.cpp's own builds span more than
+Gufo's distance from them. `ornith15.gpu_decode` passes on this capture (mean ratio
+1.01, largest position ratio 1.89), so this is not a defect under the acceptance gate.
+The scalar reference fails its stricter check here on this row (KL 0.29). No engine
+change. It is one prompt: whether Gufo adds optional arguments more often in real
+agent work is what `scripts/workflow_eval.py` reports, not this row.
+
 `tests/functional/pi_agent.py` pins Pi 0.87.0. A local copy with the pin moved to
 the installed Pi 1.3.0 passed all 8 cases, one pass, on the production default. Its
 prompts are French: it covers the tool loop, not the English product workflow.
