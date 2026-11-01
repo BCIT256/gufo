@@ -1365,8 +1365,9 @@ TextRunnerPool::Request::PreviewFirstToken() {
       impl_->pending_selection || impl_->stopped)
     return std::nullopt;
   auto sampler = impl_->sampler;
-  return impl_->runner->PreviewFirstToken(
-      dynamic_cast<TextRunnerState&>(impl_->lease.state()), sampler);
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  impl_->runner->BeginDecode(state, impl_->prompt);
+  return impl_->runner->PreviewFirstToken(state, sampler);
 }
 
 TextRunnerPool::Request::~Request() = default;

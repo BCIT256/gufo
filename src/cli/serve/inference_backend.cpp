@@ -42,6 +42,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/speculative/prompt_lookup.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
@@ -2979,6 +2980,8 @@ public:
     // The length controller is not in the snapshot. A reused session must
     // not keep another request's draft beliefs.
     draft_policy_.Reset();
+    lookup_.Clear();
+    history_.clear();
     std::string error;
     reset_failed_ = !session_->Reset(&error);
   }
@@ -3032,6 +3035,9 @@ public:
   [[nodiscard]] models::ornith15::MtpLengthController& draft_policy() {
     return draft_policy_;
   }
+  [[nodiscard]] speculative::PromptLookup<>& lookup() { return lookup_; }
+  /// Committed tokens of the running request: its prompt, then its output.
+  [[nodiscard]] std::vector<std::int32_t>& history() { return history_; }
 
 private:
   std::unique_ptr<models::ornith15::rocm::Session> session_;
@@ -3046,6 +3052,8 @@ private:
   std::vector<float> verify_rows_;
   std::vector<std::pair<float, std::uint32_t>> rank_;
   models::ornith15::MtpLengthController draft_policy_;
+  speculative::PromptLookup<> lookup_;
+  std::vector<std::int32_t> history_;
 };
 
 Ornith15TextRunnerState& RequireOrnithState(TextRunnerState& state) {
@@ -3525,6 +3533,17 @@ public:
     ornith.set_have_logits(true);
   }
 
+  // Copies come from this request's own prompt and output, so they are the
+  // same on a cold prompt and on any cache path.
+  void BeginDecode(TextRunnerState& state,
+                   std::span<const TextRunnerToken> prompt) const override {
+    if (!use_mtp_)
+      return;
+    auto& ornith = RequireOrnithState(state);
+    ornith.lookup().Clear();
+    ornith.history() = OrnithEngineTokens(prompt, tokenizer_->GetVocabSize());
+  }
+
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     // Autoregressive serving does not preview. MTP publishes the anchor
@@ -3767,6 +3786,57 @@ public:
         ornith.draft_policy().Choose(static_cast<std::uint32_t>(cap));
     std::string error;
     const auto base = ornith.session().Position();
+    const bool sampled = working.config().uses_random_sampling();
+    std::vector<std::int32_t> chain;
+    chain.reserve(cap + 1);
+    chain.push_back(anchor);
+    std::vector<qfn::MtpProposal> proposals;
+    proposals.reserve(cap);
+    using Lookup = speculative::PromptLookup<>;
+    auto& lookup = ornith.lookup();
+    auto& history = ornith.history();
+    const bool may_copy = lookup.Step(base) && history.size() == base;
+    if (may_copy)
+      lookup.Extend(history, sampled);
+    std::size_t copied = 0;
+    std::size_t copy_start = 0;
+    const auto append_copies = [&](std::size_t minimum, bool require_resume) {
+      if (!may_copy || chain.size() > cap || is_stop(chain.back()))
+        return false;
+      const auto match =
+          lookup.Find(history, chain,
+                      sampled ? Lookup::kSampledMinMatch : Lookup::kMinMatch,
+                      require_resume);
+      if (match.length == 0)
+        return false;
+      const auto available = std::min(cap + 1 - chain.size(),
+                                      lookup.IndexedTokens() - match.start);
+      if (available < minimum)
+        return false;
+      copy_start = match.start;
+      for (std::size_t i = 0; i < available; ++i) {
+        const auto token = history[match.start + i];
+        chain.push_back(token);
+        ++copied;
+        if (sampled) {
+          // A point mass: accepted with the target's p(token), and a
+          // rejection resamples from the target with the token removed.
+          qfn::MtpProposal proposal;
+          proposal.ids[0] = static_cast<sampling::TokenId>(token);
+          proposal.probabilities[0] = 1.0F;
+          proposal.size = 1;
+          proposal.token = proposal.ids[0];
+          proposal.probability = 1.0F;
+          proposals.push_back(proposal);
+        }
+        if (is_stop(token))
+          break;
+      }
+      return true;
+    };
+    // Sampled copies skip the head only on an established source. See
+    // speculative::PromptLookup<>.
+    const bool copy_only = append_copies(3, sampled);
     auto publish = [&](std::uint32_t count, bool stop, std::size_t drafted,
                        std::size_t accepted) {
       sampler.CopyDrawStateFrom(working);
@@ -3775,6 +3845,7 @@ public:
       }
       ornith.set_position(ornith.session().Position());
       ornith.set_have_logits(true);
+      history.insert(history.end(), chain.begin(), chain.begin() + count);
       TextDecodeStep step;
       step.selections.reserve(count);
       step.stop = stop;
@@ -3785,7 +3856,7 @@ public:
     };
     // A zero choice is one autoregressive token. DecodeStep would sample
     // the anchor again, so this calls the session directly.
-    if (drafts == 0) {
+    if (drafts == 0 && !copy_only) {
       if (!ornith.session().Step(anchor, ornith.logits(), &error)) {
         FailOrnithSession(ornith, "Ornith MTP decode failed: " + error);
       }
@@ -3803,26 +3874,24 @@ public:
            .piece = tokenizer_->DecodeTokenCopy(anchor_id)});
       return step;
     }
-    const bool sampled = working.config().uses_random_sampling();
     auto draft_rng = sampled ? sampling::NextRandom(working.mutable_rng_state())
                              : std::uint64_t{0};
     auto draft_sampler = working.WithoutConstraint();
     draft_sampler.Accept(anchor_id);
     working.Accept(anchor_id);
-    std::vector<std::int32_t> chain;
-    chain.reserve(static_cast<std::size_t>(drafts) + 1);
-    chain.push_back(anchor);
-    std::vector<qfn::MtpProposal> proposals;
-    proposals.reserve(drafts);
     auto& draft_row = ornith.draft_row();
     draft_row.resize(vocab);
-    for (std::uint32_t drafted = 0; drafted < drafts; ++drafted) {
+    std::uint32_t neural = 0;
+    while (!copy_only && neural < drafts) {
       if (!ornith.session().BeginDraft(chain.back(), &error) ||
           !ornith.session().FinishDraft(draft_row, &error)) {
         FailOrnithSession(ornith, "Ornith MTP draft failed: " + error);
       }
+      ++neural;
       if (!sampled) {
         chain.push_back(ArgmaxToken(draft_row));
+        if (append_copies(1, false))
+          break;
         continue;
       }
       auto& rank = ornith.rank();
@@ -3849,9 +3918,13 @@ public:
       proposals.push_back(
           qfn::SampleMtpProposal(candidates, draft_sampler, &draft_rng));
       chain.push_back(static_cast<std::int32_t>(proposals.back().token));
+      if (append_copies(1, false))
+        break;
     }
     auto& rows = ornith.verify_rows();
     rows.assign(chain.size() * vocab, 0.0F);
+    if (copy_only)
+      ornith.session().SaveMtpCarry();
     if (!ornith.session().VerifyForward(chain, rows, &error)) {
       FailOrnithSession(ornith, "Ornith MTP verify failed: " + error);
     }
@@ -3902,16 +3975,36 @@ public:
       FailOrnithSession(ornith, "Ornith MTP frontier logits failed: " + error);
     }
     // The last accepted token has no NextN row yet. Draft it from the hot
-    // chain hidden, then drop the chain so the next round starts cold.
-    if (keep == n && (!ornith.session().BeginDraft(chain.back(), &error) ||
-                      !ornith.session().FinishDraft(draft_row, &error))) {
+    // chain hidden, then drop the chain so the next round starts cold. Copied
+    // tokens had no draft at all and catch up from their trunk hiddens.
+    if (copied != 0) {
+      if (keep > neural && !ornith.session().CatchUpMtp(
+                               std::span<const std::int32_t>(chain).subspan(
+                                   neural, keep - neural),
+                               neural, &error)) {
+        FailOrnithSession(ornith, "Ornith MTP catch-up failed: " + error);
+      }
+    } else if (keep == n &&
+               (!ornith.session().BeginDraft(chain.back(), &error) ||
+                !ornith.session().FinishDraft(draft_row, &error))) {
       FailOrnithSession(ornith, "Ornith MTP draft failed: " + error);
     }
     ornith.session().RewindMtp(base + keep);
     if (correction)
       working.DeferSample(*correction);
-    ornith.draft_policy().Observe(static_cast<std::size_t>(keep - 1), drafts);
-    auto step = publish(keep, stop, drafts, static_cast<std::size_t>(keep - 1));
+    // A rejected copy says nothing about the head, and an accepted one
+    // extends a chain the controller should not read as short.
+    const std::uint32_t accepted = keep - 1;
+    const std::uint32_t neural_accepted = std::min(accepted, neural);
+    const std::uint32_t copies_accepted = accepted - neural_accepted;
+    if (copied != 0)
+      lookup.Observe(copy_start, copied, copies_accepted);
+    const bool neural_all = neural_accepted == neural;
+    ornith.draft_policy().Observe(neural_all ? accepted : neural_accepted,
+                                  neural_all ? accepted : neural);
+    auto step = publish(keep, stop, chain.size() - 1, accepted);
+    step.lookup_tokens = copied;
+    step.lookup_accepted_tokens = copies_accepted;
     for (std::uint32_t i = 0; i < keep; ++i) {
       const auto token = static_cast<sampling::TokenId>(chain[i]);
       step.selections.push_back({.stop = false,

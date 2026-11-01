@@ -1847,6 +1847,42 @@ void Session::RewindMtp(std::uint32_t position) noexcept {
   mtp_chain_ = false;
 }
 
+bool Session::CatchUpMtp(std::span<const std::int32_t> tokens,
+                         std::uint32_t first_row, std::string* error) {
+  const auto& c = model_->config();
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (!mtp_enabled_ || failed_ || n == 0 || first_row + n > kMaxVectorRows ||
+      mtp_position_ + n > max_context_) {
+    if (error != nullptr)
+      *error = "invalid MTP catch-up";
+    return false;
+  }
+  vector_rows_ = true;
+  try {
+    Check(hipMemcpyAsync(token_ids_, tokens.data(),
+                         std::size_t(n) * sizeof(std::int32_t),
+                         hipMemcpyHostToDevice, stream_),
+          "mtp catch-up tokens");
+    ShiftHidden(h_rows_, h_carry_saved_, h_in_, first_row + n, c.hidden_size,
+                stream_);
+    MtpRun(n, mtp_position_, h_in_ + std::size_t(first_row) * c.hidden_size,
+           false);
+    vector_rows_ = false;
+    Check(hipGetLastError(), "mtp catch-up launch");
+    Check(hipStreamSynchronize(stream_), "mtp catch-up");
+    mtp_position_ += n;
+    mtp_chain_ = false;
+    return true;
+  } catch (const std::exception& e) {
+    vector_rows_ = false;
+    (void)hipStreamSynchronize(stream_);
+    failed_ = true;
+    if (error != nullptr)
+      *error = e.what();
+    return false;
+  }
+}
+
 bool Session::StoreFrontierLogits(std::span<const float> logits,
                                   std::string* error) {
   if (model_ == nullptr || failed_ || stream_ == nullptr ||

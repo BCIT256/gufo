@@ -110,6 +110,7 @@ struct Event {
 };
 
 struct FakeControl {
+  std::vector<std::vector<TextRunnerToken>> decode_prompts;
   void Log(Event event) {
     const std::lock_guard<std::mutex> lock(mutex);
     events.push_back(event);
@@ -431,6 +432,12 @@ public:
         .token = *fake.frontier,
         .piece = std::to_string(*fake.frontier),
     };
+  }
+
+  void BeginDecode(TextRunnerState&,
+                   std::span<const TextRunnerToken> prompt) const override {
+    std::lock_guard<std::mutex> lock(control_->mutex);
+    control_->decode_prompts.emplace_back(prompt.begin(), prompt.end());
   }
 
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
@@ -918,6 +925,26 @@ bool WaitForPrefillAt(FakeControl& control, TextRunnerToken label,
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   return false;
+}
+
+void TestBeginDecodeSeesTheFullPromptOnACacheHit() {
+  auto control = std::make_shared<FakeControl>();
+  control->idle_reply_refill = true;
+  control->multi_token_decode = true;
+  auto scheduler = MakeScheduler(control, 1);
+  const std::vector<TextRunnerToken> prompt{7, 70};
+  const auto first = scheduler->Submit(prompt, 2, 0.0F).Wait();
+  Expect(WaitForPrefillAt(*control, 7, 2), "reply is refilled");
+  std::vector<TextRunnerToken> next = prompt;
+  next.insert(next.end(), first.tokens.begin(), first.tokens.end());
+  next.push_back(71);
+  const auto second = scheduler->Submit(next, 1, 0.0F).Wait();
+  Expect(second.cached_prompt_tokens == 4, "second request hits the cache");
+  std::lock_guard<std::mutex> lock(control->mutex);
+  Expect(control->decode_prompts.size() == 2 &&
+             control->decode_prompts[0] == prompt &&
+             control->decode_prompts[1] == next,
+         "each request's decode begins with its whole prompt");
 }
 
 void TestIdleReplyRefillCoversTheNextTurn() {
@@ -3149,6 +3176,7 @@ int main() {
       TestPrefillYieldsToEveryDueDecoder(multi_token, batched);
     }
   }
+  TestBeginDecodeSeesTheFullPromptOnACacheHit();
   TestIdleReplyRefillCoversTheNextTurn();
   TestArrivalPreemptsIdleReplyRefill();
   TestNonIncrementalRunnerFallsBackSafely();

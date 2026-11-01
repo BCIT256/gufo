@@ -198,6 +198,87 @@ int main() {
       }
     }
 
+    // Copied tokens have no draft, so CatchUpMtp writes their NextN K/V from
+    // the verified trunk hiddens. The next draft must be bit-identical to one
+    // built token by token, and the trunk must be untouched.
+    const auto reprefill = [&] {
+      Require(spec->Reset(&error), "reset: " + error);
+      Require(spec->SetCanonicalGrid(16), "grid after reset");
+      Require(spec->Prefill(prompt, spec_logits, &error),
+              "reprefill: " + error);
+    };
+    std::vector<float> draft_logits(vocab), serial_draft(vocab);
+    const auto check_catch_up = [&](const char* name, int keep) {
+      Require(spec->DraftToken(fed[keep], draft_logits, &error),
+              "draft after catch-up: " + error);
+      reprefill();
+      for (int i = 0; i < keep; ++i) {
+        Require(spec->DraftToken(fed[i], serial_draft, &error),
+                "serial draft: " + error);
+        Require(spec->VerifyDecode(fed[i], spec_logits, &error),
+                "serial verify: " + error);
+        spec->RewindMtp(spec->Position());
+      }
+      Require(spec->DraftToken(fed[keep], serial_draft, &error),
+              "serial frontier draft: " + error);
+      const float gap = MaxAbs(draft_logits.data(), serial_draft.data(), vocab);
+      std::cout << "catch_up_draft_max_abs=" << gap << " case=" << name << '\n';
+      Require(gap == 0.0F, "draft after catch-up differs");
+    };
+    constexpr int kCopies = 4;
+    const auto fed_span = std::span<const std::int32_t>(fed);
+    std::vector<float> verify_rows(static_cast<std::size_t>(kCopies) * vocab);
+    for (int pass = 0; pass < 2; ++pass) {
+      // All copies accepted.
+      reprefill();
+      const auto base = spec->Position();
+      spec->SaveMtpCarry();
+      Require(spec->VerifyForward(fed_span.first(kCopies), verify_rows, &error),
+              "copy verify: " + error);
+      Require(spec->CatchUpMtp(fed_span.first(kCopies), 0, &error),
+              "catch up: " + error);
+      spec->RewindMtp(base + kCopies);
+      Require(spec->VerifyDecode(fed[kCopies], spec_logits, &error),
+              "verify after catch-up: " + error);
+      const float trunk_gap = MaxAbs(
+          spec_logits.data(),
+          stepped.data() + static_cast<std::size_t>(kCopies) * vocab, vocab);
+      std::cout << "catch_up_trunk_max_abs=" << trunk_gap << '\n';
+      Require(trunk_gap == 0.0F, "catch-up changed the trunk");
+      reprefill();
+      spec->SaveMtpCarry();
+      Require(spec->VerifyForward(fed_span.first(kCopies), verify_rows, &error),
+              "copy verify: " + error);
+      Require(spec->CatchUpMtp(fed_span.first(kCopies), 0, &error),
+              "catch up: " + error);
+      spec->RewindMtp(base + kCopies);
+      check_catch_up("all", kCopies);
+
+      // A rejected copy rolls back first.
+      reprefill();
+      spec->SaveMtpCarry();
+      Require(spec->VerifyForward(fed_span.first(kCopies), verify_rows, &error),
+              "copy verify: " + error);
+      Require(spec->RollbackMtpBatch(2, &error), "rollback: " + error);
+      Require(spec->CatchUpMtp(fed_span.first(2), 0, &error),
+              "catch up: " + error);
+      spec->RewindMtp(base + 2);
+      check_catch_up("rejected", 2);
+
+      // One neural draft, then copies.
+      reprefill();
+      Require(spec->DraftToken(fed[0], serial_draft, &error),
+              "mixed draft: " + error);
+      Require(spec->VerifyForward(fed_span.first(kCopies), verify_rows, &error),
+              "mixed verify: " + error);
+      Require(spec->CatchUpMtp(fed_span.subspan(1, kCopies - 1), 1, &error),
+              "mixed catch up: " + error);
+      spec->RewindMtp(base + kCopies);
+      check_catch_up("mixed", kCopies);
+    }
+    Require(!spec->CatchUpMtp(fed_span.first(kCompare), 1, &error),
+            "catch-up past the verify rows must fail");
+
     Require(spec->Reset(&error) && plain->Reset(&error), "greedy reset");
     Require(spec->SetCanonicalGrid(16) && plain->SetCanonicalGrid(16),
             "greedy grid");

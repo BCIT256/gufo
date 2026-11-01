@@ -157,6 +157,13 @@ public:
   /// Drops speculative NextN positions above `position` and the draft chain.
   /// Trunk state is unchanged. `position` is the trunk length to keep.
   void RewindMtp(std::uint32_t position) noexcept;
+  /// Runs NextN over verified tokens no draft covered, at the draft position,
+  /// so the next draft sees complete K/V. `tokens` are rows `first_row` onward
+  /// of the verification batch just run; each pairs with the trunk hidden of
+  /// the row before it, and row 0 with the SaveMtpCarry() copy.
+  [[nodiscard]] bool CatchUpMtp(std::span<const std::int32_t> tokens,
+                                std::uint32_t first_row,
+                                std::string* error = nullptr);
   /// Replaces the device logit row a snapshot would store. The host buffer
   /// the caller sampled is separate.
   [[nodiscard]] bool StoreFrontierLogits(std::span<const float> logits,

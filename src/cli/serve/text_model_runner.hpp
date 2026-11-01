@@ -411,6 +411,10 @@ public:
     return true;
   }
 
+  /// Called once a request's prompt state is ready, before its first token,
+  /// on a cold prompt and on a cache hit alike.
+  virtual void BeginDecode(TextRunnerState&,
+                           std::span<const TextRunnerToken>) const {}
   /// Optional first-token preview without advancing model state. The caller
   /// supplies a copy of the sampler; normal decoding must reproduce the token.
   /// This lets serving publish a token before capturing its prompt snapshot.
