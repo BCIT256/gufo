@@ -593,9 +593,17 @@ mtp`: `cache-edits`, `tool-agent`, `tool-agent-loop`, `cache-messages-loop` and
 `long-context` pass on both. `tools` (`auto-tools`), `cache-growth`,
 `cache-shared-prefix`, `cache-compaction` and `cache-bridge` fail on both the same
 way. `cache-compaction` passes alone on both. After the other suites on one server
-its retry resumes at 27,525 of 27,542 tokens and fails its unchanged-retry check;
-this is not explained. `run.py` reads a missing `--speculative` as
-autoregressive and fails on the drafts it then sees, so MTP runs must pass the
+its retry resumes at 27,525 of 27,542 tokens and fails its unchanged-retry check.
+The cache is full (9.94 of 10.1 GB retained), so the retry copy is refused and the
+retry restores the stable boundary before the final user turn, as
+[KV-CACHE.md](../../KV-CACHE.md) specifies. That turn plus its assistant opening
+counts 17 tokens by `/messages/count_tokens`; this suite allows a fixed 16, where
+`tool_agent.py` and `tool_choice.py` measure the bound. `2f4e1d0` alone with
+`--cache-ram-bytes 1500000000` reproduces the failure with `--speculative mtp`.
+A local copy using the measured bound passes every check, cold controls included,
+with `--speculative mtp` and `off`. This is a suite bound, not lost state, and a
+retry costs one 17-token prefill (220 ms). `run.py` reads a missing `--speculative`
+as autoregressive and fails on the drafts it then sees, so MTP runs must pass the
 flag. The suites are not changed.
 
 `tests/functional/pi_agent.py` pins Pi 0.87.0. A local copy with the pin moved to
