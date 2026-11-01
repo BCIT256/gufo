@@ -283,7 +283,8 @@ kernels instead of the decode dots, so a prefill row has the same bits
 wherever the prompt is split. The server grid is width 1. Each call of up
 to 512 tokens is one launch. The server reuses a cached prompt at its
 exact boundary and stores only frontiers that prefill produced. Decode
-uses other kernels, so the next turn re-prefills the generated reply.
+uses other kernels, so the next turn re-prefills the generated reply. (Superseded:
+see [Reply reuse from decode state](#reply-reuse-from-decode-state).)
 With a RAM cache, `Session::PrefillThrough` freezes the boundary inside the
 launch. DeltaNet conv and recurrent state are checkpointed at the boundary
 token in the same kernel. Gated-attention K/V below the boundary is copied
