@@ -539,6 +539,9 @@ the same way with MTP: the reply is re-prefilled next turn.
 
 ## Idle reply refill
 
+Removed in `a1aa52ba`; see [Reply reuse from decode state](#reply-reuse-from-decode-state).
+The results below are the state at `6116b0d7`.
+
 The refill prefills the reply with the prefill kernels, so a later turn repeats
 a cold prefill. Decode state is never published. In the resend test, 8 requests
 on one conversation matched a cache-off run in text, tool name and arguments on
@@ -658,3 +661,27 @@ if all of these hold; otherwise it is reverted and the result recorded.
 4. `ornith-workflow-v1` with its harness unchanged: capability and latency
    accepted against llama.cpp, and Gufo's first-token sum at most 170 s (205.1 s
    before, 135.2 s on llama.cpp, so at least half the gap).
+
+Result: kept, at `88334a5c`. Every rule held.
+
+1. `ornith15` gates 13/13 on the oracle. Held-out `gpu_decode` passes with 18
+   new resume rows. Host PR suite 67/67.
+2. `ornith15-functional-v1` 10/10. Sampled 51 of 55; `write_merge` 27 of 33.
+3. `long-context` passes (no suite is named `continuation`; the first run named
+   it and ran nothing, so this one came after the evaluation). `cache-growth`
+   now passes. `tools` still fails `auto-tools` on the near-tie optional argument,
+   as it did before this change. `run.py` also marks these runs failed because
+   `disk-spacing` expects no drafts while the server now drafts by default.
+4. `ornith-workflow-v1`: capability accepted, 48 against 50; latency accepted,
+   247 against 257 s; first-token sum 169.8 s against the 170 s limit, a margin
+   of 0.2 s.
+
+Both Gufo failures are `resume_followup`, where the model wrote
+`self.assertRaises(ValueError, median, [])`. That test is valid, and the frozen
+scorer rejects it because it looks for the text `median([])`. The harness is
+unchanged and the failures stand in the score; correcting this needs a new suite
+id.
+
+Cached turns are no longer bit-identical to cold prompts. `a1aa52ba` then removed
+the unused idle refill: host PR 67/67, and on that binary `long-context` and the
+cancellation and disk suites pass.

@@ -967,3 +967,25 @@ starts 100 ms after a response. Pi's next request arrives a median of 10 ms
 later (p90 80 ms, 474 gaps from session timestamps), so the refill rarely runs.
 Whole-file edit rates from lookup do not carry over to this mix, where output
 is mostly reasoning and short tool calls.
+
+### With the reply's decode frontier published
+
+`88334a5c`, same harness, on AC, offload 42/42 in every llama.cpp server:
+
+| | `2f4e1d0` | `88334a5` | llama.cpp, same run |
+| --- | --- | --- | --- |
+| Passes of 50 | 50 | 48 | 50 |
+| Sum of per-task medians | 253.2 s | 247.3 s | 256.5 s |
+| Total time | 1,316.0 s | 1,285.0 s | 1,331.3 s |
+| First token, median | 512 ms | 350 ms | 285 ms |
+| First token, sum | 205.1 s | 169.8 s | 139.7 s |
+| Prompt tokens re-read | 122,350 | 91,151 | 66,558 |
+| Follow-ups resuming through the reply | 25 of 241 | 238 of 244 | 239 of 251 |
+| Stream, tok/s | 42.0 | 40.5 | 40.5 |
+
+Follow-up re-reads now match llama.cpp (39,761 against 36,488 tokens). The
+remaining re-read gap is new sessions, 51,390 against 30,070. Gufo still reaches
+the first token later; the rest of that gap is not yet explained. llama.cpp's own
+total moved 1.2% between these runs, so a 3.5% total lead on one run is suggestive,
+not settled. See [QUALITY.md](QUALITY.md#reply-reuse-from-decode-state) for the
+two scorer failures.

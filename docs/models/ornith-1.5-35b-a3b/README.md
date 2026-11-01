@@ -14,10 +14,11 @@ Q6_K and Q5_K products use a fixed order, and a one-token launch keeps the
 batched kernels instead of the decode dots. Each call of up to 4096 tokens is one
 launch. Routed prefill uses a 64-column MMQ tile when that chunk has at least
 1024 tokens and a 48-column tile below that; dense projections keep the
-default tile. The server reuses a cached prompt at its exact boundary, but stores
-only frontiers that prefill produced; decode steps use other kernels, so the
-next turn re-prefills the generated reply. Cached and cold greedy output are
-therefore identical. The direct session API leaves the grid off, so an
+default tile. The server reuses a cached prompt at its exact boundary and also
+publishes a finished reply's decode frontier, so the next turn resumes through
+the reply. Decode steps use other kernels, so such a turn is held to the
+distribution gate, not bit identity with a cold prompt. A cancelled request still
+returns to a prefill frontier. The direct session API leaves the grid off, so an
 explicit chunk size is unchanged. With a RAM cache, `Session::PrefillThrough`
 freezes the cache boundary into a staged image inside the same launch and the
 host copy runs in the background, so the boundary costs no second forward
@@ -34,9 +35,7 @@ Prompt lookup adds proposals copied from the request's own prompt and output
 checks them. `Session::CatchUpMtp` then writes NextN K/V for the copied tokens, bit-identical to
 drafting them one at a time. The index is rebuilt from each request's prompt, so
 it is not in the snapshot.
-After a reply, an idle server prefills it in bounded chunks, starting 100 ms
-after the response, so a later turn resumes past the reply on the frontier a
-cold prompt reaches. Any arrival preempts that work at the next chunk. An MTP snapshot is version
+An MTP snapshot is version
 2 and stores NextN K/V plus the trunk hidden carry. The draft chain is
 cold at a prefill frontier; it is not rebuilt from a side buffer. The
 draft-length controller resets at each request and is not in the
