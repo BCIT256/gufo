@@ -2,12 +2,12 @@
 #define GUFO_MODELS_ORNITH15_CHAT_TEMPLATE_HPP_
 
 #include <array>
+#include <gufo/ext/gguf_reader.hpp>
+#include <gufo/ext/reasoning.hpp>
 #include <string>
 #include <string_view>
 
-#include "src/core/gguf_reader.hpp"
-#include "src/core/reasoning.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 
 /// Ornith's chat policy on top of the shared Qwen ChatML formatter. The
 /// reference is Ornith's own chat_template.jinja (ornith-ai/Ornith-1.5-35B-A3B

@@ -20,7 +20,7 @@
 #endif
 
 namespace gufo::platform {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__)
 namespace detail {
 
 inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
@@ -65,6 +65,13 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
 /// asks the memory manager to prefetch the range into the standby list and
 /// then touches pages in parallel so failures surface before registration.
 inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  // Host-only population never runs in a device pass of a .hip translation
+  // unit; the device pass only needs this declaration to parse.
+  static_cast<void>(data);
+  static_cast<void>(bytes);
+  return;
+#else
   if (bytes == 0)
     return;
 #if defined(_WIN32)
@@ -132,6 +139,28 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
                             "cannot read mapped weights");
 #endif
   }
+#endif  // !__HIP_DEVICE_COMPILE__
+}
+
+/// Drop this process's resident pages of a read-only file mapping once its
+/// contents have been copied elsewhere (device upload done and synchronized).
+/// The mapping stays valid: a later read refaults the page from the file, so
+/// this is safe even if a host read remains. Never call it on a range that is
+/// hipHostRegister'ed, where the mapping is the GPU-visible weight memory.
+/// Best effort: failures are ignored, and it is a no-op on Windows.
+inline void ReleaseMappedPages(const void* data, std::size_t bytes) noexcept {
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(_WIN32)
+  const long page_size = ::sysconf(_SC_PAGESIZE);
+  if (!data || bytes == 0 || page_size <= 0)
+    return;
+  const auto address = reinterpret_cast<std::uintptr_t>(data);
+  const auto skip = address % static_cast<std::size_t>(page_size);
+  (void)::madvise(reinterpret_cast<void*>(address - skip), bytes + skip,
+                  MADV_DONTNEED);
+#else
+  static_cast<void>(data);
+  static_cast<void>(bytes);
+#endif
 }
 
 }  // namespace gufo::platform

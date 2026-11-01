@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "name": "ornith15",
+  "target": "gufo_ornith15",
+  "kind": "static",
+  "purpose": "Ornith-1.5-35B-A3B (qwen35moe) configuration, weight binding, chat policy, scalar reference and ROCm runtime.",
+  "consumers": [
+    "gufo_llm_cli",
+    "gufo_serving"
+  ]
+}

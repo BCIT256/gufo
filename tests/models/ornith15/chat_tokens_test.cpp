@@ -12,9 +12,9 @@
 #include <string>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/ornith15/chat_template.hpp"
-#include "src/models/qwen/control_tokens.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 #include "tests/models/ornith15/chat_goldens.hpp"
 
 namespace orn = gufo::models::ornith15;

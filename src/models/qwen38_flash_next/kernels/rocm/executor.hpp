@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/experimental/host_allocations.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -16,10 +18,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "src/core/hip/host_allocations.hpp"
-#include "src/core/session_mode.hpp"
-#include "src/models/qwen/hip/ops/token.hpp"
-#include "src/models/qwen/vision/device_input.hpp"
+#include "src/families/qwen/kernels/ops/token.hpp"
+#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -323,6 +323,8 @@ public:
   /// when only the draft state is needed.
   struct MtpOutput {
     std::int32_t* token{nullptr};
+    /// With `token`: the draft head's softmax probability of it.
+    float* confidence{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
     /// Prefill and headless steps need only persistent KV. A full forward with
@@ -507,9 +509,14 @@ private:
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8. With that
   /// mixer's F32 `inject_w`, the fused MoE combine also leaves its inject
-  /// partials in s_.inject (inject_fused_).
+  /// partials in s_.inject (inject_fused_). A decode combine whose `next`
+  /// mixer HcMix runs immediately after, with nothing reading res or xn in
+  /// between, is left to that mixer's single launch (FusedMixer).
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens,
-               const float* inject_w = nullptr) const;
+               const float* inject_w = nullptr,
+               const DeviceMixer* next = nullptr) const;
+  /// Whether HcMix runs a decode batch of `m` as one HcMixQ8Fused launch.
+  bool FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -541,6 +548,8 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
+  /// Orders the main stream after the work queued on side_stream_.
+  bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -595,7 +604,13 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  hipStream_t stream_{nullptr};
+  /// The stream kernels are queued on. Overlapped work swaps in side_stream_
+  /// for its launches and joins back through side_done_ (JoinSide).
+  mutable hipStream_t stream_{nullptr};
+  hipStream_t side_stream_{nullptr};
+  hipEvent_t side_start_{nullptr};
+  hipEvent_t side_done_{nullptr};
+  mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
@@ -763,12 +778,10 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
-  std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
-  mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};   ///< routed_tile_rows_ tiles
-  mutable std::uint32_t routed_64_tiles_{0};  ///< wide batches' down tiles
-  mutable std::uint32_t routed_pair_offset_{0};
-  mutable std::uint32_t routed_pair_tiles_{0};
+  std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
+  mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
+  mutable std::uint32_t routed_n_tiles_{0};     ///< routed_tile_rows_ tiles
+  mutable std::uint32_t routed_wide_tiles_{0};  ///< prefill 128-row tiles
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
@@ -813,6 +826,21 @@ private:
   };
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
+  /// A decode combine left to the next mixer's one-launch HcMixQ8Fused
+  /// (see Combine): HcCombineQ8_1's operands when Combine ran.
+  struct PendingCombine {
+    const DeviceMixer* mixer{nullptr};
+    float* res{nullptr};
+    const float* gamma{nullptr};
+    const float* block_out{nullptr};
+    const float* inject{nullptr};
+    std::uint32_t inject_parts{1};
+    float* xn{nullptr};
+    void* xn_q8{nullptr};
+    std::uint32_t n{0};
+  };
+  mutable PendingCombine pending_combine_;
+  void* hc_fused_state_{nullptr};  ///< HcMixQ8Fused's counters (zeroed)
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -3,10 +3,9 @@
 
 #include <array>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <optional>
 #include <string>
-
-#include "src/core/gguf_reader.hpp"
 
 namespace gufo::models::ornith15 {
 

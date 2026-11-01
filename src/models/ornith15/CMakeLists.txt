@@ -6,7 +6,7 @@ add_library(gufo_ornith15 STATIC
   weights.cpp)
 
 target_include_directories(gufo_ornith15 PUBLIC ${PROJECT_SOURCE_DIR})
-target_link_libraries(gufo_ornith15 PUBLIC gufo_core)
+target_link_libraries(gufo_ornith15 PUBLIC gufo_core gufo_qwen_text)
 
 # Scalar float32 oracle, built only by the validation targets that link it.
 add_library(gufo_ornith15_reference STATIC EXCLUDE_FROM_ALL

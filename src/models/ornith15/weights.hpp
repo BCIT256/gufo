@@ -3,12 +3,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
 #include "src/models/ornith15/config.hpp"
 
 namespace gufo::models::ornith15 {

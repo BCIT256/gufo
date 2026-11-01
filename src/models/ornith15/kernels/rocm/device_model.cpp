@@ -2,11 +2,11 @@
 
 #include <hip/hip_runtime.h>
 
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/weight_upload.hpp>
 #include <stdexcept>
 #include <utility>
 
-#include "src/core/hip/managed_alloc.hpp"
-#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace gufo::models::ornith15::rocm {

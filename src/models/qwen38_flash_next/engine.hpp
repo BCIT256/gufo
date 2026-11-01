@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/prompt_lookup.hpp>
+#include <gufo/ext/sampling.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -11,12 +14,9 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/sampling.hpp"
-#include "src/core/session_mode.hpp"
-#include "src/core/speculative/prompt_lookup.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
@@ -90,6 +90,10 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
+  /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
+  /// inject as Q8_0, so the draft block is not counted.
+  [[nodiscard]] std::size_t ExpandedQ8_0Tensors() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -161,6 +165,8 @@ public:
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::vector<sampling::TokenLogprobs> logprobs;
+    std::optional<sampling::TokenLogprobs> terminal_logprobs;
   };
   /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
   /// compact MTP proposals and uses target/draft rejection with a residual
@@ -313,6 +319,8 @@ private:
                      std::optional<std::uint32_t> batch_drafts = {},
                      std::uint32_t occupancy = 1);
   static void AppendDraft(PendingDecode& pending);
+  /// Whether the chain ends after its latest neural proposal.
+  static bool GateStops(const PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
                     std::size_t minimum = 1, bool require_resume = false);
@@ -324,6 +332,7 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   std::int32_t draft_token_{0};
+  float draft_confidence_{1.0F};  ///< the head's probability of draft_token_
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;

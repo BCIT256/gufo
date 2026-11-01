@@ -2,8 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
-
-#include "src/core/crypto/sha256.hpp"
+#include <gufo/ext/sha256.hpp>
 
 namespace gufo::models::ornith15 {
 

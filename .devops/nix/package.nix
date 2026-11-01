@@ -10,11 +10,16 @@
   libpng,
   libjpeg,
   libwebp,
+  libsndfile,
+  soxr,
   openssl,
   ffmpeg-headless,
+  ccache,
   rocmPackages,
   releaseVersion ? null,
+  extensionsFromLock ? false,
   revision,
+  sourceRoot ? ../..,
 }:
 
 let
@@ -22,12 +27,20 @@ let
   # compaction of ROCr's queue save areas and HIP's runtime-owned buffers from
   # suspending inference.
   rocmRuntime = rocmPackages.rocm-runtime.overrideAttrs (old: {
-    patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr.patch ];
+    patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr-rocm10.patch ];
   });
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
     if releaseVersion == null then "0-unstable-${revision}" else releaseVersion;
-  sourceRoot = ../..;
+  # The CI timing baseline builds an older revision with this definition.
+  # Revisions before model extensions have no extensions.lock, keep the eval
+  # fixture under the DeepSeek tests and report no extension selection.
+  hasExtensions = builtins.pathExists (sourceRoot + "/extensions.lock");
+  evalFixture =
+    if hasExtensions then
+      "tests/fixtures/eval/antirez-ds4.json"
+    else
+      "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
   productionSource = lib.cleanSourceWith {
     src = sourceRoot;
     filter =
@@ -38,20 +51,36 @@ let
         relativePath = lib.removePrefix "${root}/" pathString;
       in
       pathString == root
-      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" ]
+      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" "extensions.lock" ]
       || relativePath == "licenses"
       || lib.hasPrefix "licenses/" relativePath
       || relativePath == "cmake"
       || lib.hasPrefix "cmake/" relativePath
-      || relativePath == "src"
-      || lib.hasPrefix "src/" relativePath
-      || relativePath == "tests"
-      || relativePath == "tests/models"
-      || relativePath == "tests/models/deepseek_v4_flash"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures"
-      || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json";
+      || relativePath == "schemas"
+      || lib.hasPrefix "schemas/" relativePath
+      || relativePath == "include"
+      || lib.hasPrefix "include/" relativePath
+      || (
+        (relativePath == "src" || lib.hasPrefix "src/" relativePath)
+        && !(
+          lib.hasInfix "/tests/" "/${relativePath}"
+          || lib.hasSuffix "/tests" relativePath
+          || lib.hasInfix "/functional/" "/${relativePath}"
+          || lib.hasSuffix "/functional" relativePath
+          || lib.hasInfix "/tools/" "/${relativePath}"
+          || lib.hasSuffix "/tools" relativePath
+          || lib.hasInfix "/fixtures/" "/${relativePath}"
+          || lib.hasSuffix "/fixtures" relativePath
+        )
+      )
+      # `gufo eval` reads its default dataset at run time and that dataset is
+      # core-owned, so exactly one test-tree file is admitted: the core eval
+      # fixture. No model test file enters the production derivation.
+      || relativePath == evalFixture
+      || lib.hasPrefix "${relativePath}/" evalFixture;
   };
 in
+assert lib.versions.majorMinor rocmPackages.clr.version == "10.1";
 stdenv.mkDerivation {
   pname = "gufo";
   version = packageVersion;
@@ -71,6 +100,8 @@ stdenv.mkDerivation {
     libpng
     libjpeg
     libwebp
+    libsndfile
+    soxr
     openssl
     ffmpeg-headless
     rocmPackages.clr
@@ -85,12 +116,37 @@ stdenv.mkDerivation {
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
+    "-DGUFO_EXTENSIONS_FROM_LOCK=${if extensionsFromLock then "ON" else "OFF"}"
     "-DGUFO_RELEASE_VERSION=${versionLabel}"
     "-DGUFO_REVISION=${revision}"
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ];
+
+  # CI exposes a persistent /tmp/gufo-ccache through extra-sandbox-paths for
+  # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
+  # whose included headers ccache 4.13.6 does not record. A header-only change
+  # can then reuse a stale HIP object, including one from the timing baseline.
+  preConfigure = ''
+    ccache_dir=/tmp/gufo-ccache
+    if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
+      export CCACHE_DIR="$ccache_dir"
+      export CCACHE_COMPILERCHECK=content
+      export CCACHE_MAXSIZE=4G
+      export CCACHE_NOHASHDIR=true
+      export CCACHE_UMASK=000
+      cmakeFlagsArray+=(
+        "-DGUFO_CCACHE_PROGRAM=${ccache}/bin/ccache"
+      )
+      ${ccache}/bin/ccache --zero-stats
+    fi
+  '';
+  postBuild = ''
+    if [[ -n "''${CCACHE_DIR:-}" ]]; then
+      ${ccache}/bin/ccache --show-stats
+    fi
+  '';
 
   doInstallCheck = true;
   postFixup = ''
@@ -102,9 +158,13 @@ stdenv.mkDerivation {
   installCheckPhase = ''
     runHook preInstallCheck
 
-    test "$($out/bin/gufo --version)" = "gufo version ${versionLabel} (${revision})"
+    test "$($out/bin/gufo --version | head -n 1)" = "gufo version ${versionLabel} (${revision})"
+  '' + lib.optionalString hasExtensions ''
+    $out/bin/gufo --version | grep -Fx "Extension selection: ${if extensionsFromLock then "lock" else "discovery"}"
+    $out/bin/gufo diagnose --section extensions --json > extensions.json
+  '' + ''
     $out/bin/gufo --help >/dev/null
-    test "$($out/bin/gufo-server --version)" = "gufo version ${versionLabel} (${revision})"
+    test "$($out/bin/gufo-server --version | head -n 1)" = "gufo version ${versionLabel} (${revision})"
     $out/bin/gufo-server --help >/dev/null
     test ! -e $out/bin/gufo-kernel-bench
     test ! -e $out/bin/ornith15_bench
@@ -115,7 +175,7 @@ stdenv.mkDerivation {
   '';
 
   passthru = {
-    inherit releaseVersion revision rocmPackages rocmRuntime;
+    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock;
     toolchain = {
       targetPlatform = "x86_64-linux";
       targetGpu = "gfx1151";

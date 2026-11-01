@@ -4,12 +4,12 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-#include "src/core/hip/managed_alloc.hpp"
 #include "src/models/ornith15/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
@@ -501,7 +501,7 @@ void Session::LinearAttention(const DeviceLayer& l, std::size_t layer,
       kn_, raw_, state.recurrent, gdn_out_, nullptr, state_snaps, conv_snaps, n,
       c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
       false, false, c.rms_eps, stream_, nullptr, checkpoint, 0, nullptr,
-      fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
+      nullptr, fn::GdnGate::kSilu, fn::GdnL2Norm::kClampEps);
   Project(l.ssm_out, gdn_out_, block_out_, n);
 }
 

@@ -8,7 +8,7 @@
 #include <random>
 #include <stdexcept>
 
-#include "src/models/qwen/control_tokens.hpp"
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 #include "src/models/qwen_image_21/tokenizer.hpp"
 
@@ -525,8 +525,10 @@ Matrix Denoise(Runtime& rt, DiffusionContext& context, const Matrix& latent,
         "dit." + std::to_string(step) + ".block." + std::to_string(layer), x);
   }
   const auto scale = rt.Linear(activated, "transformer.norm_out.linear");
+  rt.Observe(observer, "dit." + std::to_string(step) + ".output_scale", scale);
   x = rt.NormalizeModulate(x.Slice(prefix, latent.rows),
                            rt.ModulationFactors(scale, false), 0, 0);
+  rt.Observe(observer, "dit." + std::to_string(step) + ".output_norm", x);
   x = rt.Linear(x, "transformer.proj_out");
   rt.Observe(observer, "dit." + std::to_string(step) + ".output", x);
   return x;

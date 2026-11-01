@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/experimental/hip_utils.hpp>
+#include <gufo/ext/experimental/snapshot_transfer.hpp>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -12,13 +14,12 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/hip/hip_utils.hpp"
-#include "src/core/hip/snapshot_transfer.hpp"
+#include "src/families/qwen/kernels/dflash_kernels.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
+#include "src/families/qwen/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
-#include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -407,6 +408,9 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
     // matrix-core W8A8 route once the shared kernel read activations as float4
     // (11.3 vs 12.2 ms per draft block), so there is one route here.
     if (batch_size <= kDFlashMaxSharedBatch) {
+      if (TryLaunchVerifyGemm27(weight.type, weight.data, input, output,
+                                batch_size, output_size, input_size, stream_))
+        return;
       LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                  batch_size, output_size, input_size, stream_);
       return;
@@ -471,7 +475,9 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
       LaunchExactBf16GEMMFp32SmallBatch(weight.data, chunk_input, chunk_output,
                                         chunk, output_size, input_size,
                                         stream_);
-    } else {
+    } else if (!TryLaunchVerifyGemm27(weight.type, weight.data, chunk_input,
+                                      chunk_output, chunk, output_size,
+                                      input_size, stream_)) {
       LaunchBatchedQuantGEMMFp32(weight.type, weight.data, chunk_input,
                                  chunk_output, chunk, output_size, input_size,
                                  stream_);

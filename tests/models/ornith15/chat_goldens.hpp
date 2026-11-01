@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "src/core/json.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "tests/models/chat_template_golden_helpers.hpp"
 
 /// Reads tests/fixtures/ornith15_chat_goldens.json, written by

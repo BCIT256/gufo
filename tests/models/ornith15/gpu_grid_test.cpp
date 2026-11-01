@@ -24,10 +24,10 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/reasoning.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/ornith15/chat_template.hpp"
 #include "src/models/ornith15/kernels/rocm/executor.hpp"
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 namespace orn = gufo::models::ornith15;
 namespace fs = std::filesystem;
