@@ -686,3 +686,15 @@ id.
 Cached turns are no longer bit-identical to cold prompts. `a1aa52ba` then removed
 the unused idle refill: host PR 67/67, and on that binary `long-context` and the
 cancellation and disk suites pass.
+
+## Split decode attention
+
+Decode dots split each row's key tiles over eight blocks and merge the partial
+rows, so a decode row's rounding differs from the unsplit kernel at the same
+precision. Heads per block do not change bits at a given split count, and prefill
+stays unsplit and bit-identical. Rules fixed before scoring: `ornith-workflow-v1`
+capability and latency accepted, sampled functional-v1 at least 49 of 55,
+`write_merge` at least 25 of 33. Results: accepted at 50/50 and 50/50, 55/55, 29/33.
+Gates 35/35, held-out `gpu_decode` passes: worst mean ratio 1.39 (1.40 before, limit
+2), worst position KL 5.6 (5.58 before, limit 15.1). Host PR 101/101, functional-v1
+10/10. MTP rows stay bit-identical to a decode step (`ornith15.gpu_mtp`).

@@ -989,3 +989,29 @@ the first token later; the rest of that gap is not yet explained. llama.cpp's ow
 total moved 1.2% between these runs, so a 3.5% total lead on one run is suggestive,
 not settled. See [QUALITY.md](QUALITY.md#reply-reuse-from-decode-state) for the
 two scorer failures.
+
+## Context depth and split decode attention
+
+2026-11-01, gfx1151, ROCm 10.1.0, AC power, production builds interleaved with
+llama.cpp b11580 (`offloaded 42/42`): context 32768, tools and thinking on,
+temperature 0.6, 256 new tokens, two cycles with order reversed, client stream
+rate over three repeats. Fixed is `67d9bf8` plus eight splits and four heads per
+block on the decode dots, and eight heads per block from 512 prefill rows.
+
+| Prompt tokens | Fixed MTP | Old MTP | llama.cpp MTP | Fixed AR | llama.cpp AR |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,013 | 48.9, 50.3 | 51.1, 47.7 | 39.1, 38.3 | 40.8, 40.8 | 38.5, 38.4 |
+| 7,956 | 45.3, 44.9 | 40.5, 41.3 | 37.4, 36.9 | 39.7, 39.7 | 37.5, 37.6 |
+| 15,960 | 42.7, 42.7 | 34.9, 34.4 | 38.2, 37.3 | 38.5, 38.3 | 36.5, 36.5 |
+| 30,117 | 42.5, 42.1 | 30.4, 30.4 | 34.3, 34.1 | 36.1, 36.2 | 34.6, 34.7 |
+
+Before the fix, AR at 30,117 tokens was 23.6 and 23.5 tok/s. Cold first token at
+30,117 tokens: fixed 65.9 s, old 71.1 s, llama.cpp 41.7 s. Repeat: 68, 68 and
+167 ms. `ornith15_attn_depth_bench`, synthetic caches, ten layers, one row, median
+ms at 30,000 tokens: 18.0 with two heads per block, 22.5 with four, 39.4 with
+eight, all unsplit; 3.6 with four heads and eight splits.
+
+`ornith-workflow-v1`, same build: Gufo 50/50, 223.4 s sum of medians, 1,175.6 s
+total, 44.5 tok/s, first token median 320 ms; llama.cpp 50/50, 235.9 s, 1,244.5 s,
+41.7 tok/s, 293 ms. Paired mean 1.38 s faster, bootstrap 95% range 4.67 s faster
+to 2.48 s slower, so inside noise. Its largest prompt is about 10,000 tokens.
