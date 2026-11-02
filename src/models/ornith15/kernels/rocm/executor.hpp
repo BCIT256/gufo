@@ -52,6 +52,9 @@ public:
   static constexpr std::uint32_t kMaxPrefillChunk = 4096;
   /// Widest verification batch that runs on the decode dots.
   static constexpr std::uint32_t kMaxVectorRows = 8;
+  static constexpr std::uint32_t kAttnSplits = 8;
+  /// From this many rows, eight query heads per block share K/V loads.
+  static constexpr std::uint32_t kWideAttentionRows = 512;
 
   ~Session();
   Session(const Session&) = delete;
@@ -341,7 +344,7 @@ private:
       *beta_{nullptr}, *conv_{nullptr}, *qn_{nullptr}, *kn_{nullptr},
       *raw_{nullptr}, *gdn_out_{nullptr};
   float *qg_{nullptr}, *q_{nullptr}, *gate_{nullptr}, *k_{nullptr},
-      *v_{nullptr}, *ctx_{nullptr};
+      *v_{nullptr}, *ctx_{nullptr}, *attn_partials_{nullptr};
   float *router_{nullptr}, *route_weights_{nullptr}, *expert_gate_{nullptr},
       *expert_up_{nullptr}, *expert_down_{nullptr}, *shared_gate_{nullptr},
       *shared_up_{nullptr}, *shared_out_{nullptr}, *shared_inp_{nullptr};

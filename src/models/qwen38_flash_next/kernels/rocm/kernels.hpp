@@ -542,6 +542,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
 /// Rows seeing at most `dense_extent` keys ignore the mask and sweep densely,
 /// as they do without one; pass the token budget so a row's arithmetic does
 /// not depend on whether its batch crosses the budget.
+/// `heads_per_block` of 2, 4 or 8 overrides how many query heads share a
+/// block's K/V loads; 0 picks 2 for one or two rows and 4 for wider calls.
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
@@ -549,7 +551,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists = nullptr,
                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
-               std::uint32_t dense_extent = 0);
+               std::uint32_t dense_extent = 0,
+               std::uint32_t heads_per_block = 0);
 
 /// Maximum visible sparse context for this WMMA geometry, or zero when the
 /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.

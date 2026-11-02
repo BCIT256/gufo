@@ -241,6 +241,8 @@ std::unique_ptr<Session> Session::Create(const DeviceModel& model,
     s->k_ = s->Floats(std::size_t(n) * c.AttentionKvDim());
     s->v_ = s->Floats(std::size_t(n) * c.AttentionKvDim());
     s->ctx_ = s->Floats(std::size_t(n) * c.AttentionQDim());
+    s->attn_partials_ = s->Floats(std::size_t(kMaxVectorRows) * c.num_heads *
+                                  kAttnSplits * (c.head_dim + 2));
     s->router_ = s->Floats(std::size_t(n) * c.num_experts);
     s->route_weights_ = s->Floats(std::size_t(n) * used);
     s->ids_ = static_cast<std::int32_t*>(
@@ -522,9 +524,16 @@ void Session::Attention(const DeviceLayer& l, State& state, std::uint32_t n) {
            c.rope_theta, stream_);
   fn::StoreKv(k_, state.k, n, c.AttentionKvDim(), device_pos_, stream_);
   fn::StoreKv(v_, state.v, n, c.AttentionKvDim(), device_pos_, stream_);
-  fn::Attention(q_, state.k, state.v, nullptr, 0, ctx_, nullptr, 1, n,
+  // Decode dots split each row's key tiles over kAttnSplits blocks so a step
+  // at depth fills the device, with four heads per block sharing K/V loads.
+  // Prefill keeps one pass per row; its wide calls have blocks to spare, so
+  // only the heads-per-block grouping changes and its bits do not.
+  const bool split = DecodeDots(n);
+  fn::Attention(q_, state.k, state.v, nullptr, 0, ctx_,
+                split ? attn_partials_ : nullptr, split ? kAttnSplits : 1, n,
                 device_pos_, c.num_heads, c.num_kv_heads, c.head_dim, 1,
-                stream_);
+                stream_, nullptr, nullptr, 0, 0,
+                split ? 4 : (n >= kWideAttentionRows ? 8 : 0));
   fn::SigmoidMul(ctx_, gate_, std::size_t(n) * c.AttentionQDim(), stream_);
   if (DecodeDots(n)) {
     // Keep this input in F32: quantizing both V and the gated context can

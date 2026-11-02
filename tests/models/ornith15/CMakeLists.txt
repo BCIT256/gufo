@@ -46,4 +46,9 @@ if (ENGINE_ENABLE_HIP)
   add_ornith15_test(gpu_mtp "gpu;hip;gfx1151;external-model"
     gufo_ornith15_gpu)
   set_tests_properties(ornith15.gpu_mtp PROPERTIES TIMEOUT 3600)
+
+  add_executable(ornith15_attn_depth_bench EXCLUDE_FROM_ALL
+    attn_depth_bench.cpp)
+  target_link_libraries(ornith15_attn_depth_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
 endif()

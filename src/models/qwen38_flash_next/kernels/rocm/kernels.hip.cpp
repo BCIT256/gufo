@@ -8788,7 +8788,8 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
-               std::uint32_t list_capacity, std::uint32_t dense_extent) {
+               std::uint32_t list_capacity, std::uint32_t dense_extent,
+               std::uint32_t heads_per_block) {
   if (d != 256) {
     return;  // the kernel is written for the model's 256-wide heads
   }
@@ -8818,7 +8819,14 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                        partials, start_pos, heads, kv_heads, d, ratio, lists,
                        counts, list_capacity, dense_extent);
   };
-  if (n_tokens <= 2) {
+  if (heads_per_block == 8) {
+    if ((heads / kv_heads) % 8 != 0) {
+      return;
+    }
+    launch(AttentionKernel<8>, 8);
+  } else if (heads_per_block == 4) {
+    launch(AttentionKernel<4>, 4);
+  } else if (heads_per_block == 2 || n_tokens <= 2) {
     launch(AttentionKernel<2>, 2);
   } else {
     launch(AttentionKernel<4>, 4);
