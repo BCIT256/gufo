@@ -698,3 +698,43 @@ capability and latency accepted, sampled functional-v1 at least 49 of 55,
 Gates 35/35, held-out `gpu_decode` passes: worst mean ratio 1.39 (1.40 before, limit
 2), worst position KL 5.6 (5.58 before, limit 15.1). Host PR 101/101, functional-v1
 10/10. MTP rows stay bit-identical to a decode step (`ornith15.gpu_mtp`).
+
+## Trailing draft without the output head
+
+After a round whose drafts are all accepted, `Session::AdvanceDraft` writes the
+NextN row for the last accepted token without running the output head or
+downloading logits, and leaves the draft chain cold (`0c4af212`). The row and all
+later state are meant to be bit-identical to a full draft step.
+
+1. `ornith15.gpu_mtp` runs the same round both ways: the next round's draft
+   logits differ by 0 and the session snapshot payloads are identical. Passing
+   the wrong token fails the check (max abs 0.189, snapshot differs).
+2. Greedy served output and draft counts are identical to `5a8fc19` on every
+   request of the timing runs.
+3. Seeded sampling, rule fixed before running: the five `ornith15-functional-v1`
+   tasks at the frozen seed and seeds 1000 to 1009, plus `write_merge` to seed
+   1031, at card sampling on default serving. All 77 jobs gave identical content,
+   reasoning, tool calls, finish reasons, token counts and draft counts on both
+   builds (22,043 of 26,662 drafts accepted). Scores are 55/55 and `write_merge`
+   29/33 on each.
+4. Gates: `ornith15` GPU suites 13/13 on the oracle (edited tree, before the
+   commit); held-out `gpu_decode` and `gpu_mtp` 2/2 at `0c4af212` with no skips;
+   host PR 101/101; format 853 files.
+5. `long-context`, `cache` and `cache-growth` at tier `pr`, two runs per build:
+   all 12 cases pass with no output or coverage changes between builds.
+
+`run.py` marks all four of those runs failed, on `5a8fc19` as well. Besides the
+known draft expectation in the `disk-spacing` measurement check, the spacing
+check now reports checkpoints closer than 2,048 tokens. The spacing conversation
+writes 2,447 and 6,278 and skips its short turns, as before the 0.28.1 merge. The
+third checkpoint, at 2,828 tokens, belongs to the `cache-persist` case that the
+merge added after it in the same server. Ornith's cache does not report
+checkpoint ids, so the check attributes log lines by token count and counts it.
+This is a harness attribution gap, not a spacing fault.
+
+Because the functional status is failed, the runner issued no timing
+qualification. An advisory comparison with `run.compare` at the runner's 5% and
+10 ms margins is inconclusive: of 1,459 measurements, 17 and 68 exceeded the
+margin in the two build pairs and 8 and 39 in the same-build controls, and no
+flagged request repeated between the build pairs. The second candidate run was 5
+to 12% slower in prefill than the first, a path this change does not touch.

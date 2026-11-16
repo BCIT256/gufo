@@ -1015,3 +1015,35 @@ eight, all unsplit; 3.6 with four heads and eight splits.
 total, 44.5 tok/s, first token median 320 ms; llama.cpp 50/50, 235.9 s, 1,244.5 s,
 41.7 tok/s, 293 ms. Paired mean 1.38 s faster, bootstrap 95% range 4.67 s faster
 to 2.48 s slower, so inside noise. Its largest prompt is about 10,000 tokens.
+
+## Trailing draft without the output head
+
+2026-11-15, gfx1151, ROCm 10.1.0, AC power, `balanced` platform profile logged at
+start and end. Production builds `5a8fc19` and `0c4af212`, both servers resident,
+requests alternated in ABBA order over four cycles: greedy, thinking off, prefix
+cache off, 256 new tokens, default drafting and prompt lookup. Text and draft
+counts were identical on every request. Median tok/s; change is the median of
+per-cycle ratios.
+
+| Prompt | Prompt tokens | Drafts accepted | `5a8fc19` | `0c4af212` | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Code | 262 | 117 of 154 | 48.26 | 50.38 | +4.9% |
+| Code | 2,052 | 120 of 145 | 49.17 | 51.54 | +4.8% |
+| Write a module | 49 | 119 of 158 | 48.41 | 50.58 | +4.4% |
+| Prose | 44 | 33 of 70 | 39.17 | 39.72 | +1.4% |
+
+The candidate was faster on 4 of 4 cycles for every prompt. First token is
+unchanged (414.0 and 412.4 ms at 262 tokens, 2,044 and 2,043 ms at 2,052).
+
+Two earlier pairs of launches on 2026-11-14 timed the same source before it was
+committed, without recording the platform profile. Baseline started first, six
+cycles: +2.1%, +2.8%, +2.0% and -0.8% in the table's order. Candidate started
+first, four cycles: +4.3% writing a module and +1.2% on prose. A baseline against
+a second process of the same binary differed by 0.1 and 0.3%. Across the three
+pairs the code prompts gain 2.0 to 4.9% and prose ranges from -0.8 to +1.4%, so
+two launches of the same pair differ by about 2 points and the size of the gain
+is not known more closely than that range.
+
+`tools/ornith15/bench.cpp` and `kMtpRelativeCost` still describe a round as one
+verification plus its drafts and leave out the trailing step. The bench has not
+been rerun on ROCm 10.1.
