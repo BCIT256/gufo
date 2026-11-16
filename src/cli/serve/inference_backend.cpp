@@ -3668,8 +3668,7 @@ public:
         FailOrnithSession(ornith, "Ornith MTP catch-up failed: " + error);
       }
     } else if (keep == n &&
-               (!ornith.session().BeginDraft(chain.back(), &error) ||
-                !ornith.session().FinishDraft(draft_row, &error))) {
+               !ornith.session().AdvanceDraft(chain.back(), &error)) {
       FailOrnithSession(ornith, "Ornith MTP draft failed: " + error);
     }
     ornith.session().RewindMtp(base + keep);

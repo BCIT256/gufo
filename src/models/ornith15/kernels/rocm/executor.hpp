@@ -135,6 +135,11 @@ public:
                                 std::string* error = nullptr);
   [[nodiscard]] bool FinishDraft(std::span<float> logits,
                                  std::string* error = nullptr);
+  /// Writes the NextN row for `token` and leaves the chain cold. No output
+  /// head and no download: for a round's last accepted token, whose draft
+  /// nobody reads.
+  [[nodiscard]] bool AdvanceDraft(std::int32_t token,
+                                  std::string* error = nullptr);
   /// Trunk forward of a decode-time verification batch. Not grid-aligned.
   /// Does not write the NextN cache (the draft already did). Updates the
   /// carried trunk hidden from the last token. A batch of 2 to 8 tokens
@@ -285,6 +290,8 @@ private:
   /// Points the drafter at its private scratch, then swaps back. The decode
   /// graph keeps the addresses it captured, so the two must not share them.
   void SwapDraftScratch() noexcept;
+  [[nodiscard]] bool LaunchDraft(std::int32_t token, bool write_head,
+                                 std::string* error);
   void EnsureLogitsBatch();
   void* Allocate(std::size_t bytes);
   float* Floats(std::size_t count);

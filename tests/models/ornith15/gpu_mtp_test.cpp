@@ -359,6 +359,43 @@ int main() {
                 << " plain=" << plain_out[matched] << '\n';
     }
 
+    // A fully accepted round writes the last token's NextN row without the
+    // output head. The cache and the next round's draft must equal the ones
+    // a full draft step leaves.
+    {
+      const std::span<const std::int32_t> chain(fed.data(), 3);
+      std::vector<float> rows(chain.size() * vocab);
+      std::vector<std::uint8_t> full_state, advanced_state;
+      const auto round = [&](bool advance, std::vector<std::uint8_t>* state,
+                             std::vector<float>& next) {
+        reprefill();
+        const auto base = spec->Position();
+        Require(spec->DraftToken(chain[0], draft_logits, &error) &&
+                    spec->DraftToken(chain[1], draft_logits, &error),
+                "advance drafts: " + error);
+        Require(spec->VerifyForward(chain, rows, &error),
+                "advance verify: " + error);
+        Require(advance ? spec->AdvanceDraft(chain[2], &error)
+                        : spec->DraftToken(chain[2], draft_logits, &error),
+                "advance last row: " + error);
+        spec->RewindMtp(base + 3);
+        Require(spec->SaveSnapshot(state, &error),
+                "advance snapshot: " + error);
+        Require(spec->DraftToken(fed[3], next, &error),
+                "draft after advance: " + error);
+      };
+      std::vector<float> full_next(vocab), advanced_next(vocab);
+      round(false, &full_state, full_next);
+      round(true, &advanced_state, advanced_next);
+      const float advance_gap =
+          MaxAbs(full_next.data(), advanced_next.data(), vocab);
+      const bool same_state = full_state == advanced_state;
+      std::cout << "advance_next_draft_max_abs=" << advance_gap
+                << " advance_snapshot_identical=" << same_state << '\n';
+      Require(advance_gap == 0.0F && same_state,
+              "AdvanceDraft differs from a full draft step");
+    }
+
     // Real text. Sequential ids 100+i are not a sentence the head was trained
     // on, so a zero accept count there does not locate a pairing bug.
     const auto tokenizer =

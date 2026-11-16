@@ -1602,6 +1602,26 @@ void Session::SwapDraftScratch() noexcept {
 }
 
 bool Session::BeginDraft(std::int32_t token, std::string* error) {
+  return LaunchDraft(token, true, error);
+}
+
+bool Session::AdvanceDraft(std::int32_t token, std::string* error) {
+  if (!LaunchDraft(token, false, error))
+    return false;
+  mtp_draft_inflight_ = false;
+  // Without the head, chain_h_ still holds the previous draft's hidden.
+  mtp_chain_ = false;
+  if (hipStreamSynchronize(mtp_stream_) != hipSuccess) {
+    failed_ = true;
+    if (error != nullptr)
+      *error = "mtp advance";
+    return false;
+  }
+  return true;
+}
+
+bool Session::LaunchDraft(std::int32_t token, bool write_head,
+                          std::string* error) {
   const auto& c = model_->config();
   if (!mtp_enabled_ || failed_ || mtp_draft_inflight_ || token < 0 ||
       static_cast<std::uint32_t>(token) >= c.vocab_size ||
@@ -1622,7 +1642,7 @@ bool Session::BeginDraft(std::int32_t token, std::string* error) {
       Check(hipMemcpyAsync(token_ids_, &token, sizeof(token),
                            hipMemcpyHostToDevice, stream_),
             "mtp token");
-      MtpRun(1, mtp_position_, mtp_hidden_, true);
+      MtpRun(1, mtp_position_, mtp_hidden_, write_head);
       Check(hipGetLastError(), "mtp draft launch");
     } catch (...) {
       SwapDraftScratch();
